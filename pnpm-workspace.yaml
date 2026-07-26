@@ -1,5 +1,8 @@
 allowBuilds:
+  '@google/genai': false
   better-sqlite3: true
+  esbuild: true
+  protobufjs: false
 overrides:
   '@earendil-works/pi-agent-core': 0.82.0
   '@earendil-works/pi-ai': 0.82.0
