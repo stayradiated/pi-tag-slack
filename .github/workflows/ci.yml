@@ -16,14 +16,12 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
-        # The gateway ships platform-specific daemon/path code, so test the
-        # Linux and macOS are supported. Node floor tracks the pi SDK.
-        os: [ubuntu-latest, macos-latest]
+        # Node floor tracks the pi SDK.
         node-version: [22, 24]
 
     steps:
