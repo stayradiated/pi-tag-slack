@@ -154,7 +154,7 @@ export function initDb(dbPath: string = config.dbPath): void {
     db = candidate;
     dbOpen = true;
     activeDbPath = dbPath;
-    logger.info({ path: dbPath }, 'Database initialized');
+    logger.debug({ path: dbPath }, 'Database initialized');
   } catch (error) {
     try {
       candidate?.close();
