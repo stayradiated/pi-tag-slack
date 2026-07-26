@@ -7,7 +7,7 @@ import { config, resolveConfigPath, validateSlackTokens } from '../config.js';
 import { closeDb, getAllChannels, initDb } from '../db.js';
 
 const AUTH_PATH = resolve(homedir(), '.pi/agent/auth.json');
-const SERVICE_NAME = 'pitag';
+const SERVICE_NAME = 'pi-tag-slack';
 
 export async function runStatus(): Promise<void> {
   const configPath = resolveConfigPath();
@@ -21,7 +21,7 @@ export async function runStatus(): Promise<void> {
   const sessionFolderCount = countSessionFolders(sessionsPath);
 
   const lines = [
-    'pitag status',
+    'pi-tag-slack status',
     '',
     `Pi binary: ${piPath || 'not found'}`,
     `Pi version: ${piVersion || 'unknown'}`,
@@ -136,8 +136,7 @@ function countSessionFolders(baseDir: string): number {
 }
 
 function findExecutable(name: string): string | undefined {
-  const cmd = process.platform === 'win32' ? 'where' : 'which';
-  return readCommandOutput(`${cmd} ${name}`);
+  return readCommandOutput(`which ${name}`);
 }
 
 function readCommandOutput(command: string): string | undefined {

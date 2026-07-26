@@ -129,12 +129,8 @@ export async function invokeAgent(
     // Abort support
     if (opts?.signal) {
       const onAbort = () => {
-        if (process.platform === 'win32') {
-          proc.kill();
-        } else {
-          proc.kill('SIGTERM');
-          setTimeout(() => proc.kill('SIGKILL'), 5000);
-        }
+        proc.kill('SIGTERM');
+        setTimeout(() => proc.kill('SIGKILL'), 5000);
       };
       opts.signal.addEventListener('abort', onAbort, { once: true });
       proc.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
@@ -374,12 +370,8 @@ async function getSessionStatsViaRpc(
     };
 
     const timeout = setTimeout(() => {
-      if (process.platform === 'win32') {
-        proc.kill();
-      } else {
-        proc.kill('SIGTERM');
-        setTimeout(() => proc.kill('SIGKILL'), 1000);
-      }
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 1000);
       finish(new Error('Timed out waiting for pi session stats'));
     }, 2500);
 

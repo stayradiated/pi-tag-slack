@@ -8,46 +8,45 @@ describe('buildConfigFile', () => {
       appToken: 'xapp-test-token',
       triggerName: 'PiBot',
       workingDir: '/workspace/project',
-      sessionsDir: '/var/lib/pi-tag/sessions',
-      dbPath: '/var/lib/pi-tag/gateway.db',
+      sessionsDir: '/var/lib/pi-tag-slack/sessions',
+      dbPath: '/var/lib/pi-tag-slack/gateway.db',
     });
 
-    expect(text).toContain('SLACK_BOT_TOKEN=xoxb-test-token');
-    expect(text).toContain('SLACK_APP_TOKEN=xapp-test-token');
-    expect(text).toContain('TRIGGER_NAME=PiBot');
-    expect(text).toContain('PI_CWD=/workspace/project');
-    expect(text).toContain('SESSIONS_DIR=/var/lib/pi-tag/sessions');
-    expect(text).toContain('DB_PATH=/var/lib/pi-tag/gateway.db');
+    expect(text).toContain('SLACK_BOT_TOKEN=`xoxb-test-token`');
+    expect(text).toContain('SLACK_APP_TOKEN=`xapp-test-token`');
+    expect(text).toContain('TRIGGER_NAME=`PiBot`');
+    expect(text).toContain('PI_CWD=`/workspace/project`');
+    expect(text).toContain('SESSIONS_DIR=`/var/lib/pi-tag-slack/sessions`');
+    expect(text).toContain('DB_PATH=`/var/lib/pi-tag-slack/gateway.db`');
     expect(text).not.toContain('AUTO_REGISTER_DMS');
   });
 
-  it('defaults DM policy to open and reply-in-thread to true', () => {
+  it('defaults DM policy to open and omits deprecated thread configuration', () => {
     const text = buildConfigFile({
       botToken: 'xoxb-test-token',
       appToken: 'xapp-test-token',
       triggerName: 'PiBot',
       workingDir: '/workspace/project',
-      sessionsDir: '/var/lib/pi-tag/sessions',
-      dbPath: '/var/lib/pi-tag/gateway.db',
+      sessionsDir: '/var/lib/pi-tag-slack/sessions',
+      dbPath: '/var/lib/pi-tag-slack/gateway.db',
     });
 
-    expect(text).toContain('DM_POLICY=open');
-    expect(text).toContain('REPLY_IN_THREAD=true');
+    expect(text).toContain('DM_POLICY=`open`');
+    expect(text).not.toContain('REPLY_IN_THREAD');
   });
 
-  it('writes the selected DM policy and thread preference', () => {
+  it('writes the selected DM policy', () => {
     const text = buildConfigFile({
       botToken: 'xoxb-test-token',
       appToken: 'xapp-test-token',
       triggerName: 'PiBot',
       workingDir: '/workspace/project',
       dmPolicy: 'disabled',
-      replyInThread: false,
-      sessionsDir: '/var/lib/pi-tag/sessions',
-      dbPath: '/var/lib/pi-tag/gateway.db',
+      sessionsDir: '/var/lib/pi-tag-slack/sessions',
+      dbPath: '/var/lib/pi-tag-slack/gateway.db',
     });
 
-    expect(text).toContain('DM_POLICY=disabled');
-    expect(text).toContain('REPLY_IN_THREAD=false');
+    expect(text).toContain('DM_POLICY=`disabled`');
+    expect(text).not.toContain('REPLY_IN_THREAD');
   });
 });

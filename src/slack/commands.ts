@@ -34,6 +34,7 @@ import {
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
+  isTrustedUser,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -57,6 +58,7 @@ export function registerCommands(app: App): void {
   app.command('/pi', async ({ command, ack, respond }) => {
     // Slash commands must be acked within 3s; respond() stays valid for 30min.
     await ack();
+    if (!isTrustedUser(command.user_id)) return;
 
     const [rawSubcommand = '', ...args] = command.text.trim().split(/\s+/).filter(Boolean);
     const subcommand = rawSubcommand.toLowerCase();
@@ -151,7 +153,7 @@ async function respondWithPanel(
 ): Promise<void> {
   const state = await buildPanelState(channel, opts.notice);
   await respond({
-    text: `pi gateway — ${channel.name}`,
+    text: `pi-tag-slack — ${channel.name}`,
     blocks: buildPanelBlocks(state),
     ...(opts.replace ? { replace_original: true } : {}),
   });
@@ -191,6 +193,7 @@ function registerPanelAction<A extends BlockElementAction>(
 ): void {
   app.action<BlockAction<A>>(actionId, async ({ ack, body, action, respond }) => {
     await ack();
+    if (!isTrustedUser(body.user.id)) return;
 
     try {
       const channelId = body.channel?.id;

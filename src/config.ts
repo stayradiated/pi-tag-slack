@@ -5,36 +5,28 @@ import { isAbsolute, resolve } from 'node:path';
 
 const DEFAULT_CONFIG_PATH = defaultConfigPath();
 const DEFAULT_DATA_DIR = defaultDataDir();
-const LEGACY_ENV_PATH = resolve(process.cwd(), '.env');
 const CONFIG_SOURCE = buildConfigSource();
 
 function defaultConfigPath(): string {
   switch (process.platform) {
-    case 'win32':
-      return resolve(
-        process.env.APPDATA || resolve(homedir(), 'AppData/Roaming'),
-        'pitag/config.env',
-      );
     case 'darwin':
-      return resolve(homedir(), 'Library/Application Support/pitag/config.env');
+      return resolve(homedir(), 'Library/Application Support/pi-tag-slack/config.env');
     default:
-      return resolve(homedir(), '.config', 'pitag', 'config.env');
+      return resolve(homedir(), '.config', 'pi-tag-slack', 'config.env');
   }
 }
 
 export function defaultDataDir(): string {
   switch (process.platform) {
-    case 'win32':
-      return resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData/Local'), 'pitag');
     case 'darwin':
-      return resolve(homedir(), 'Library/Application Support/pitag');
+      return resolve(homedir(), 'Library/Application Support/pi-tag-slack');
     default:
-      return resolve(homedir(), '.local/share', 'pitag');
+      return resolve(homedir(), '.local/share', 'pi-tag-slack');
   }
 }
 
 export function resolveConfigPath(): string {
-  const configuredPath = process.env.PITAG_CONFIG?.trim() ?? '';
+  const configuredPath = process.env.PI_TAG_SLACK_CONFIG?.trim() ?? '';
   if (configuredPath) {
     return resolveUserPath(configuredPath);
   }
@@ -65,7 +57,6 @@ function readEnvValue(key: string): string | undefined {
 
 function buildConfigSource(): Record<string, string> {
   return {
-    ...loadEnvFile(LEGACY_ENV_PATH),
     ...loadEnvFile(resolveConfigPath()),
     ...readProcessEnv(),
   };
@@ -111,12 +102,6 @@ function envInt(key: string, fallback: number, opts: { min?: number } = {}): num
   if (Number.isNaN(v)) return fallback;
   if (opts.min !== undefined && v < opts.min) return fallback;
   return v;
-}
-
-function envBool(key: string, fallback: boolean): boolean {
-  const v = env(key).toLowerCase();
-  if (!v) return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(v);
 }
 
 const VALID_CHANNEL_POLICIES = ['open', 'open-trigger', 'allowlist'] as const;
@@ -168,7 +153,7 @@ export const config = {
   dbPath: env('DB_PATH', resolve(DEFAULT_DATA_DIR, 'gateway.db')),
 
   /** Bot trigger name (default: bot's own display name) */
-  triggerName: env('TRIGGER_NAME', 'pi'),
+  triggerName: env('TRIGGER_NAME', 'pi-tag-slack'),
 
   /** Max concurrent agent invocations */
   maxConcurrency: envInt('MAX_CONCURRENCY', 3, { min: 1 }),
@@ -193,9 +178,6 @@ export const config = {
 
   /** DM access policy: open (auto-register), allowlist, or disabled */
   dmPolicy: parseDmPolicy(env('DM_POLICY', 'open')),
-
-  /** Post responses into the triggering message's thread when it has one */
-  replyInThread: envBool('REPLY_IN_THREAD', true),
 
   /** Channel access policy: open, open-trigger, or allowlist */
   channelPolicy: parseChannelPolicy(env('CHANNEL_POLICY', 'allowlist')),

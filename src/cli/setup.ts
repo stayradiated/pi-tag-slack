@@ -1,33 +1,42 @@
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import * as clack from '@clack/prompts';
 import { listAvailableModels } from '../agent/model-catalog.js';
 import type { DmPolicy } from '../config.js';
 import { defaultDataDir, resolveConfigPath, validateSlackTokens } from '../config.js';
+import { validateTrustedUserId } from '../db.js';
 
-const SERVICE_NAME = 'pitag';
-const DEFAULT_TRIGGER_NAME = 'pi';
+const SERVICE_NAME = 'pi-tag-slack';
+const DEFAULT_TRIGGER_NAME = 'pi-tag-slack';
 const DEFAULT_WORKING_DIR = homedir();
-const DEFAULT_DATA_DIR = defaultDataDir();
-const DEFAULT_SESSIONS_DIR = resolve(DEFAULT_DATA_DIR, 'sessions');
-const DEFAULT_DB_PATH = resolve(DEFAULT_DATA_DIR, 'gateway.db');
+
 const AUTH_PATH = resolve(homedir(), '.pi/agent/auth.json');
 
 export async function runSetup(args: string[]): Promise<void> {
-  const botTokenArg = args[0]?.trim() ?? '';
-  const appTokenArg = args[1]?.trim() ?? '';
+  if (args.length > 0) {
+    throw new Error(
+      'Usage: pi-tag-slack setup (use SLACK_BOT_TOKEN and SLACK_APP_TOKEN in non-interactive mode)',
+    );
+  }
+  const botTokenArg = process.env.SLACK_BOT_TOKEN?.trim() ?? '';
+  const appTokenArg = process.env.SLACK_APP_TOKEN?.trim() ?? '';
+  const trustedUserIdArg = process.env.PI_TAG_SLACK_TRUSTED_USER_ID ?? '';
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const configPath = resolveConfigPath();
+  // A custom config location never relocates application storage.
+  const dataDir = defaultDataDir();
+  const sessionsDir = resolve(dataDir, 'sessions');
+  const dbPath = resolve(dataDir, 'gateway.db');
 
-  if (!interactive && (!botTokenArg || !appTokenArg)) {
+  if (!interactive && (!botTokenArg || !appTokenArg || !trustedUserIdArg)) {
     throw new Error(
-      'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be provided as arguments when stdin is not interactive.',
+      'SLACK_BOT_TOKEN, SLACK_APP_TOKEN, and PI_TAG_SLACK_TRUSTED_USER_ID are required when stdin is not interactive.',
     );
   }
 
-  clack.intro('pitag setup');
+  clack.intro('pi-tag-slack setup');
 
   // ── Prerequisites ──
   const prereqs = checkPrerequisites();
@@ -72,7 +81,7 @@ export async function runSetup(args: string[]): Promise<void> {
       message: 'Slack Bot Token (xoxb-…)',
       placeholder: 'Paste your bot token here',
       validate: (v) => {
-        if (!v.trim()) return 'Token cannot be empty.';
+        if (!v?.trim()) return 'Token cannot be empty.';
         if (!v.trim().startsWith('xoxb-')) return 'Bot tokens start with "xoxb-".';
       },
     });
@@ -80,7 +89,7 @@ export async function runSetup(args: string[]): Promise<void> {
       clack.cancel('Setup cancelled.');
       process.exit(0);
     }
-    botToken = result.trim();
+    botToken = result?.trim() ?? '';
   }
 
   // ── App-level token (Socket Mode) ──
@@ -90,7 +99,7 @@ export async function runSetup(args: string[]): Promise<void> {
       message: 'Slack App-Level Token (xapp-…, Socket Mode)',
       placeholder: 'Paste your app-level token here',
       validate: (v) => {
-        if (!v.trim()) return 'Token cannot be empty.';
+        if (!v?.trim()) return 'Token cannot be empty.';
         if (!v.trim().startsWith('xapp-')) return 'App-level tokens start with "xapp-".';
       },
     });
@@ -98,7 +107,7 @@ export async function runSetup(args: string[]): Promise<void> {
       clack.cancel('Setup cancelled.');
       process.exit(0);
     }
-    appToken = result.trim();
+    appToken = result?.trim() ?? '';
   }
 
   // Covers non-interactive/argument-passed tokens too (same rules as startup).
@@ -142,7 +151,7 @@ export async function runSetup(args: string[]): Promise<void> {
         {
           value: 'allowlist' as const,
           label: 'allowlist',
-          hint: 'Only respond in manually registered channels (pitag register ...)',
+          hint: 'Only respond in manually registered channels (pi-tag-slack register ...)',
         },
       ],
       initialValue: 'allowlist' as const,
@@ -185,19 +194,30 @@ export async function runSetup(args: string[]): Promise<void> {
     dmPolicy = result;
   }
 
-  // ── Reply in thread ──
-  let replyInThread = true;
+  // ── Initial trusted Slack user ──
+  let trustedUserId = trustedUserIdArg;
   if (interactive) {
-    const result = await clack.confirm({
-      message: 'Reply in thread — when a message lives in a thread, answer inside it?',
-      initialValue: true,
+    clack.note(
+      'Find your raw Member ID in Slack: profile → ⋮ → Copy member ID. Do not use a display name or <@mention>.',
+      'Gateway trust',
+    );
+    const result = await clack.text({
+      message: 'Initial trusted Slack user ID (U... or W...)',
+      validate: (value) => {
+        try {
+          validateTrustedUserId(value ?? '');
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      },
     });
     if (clack.isCancel(result)) {
       clack.cancel('Setup cancelled.');
       process.exit(0);
     }
-    replyInThread = result;
+    trustedUserId = result ?? '';
   }
+  trustedUserId = validateTrustedUserId(trustedUserId);
 
   // ── Working directory ──
   let workingDir = DEFAULT_WORKING_DIR;
@@ -217,8 +237,8 @@ export async function runSetup(args: string[]): Promise<void> {
 
   // ── Write config ──
   mkdirSync(dirname(configPath), { recursive: true });
-  mkdirSync(DEFAULT_DATA_DIR, { recursive: true });
-  mkdirSync(DEFAULT_SESSIONS_DIR, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(sessionsDir, { recursive: true });
 
   writeFileSync(
     configPath,
@@ -229,11 +249,22 @@ export async function runSetup(args: string[]): Promise<void> {
       workingDir,
       channelPolicy,
       dmPolicy,
-      replyInThread,
-      sessionsDir: DEFAULT_SESSIONS_DIR,
-      dbPath: DEFAULT_DB_PATH,
+      sessionsDir,
+      dbPath,
     }),
+    { mode: 0o600 },
   );
+  chmodSync(configPath, 0o600);
+
+  // Bootstrap trust only after config creation; do not claim setup succeeded
+  // until both persistent pieces exist.
+  const dbModule = await import('../db.js');
+  try {
+    dbModule.initDb(dbPath);
+    dbModule.addTrustedUser(trustedUserId);
+  } finally {
+    dbModule.closeDb();
+  }
 
   clack.log.success(`Config written to: ${configPath}`);
 
@@ -263,7 +294,7 @@ export async function runSetup(args: string[]): Promise<void> {
         s.stop('Service installation failed.');
         clack.log.error(errorMessage(err));
         clack.log.info(
-          'You can install manually later: pitag daemon install && pitag daemon start',
+          'You can install manually later: pi-tag-slack daemon install && pi-tag-slack daemon start',
         );
       }
     }
@@ -274,9 +305,9 @@ export async function runSetup(args: string[]): Promise<void> {
     `Config:    ${configPath}`,
     `Policy:    ${channelPolicy}`,
     `DMs:       ${dmPolicy}`,
-    `Threads:   ${replyInThread ? 'reply in thread' : 'reply top-level'}`,
+    `Trust:     ${trustedUserId}`,
     `Trigger:   ${triggerName}`,
-    `Sessions:  ${DEFAULT_SESSIONS_DIR}`,
+    `Sessions:  ${sessionsDir}`,
   ];
   clack.note(summaryLines.join('\n'), 'Configuration');
 
@@ -304,12 +335,28 @@ function checkPrerequisites(): {
 }
 
 function findExecutable(name: string): string | undefined {
-  const cmd = process.platform === 'win32' ? 'where' : 'which';
-  return readCommandOutput(`${cmd} ${name}`);
+  return readCommandOutput(`which ${name}`);
 }
 
 function isUnix(): boolean {
   return process.platform === 'linux' || process.platform === 'darwin';
+}
+
+export function serializeDotenvValue(value: string): string {
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error(
+      'Configuration values cannot contain NUL, carriage return, or newline characters.',
+    );
+  }
+  // dotenv 17 preserves the contents of backtick and single quoted values.
+  // Prefer those delimiters rather than shell escaping, which dotenv does not
+  // reverse. Double quotes expand literal \\n and \\r, so use them only when safe.
+  if (!value.includes('`')) return `\`${value}\``;
+  if (!value.includes("'")) return `'${value}'`;
+  if (!value.includes('"') && !/\\[nr]/.test(value)) return `"${value}"`;
+  // An unquoted value is exact only when dotenv will neither trim nor start a comment.
+  if (value !== '' && value === value.trim() && !value.includes('#')) return value;
+  throw new Error('Configuration value cannot be represented exactly in dotenv format.');
 }
 
 export function buildConfigFile(options: {
@@ -319,47 +366,46 @@ export function buildConfigFile(options: {
   workingDir: string;
   channelPolicy?: 'open' | 'open-trigger' | 'allowlist';
   dmPolicy?: DmPolicy;
-  replyInThread?: boolean;
   sessionsDir: string;
   dbPath: string;
 }): string {
+  const assignment = (key: string, value: string) => `${key}=${serializeDotenvValue(value)}`;
   return [
-    '# Generated by: pitag setup',
-    '# Or edit manually. See: pitag help',
+    '# Generated by: pi-tag-slack setup',
+    '# Or edit manually. See: pi-tag-slack help',
     '',
-    `SLACK_BOT_TOKEN=${options.botToken}`,
-    `SLACK_APP_TOKEN=${options.appToken}`,
+    assignment('SLACK_BOT_TOKEN', options.botToken),
+    assignment('SLACK_APP_TOKEN', options.appToken),
     '',
     '# Pi agent configuration',
-    'PI_BIN=pi',
-    'PI_MODEL=',
-    'PI_THINKING=',
-    `PI_CWD=${options.workingDir}`,
-    'PI_EXTRA_FLAGS=',
+    assignment('PI_BIN', 'pi'),
+    assignment('PI_MODEL', ''),
+    assignment('PI_THINKING', ''),
+    assignment('PI_CWD', options.workingDir),
+    assignment('PI_EXTRA_FLAGS', ''),
     '',
     '# Gateway behavior',
-    `TRIGGER_NAME=${options.triggerName}`,
-    'MAX_CONCURRENCY=3',
-    'MAX_SCHEDULED_CONCURRENCY=1',
-    'POLL_INTERVAL_MS=1000',
-    'SHUTDOWN_TIMEOUT_MS=15000',
-    `DM_POLICY=${options.dmPolicy ?? 'open'}`,
-    `REPLY_IN_THREAD=${options.replyInThread ?? true}`,
-    `CHANNEL_POLICY=${options.channelPolicy ?? 'allowlist'}`,
-    'EXCLUDED_CHANNELS=',
-    'MAX_ATTACHMENT_BYTES=26214400',
-    'MAX_TOTAL_ATTACHMENT_BYTES=52428800',
-    'MEDIA_RETENTION_HOURS=168',
+    assignment('TRIGGER_NAME', options.triggerName),
+    assignment('MAX_CONCURRENCY', '3'),
+    assignment('MAX_SCHEDULED_CONCURRENCY', '1'),
+    assignment('POLL_INTERVAL_MS', '1000'),
+    assignment('SHUTDOWN_TIMEOUT_MS', '15000'),
+    assignment('DM_POLICY', options.dmPolicy ?? 'open'),
+    assignment('CHANNEL_POLICY', options.channelPolicy ?? 'allowlist'),
+    assignment('EXCLUDED_CHANNELS', ''),
+    assignment('MAX_ATTACHMENT_BYTES', '26214400'),
+    assignment('MAX_TOTAL_ATTACHMENT_BYTES', '52428800'),
+    assignment('MEDIA_RETENTION_HOURS', '168'),
     '',
     '# Archive',
-    'ARCHIVE_RETENTION_DAYS=30',
+    assignment('ARCHIVE_RETENTION_DAYS', '30'),
     '',
     '# Storage',
-    `SESSIONS_DIR=${options.sessionsDir}`,
-    `DB_PATH=${options.dbPath}`,
+    assignment('SESSIONS_DIR', options.sessionsDir),
+    assignment('DB_PATH', options.dbPath),
     '',
     '# Logging',
-    'LOG_LEVEL=info',
+    assignment('LOG_LEVEL', 'info'),
     '',
   ].join('\n');
 }

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const originalCwd = process.cwd();
 const originalEnv = { ...process.env };
 const tempDirs: string[] = [];
-const CONFIG_ENV_KEYS = ['CHANNEL_POLICY', 'EXCLUDED_CHANNELS', 'HOME', 'PITAG_CONFIG'];
+const CONFIG_ENV_KEYS = ['CHANNEL_POLICY', 'EXCLUDED_CHANNELS', 'HOME', 'PI_TAG_SLACK_CONFIG'];
 
 afterEach(() => {
   vi.resetModules();
@@ -31,7 +31,7 @@ describe('channel policy config', () => {
     const { homeDir, workDir } = createIsolatedDirs();
     process.chdir(workDir);
     process.env.HOME = homeDir;
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
     delete process.env.CHANNEL_POLICY;
     delete process.env.EXCLUDED_CHANNELS;
 
@@ -44,7 +44,7 @@ describe('channel policy config', () => {
     const { homeDir, workDir } = createIsolatedDirs();
     process.chdir(workDir);
     process.env.HOME = homeDir;
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
     delete process.env.CHANNEL_POLICY;
     process.env.EXCLUDED_CHANNELS = '123, 456, 789';
 
@@ -67,12 +67,12 @@ describe('buildConfigFile channel policy settings', () => {
       triggerName: 'PiBot',
       workingDir: '/workspace/project',
       channelPolicy: 'open-trigger',
-      sessionsDir: '/var/lib/pi-tag/sessions',
-      dbPath: '/var/lib/pi-tag/gateway.db',
+      sessionsDir: '/var/lib/pi-tag-slack/sessions',
+      dbPath: '/var/lib/pi-tag-slack/gateway.db',
     });
 
-    expect(text).toContain('CHANNEL_POLICY=open-trigger');
-    expect(text).toContain('EXCLUDED_CHANNELS=');
+    expect(text).toContain('CHANNEL_POLICY=`open-trigger`');
+    expect(text).toContain('EXCLUDED_CHANNELS=``');
   });
 
   it('defaults the channel policy to allowlist, matching config and docs', async () => {
@@ -82,17 +82,17 @@ describe('buildConfigFile channel policy settings', () => {
       appToken: 'xapp-test-token',
       triggerName: 'PiBot',
       workingDir: '/workspace/project',
-      sessionsDir: '/var/lib/pi-tag/sessions',
-      dbPath: '/var/lib/pi-tag/gateway.db',
+      sessionsDir: '/var/lib/pi-tag-slack/sessions',
+      dbPath: '/var/lib/pi-tag-slack/gateway.db',
     });
 
-    expect(text).toContain('CHANNEL_POLICY=allowlist');
+    expect(text).toContain('CHANNEL_POLICY=`allowlist`');
   });
 });
 
 function createIsolatedDirs(): { homeDir: string; workDir: string } {
-  const homeDir = mkdtempSync(join(tmpdir(), 'pitag-channel-policy-home-'));
-  const workDir = mkdtempSync(join(tmpdir(), 'pitag-channel-policy-work-'));
+  const homeDir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-channel-policy-home-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-channel-policy-work-'));
   tempDirs.push(homeDir, workDir);
   return { homeDir, workDir };
 }

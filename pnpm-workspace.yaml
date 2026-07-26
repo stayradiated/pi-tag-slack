@@ -1,0 +1,5 @@
+allowBuilds:
+  better-sqlite3: true
+overrides:
+  '@earendil-works/pi-agent-core': 0.82.0
+  '@earendil-works/pi-ai': 0.82.0

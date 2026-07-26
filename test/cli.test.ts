@@ -18,7 +18,7 @@ vi.mock('../src/index.js', () => ({
 
 const originalEnv = { ...process.env };
 const tempDirs: string[] = [];
-const CONFIG_ENV_KEYS = ['DB_PATH', 'HOME', 'PI_CWD', 'PITAG_CONFIG', 'SESSIONS_DIR'];
+const CONFIG_ENV_KEYS = ['DB_PATH', 'HOME', 'PI_CWD', 'PI_TAG_SLACK_CONFIG', 'SESSIONS_DIR'];
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -45,12 +45,14 @@ describe('formatHelpText', () => {
     const { formatHelpText } = await import('../src/cli/index.js');
     const help = formatHelpText();
 
-    expect(help).toContain('pitag setup');
-    expect(help).toContain('pitag start');
-    expect(help).toContain('pitag status');
-    expect(help).toContain('pitag register');
-    expect(help).toContain('pitag daemon install');
-    expect(help).toContain('pitag send --channel <jid> [--text <message>] [--file <path> ...]');
+    expect(help).toContain('pi-tag-slack setup');
+    expect(help).toContain('pi-tag-slack start');
+    expect(help).toContain('pi-tag-slack status');
+    expect(help).toContain('pi-tag-slack register');
+    expect(help).toContain('pi-tag-slack daemon install');
+    expect(help).toContain(
+      'pi-tag-slack send --channel <jid> [--thread <slack-ts>] [--text <message>] [--file <path> ...]',
+    );
     expect(help).toContain('sl:C0123456789');
     expect(help).toContain('--cwd <path>');
   });
@@ -58,7 +60,7 @@ describe('formatHelpText', () => {
 
 describe('start command', () => {
   it('does not report ESM-only pi-ai as a missing peer dependency', async () => {
-    process.env.PITAG_CONFIG = resolve('package.json');
+    process.env.PI_TAG_SLACK_CONFIG = resolve('package.json');
     startGatewayMock.mockResolvedValue(undefined);
 
     vi.resetModules();
@@ -102,7 +104,7 @@ describe('send command', () => {
 
 describe('register command cwd support', () => {
   it('stores a per-channel cwd override and shows it in channel listings', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'pitag-cli-'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-cli-'));
     tempDirs.push(tempDir);
 
     process.env.DB_PATH = resolve(tempDir, 'gateway.db');

@@ -1,4 +1,4 @@
-import { AuthStorage, ModelRegistry, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, SettingsManager } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { listSelectableModels, parsePiModelList } from '../src/agent/model-catalog.js';
@@ -38,15 +38,12 @@ test     beta   128K     16K      yes       no
 `;
 
 function mockPiCatalog(enabledModels?: string[], cliOutput = defaultCliOutput): void {
-  const authStorage = { reload: vi.fn() } as unknown as AuthStorage;
-  const registry = {
-    refresh: vi.fn(),
-    getAvailable: vi.fn(() => models),
-  } as unknown as ModelRegistry;
+  const runtime = {
+    getAvailable: vi.fn(async () => models),
+  } as unknown as ModelRuntime;
 
   spawnSyncMock.mockReturnValue({ status: 0, stdout: cliOutput, stderr: '' });
-  vi.spyOn(AuthStorage, 'create').mockReturnValue(authStorage);
-  vi.spyOn(ModelRegistry, 'create').mockReturnValue(registry);
+  vi.spyOn(ModelRuntime, 'create').mockResolvedValue(runtime);
   vi.spyOn(SettingsManager, 'create').mockReturnValue(SettingsManager.inMemory({ enabledModels }));
 }
 

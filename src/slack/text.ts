@@ -1,10 +1,7 @@
 /**
  * Slack text utilities shared by the Socket Mode client and the one-shot
- * `pitag send` path.
+ * `pi-tag-slack send` path.
  */
-
-import { basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 /**
  * chat.postMessage truncates `text` at 40,000 but chat.update rejects at
@@ -104,55 +101,6 @@ export function resolveInboundContent(
   const content = normalizeSlackText(rawText.replace(botMention, '').trim());
   const triggerPattern = buildTriggerPattern(opts.triggerName);
   return triggerPattern.test(content) ? content : `@${opts.triggerName} ${content}`;
-}
-
-export interface ExtractedFileUris {
-  /** Decoded local filesystem paths referenced via file:// URIs */
-  paths: string[];
-  /** The text with those references replaced by plain file names */
-  text: string;
-}
-
-/**
- * Detect `file://` references in an agent response.
- *
- * A file:// link is meaningless to Slack recipients (it points at the
- * gateway's own disk), so any such reference is treated as "the agent wants
- * to share this file": the caller uploads the paths as real attachments and
- * posts the cleaned text instead.
- */
-export function extractFileUris(text: string): ExtractedFileUris {
-  const paths: string[] = [];
-
-  const decode = (uri: string): string | null => {
-    try {
-      // Strip sentence punctuation that regex capture may have swallowed.
-      return fileURLToPath(uri.replace(/[.,;:!?]+$/, ''));
-    } catch {
-      return null;
-    }
-  };
-
-  // [label](file:///path) → label (or the file name when the label is empty)
-  let result = text.replace(
-    /\[([^\]]*)\]\((file:\/\/[^)\s]+)\)/g,
-    (match, label: string, uri: string) => {
-      const path = decode(uri);
-      if (!path) return match;
-      paths.push(path);
-      return label || `📎 ${basename(path)}`;
-    },
-  );
-
-  // Bare or <angle-bracketed> file:///path → 📎 name
-  result = result.replace(/<?(file:\/\/[^\s<>)\]]+)>?/g, (match, uri: string) => {
-    const path = decode(uri);
-    if (!path) return match;
-    paths.push(path);
-    return `📎 ${basename(path)}`;
-  });
-
-  return { paths: [...new Set(paths)], text: result };
 }
 
 /**

@@ -1,6 +1,6 @@
 import { config, validateSlackTokens } from './config.js';
 import { logger } from './logger.js';
-import { initDb, closeDb, getAllChannels } from './db.js';
+import { initDb, closeDb, getAllChannels, getTrustedUserCount } from './db.js';
 import { startSlack, stopSlack, getBotTag } from './slack/client.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
@@ -9,7 +9,7 @@ import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
 
 /**
- * pi-tag - Lightweight Slack gateway for pi coding agent.
+ * pi-tag-slack - Lightweight Slack gateway for pi coding agent.
  *
  * Architecture inspired by NanoClaw (https://github.com/qwibitai/nanoclaw).
  * Slack messages (Socket Mode) -> SQLite queue -> pi subprocess -> Slack response.
@@ -21,6 +21,10 @@ export async function startGateway(): Promise<void> {
   }
 
   initDb();
+  if (getTrustedUserCount() === 0) {
+    closeDb();
+    throw new Error('No trusted Slack users configured. Run: pi-tag-slack trust add <user-id>');
+  }
 
   let stopArchiveCleanup = () => {};
   let stopMediaCleanup = () => {};
@@ -38,9 +42,6 @@ export async function startGateway(): Promise<void> {
   };
   process.once('SIGINT', onSignal);
   process.once('SIGTERM', onSignal);
-  if (process.platform === 'win32') {
-    process.once('SIGBREAK', onSignal);
-  }
 
   const shutdown = (reason: string) => {
     if (shutdownPromise) return shutdownPromise;
@@ -48,9 +49,6 @@ export async function startGateway(): Promise<void> {
     shutdownPromise = (async () => {
       process.off('SIGINT', onSignal);
       process.off('SIGTERM', onSignal);
-      if (process.platform === 'win32') {
-        process.off('SIGBREAK', onSignal);
-      }
 
       logger.info({ reason }, 'Shutting down gateway');
 
@@ -71,7 +69,7 @@ export async function startGateway(): Promise<void> {
   };
 
   try {
-    logger.info('Starting pi-tag...');
+    logger.info('Starting pi-tag-slack...');
     warmModelCatalogs();
 
     await startSlack();

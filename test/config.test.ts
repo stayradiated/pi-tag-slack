@@ -7,43 +7,31 @@ const originalCwd = process.cwd();
 const originalEnv = { ...process.env };
 const tempDirs: string[] = [];
 const CONFIG_ENV_KEYS = [
-  'APPDATA',
   'DB_PATH',
   'DM_POLICY',
   'HOME',
-  'LOCALAPPDATA',
   'LOG_LEVEL',
   'MAX_ATTACHMENT_BYTES',
   'MAX_CONCURRENCY',
   'MAX_TOTAL_ATTACHMENT_BYTES',
   'MEDIA_RETENTION_HOURS',
-  'PITAG_CONFIG',
+  'PI_TAG_SLACK_CONFIG',
   'PI_BIN',
   'PI_CWD',
   'PI_EXTRA_FLAGS',
   'PI_MODEL',
   'PI_THINKING',
   'POLL_INTERVAL_MS',
-  'REPLY_IN_THREAD',
   'SESSIONS_DIR',
   'SHUTDOWN_TIMEOUT_MS',
   'SLACK_APP_TOKEN',
   'SLACK_BOT_TOKEN',
   'TRIGGER_NAME',
-  'USERPROFILE',
 ];
 
-/**
- * Point every home-derived location at the fake home dir. HOME alone is not
- * enough on Windows: homedir() reads USERPROFILE, and the config's platform
- * paths read APPDATA/LOCALAPPDATA — leaving those at their real values leaks
- * test config files into the machine's actual profile.
- */
+/** Point home-derived locations at the fake home directory. */
 function stubHomeDir(homeDir: string): void {
   process.env.HOME = homeDir;
-  process.env.USERPROFILE = homeDir;
-  process.env.APPDATA = resolve(homeDir, 'AppData/Roaming');
-  process.env.LOCALAPPDATA = resolve(homeDir, 'AppData/Local');
 }
 
 afterEach(() => {
@@ -65,16 +53,16 @@ afterEach(() => {
 });
 
 describe('resolveConfigPath', () => {
-  it('uses PITAG_CONFIG when set', async () => {
-    process.env.PITAG_CONFIG = '~/custom/pi-tag/config.env';
+  it('uses PI_TAG_SLACK_CONFIG when set', async () => {
+    process.env.PI_TAG_SLACK_CONFIG = '~/custom/pi-tag-slack/config.env';
 
     const { resolveConfigPath } = await loadConfigModule();
 
-    expect(resolveConfigPath()).toBe(resolve(homedir(), 'custom/pi-tag/config.env'));
+    expect(resolveConfigPath()).toBe(resolve(homedir(), 'custom/pi-tag-slack/config.env'));
   });
 
   it('falls back to the platform default config path', async () => {
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
 
     const { resolveConfigPath } = await loadConfigModule();
 
@@ -101,7 +89,7 @@ describe('config loading', () => {
 
     process.chdir(workDir);
     stubHomeDir(homeDir);
-    process.env.PITAG_CONFIG = configPath;
+    process.env.PI_TAG_SLACK_CONFIG = configPath;
     process.env.PI_CWD = '/env/project';
     delete process.env.DB_PATH;
     delete process.env.SESSIONS_DIR;
@@ -117,7 +105,7 @@ describe('config loading', () => {
   it('uses the default config file before the cwd .env fallback', async () => {
     const homeDir = createTempDir();
     const workDir = createTempDir();
-    // Stub before deriving the expected path: the helper reads APPDATA.
+    // Stub before deriving the expected path.
     stubHomeDir(homeDir);
     const defaultConfigPath = expectedDefaultConfigPath(homeDir);
 
@@ -131,7 +119,7 @@ describe('config loading', () => {
     });
 
     process.chdir(workDir);
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
     delete process.env.DB_PATH;
     delete process.env.SESSIONS_DIR;
 
@@ -142,13 +130,13 @@ describe('config loading', () => {
     expect(config.sessionsDir).toBe('/default/sessions');
   });
 
-  it('uses the pitag platform data directory defaults when storage paths are unset', async () => {
+  it('uses the pi-tag-slack platform data directory defaults when storage paths are unset', async () => {
     const homeDir = createTempDir();
     const workDir = createTempDir();
 
     process.chdir(workDir);
     stubHomeDir(homeDir);
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
     delete process.env.DB_PATH;
     delete process.env.SESSIONS_DIR;
 
@@ -159,36 +147,17 @@ describe('config loading', () => {
     expect(config.sessionsDir).toBe(resolve(dataDir, 'sessions'));
   });
 
-  it('defaults dmPolicy to open and replyInThread to true', async () => {
+  it('parses DM_POLICY and rejects unknown policies', async () => {
     const homeDir = createTempDir();
     const workDir = createTempDir();
 
     process.chdir(workDir);
     stubHomeDir(homeDir);
-    delete process.env.PITAG_CONFIG;
-    delete process.env.DM_POLICY;
-    delete process.env.REPLY_IN_THREAD;
-
-    const { config } = await loadConfigModule();
-
-    expect(config.dmPolicy).toBe('open');
-    expect(config.replyInThread).toBe(true);
-  });
-
-  it('parses DM_POLICY and REPLY_IN_THREAD overrides and rejects unknown policies', async () => {
-    const homeDir = createTempDir();
-    const workDir = createTempDir();
-
-    process.chdir(workDir);
-    stubHomeDir(homeDir);
-    delete process.env.PITAG_CONFIG;
+    delete process.env.PI_TAG_SLACK_CONFIG;
     process.env.DM_POLICY = 'disabled';
-    process.env.REPLY_IN_THREAD = 'false';
 
     const { config } = await loadConfigModule();
-
     expect(config.dmPolicy).toBe('disabled');
-    expect(config.replyInThread).toBe(false);
 
     process.env.DM_POLICY = 'bogus';
     const { config: fallbackConfig } = await loadConfigModule();
@@ -221,7 +190,7 @@ describe('validateSlackTokens', () => {
 });
 
 function createTempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'pitag-config-'));
+  const dir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-config-'));
   tempDirs.push(dir);
   return dir;
 }
@@ -238,26 +207,19 @@ function writeEnvFile(filePath: string, values: Record<string, string>): void {
 
 function expectedDefaultConfigPath(homeDir: string): string {
   switch (process.platform) {
-    case 'win32':
-      return resolve(
-        process.env.APPDATA || resolve(homeDir, 'AppData/Roaming'),
-        'pitag/config.env',
-      );
     case 'darwin':
-      return resolve(homeDir, 'Library/Application Support/pitag/config.env');
+      return resolve(homeDir, 'Library/Application Support/pi-tag-slack/config.env');
     default:
-      return resolve(homeDir, '.config', 'pitag', 'config.env');
+      return resolve(homeDir, '.config', 'pi-tag-slack', 'config.env');
   }
 }
 
 function expectedDefaultDataDir(homeDir: string): string {
   switch (process.platform) {
-    case 'win32':
-      return resolve(process.env.LOCALAPPDATA || resolve(homeDir, 'AppData/Local'), 'pitag');
     case 'darwin':
-      return resolve(homeDir, 'Library/Application Support/pitag');
+      return resolve(homeDir, 'Library/Application Support/pi-tag-slack');
     default:
-      return resolve(homeDir, '.local/share', 'pitag');
+      return resolve(homeDir, '.local/share', 'pi-tag-slack');
   }
 }
 

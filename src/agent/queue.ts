@@ -14,16 +14,14 @@ import {
   clearPendingMessages,
   markMessageDone,
   markMessageFailed,
-  recoverStuckMessages,
+  recoverQueueForStartup,
   logMessage,
   getChannel,
+  isAuthorizedQueueSender,
 } from '../db.js';
 import type { QueuedMessage } from '../types.js';
-import { statSync } from 'node:fs';
-import { basename } from 'node:path';
 import { invokeAgent } from './invoke.js';
-import { sendFiles, sendResponse, setBusy } from '../slack/client.js';
-import { extractFileUris } from '../slack/text.js';
+import { sendResponse, setBusy } from '../slack/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 
 /** Channels currently being processed (per-channel serial lock) */
@@ -56,10 +54,9 @@ export function startProcessingLoop(): void {
   running = true;
   stopPromise = null;
 
-  // Recover any messages stuck in 'processing' from a previous crash.
-  const recovered = recoverStuckMessages();
-  if (recovered > 0) {
-    logger.info({ count: recovered }, 'Recovered stuck messages');
+  const recovery = recoverQueueForStartup();
+  if (recovery.recoveredProcessing > 0 || recovery.rejectedUnauthorized > 0) {
+    logger.info(recovery, 'Recovered queue for startup');
   }
 
   schedulePoll(0);
@@ -121,7 +118,7 @@ function dispatch(): void {
 
     // The promise is stored, not awaited, so it must never be left without a
     // rejection handler: an unhandled rejection would crash the whole gateway.
-    const taskPromise = processMessage(jid, msg, controller.signal)
+    const taskPromise = executeClaimedMessage(jid, msg, controller.signal)
       .catch((err: any) => {
         logger.error({ jid, rowid: msg.rowid, err: err?.message }, 'processMessage rejected');
       })
@@ -197,13 +194,49 @@ async function waitForPromise(promise: Promise<unknown>, timeoutMs: number): Pro
   return activeTaskPromises.size === 0;
 }
 
-async function processMessage(jid: string, msg: QueuedMessage, signal: AbortSignal): Promise<void> {
+export interface QueueExecutionDeps {
+  isAuthorizedQueueSender: typeof isAuthorizedQueueSender;
+  markMessageFailed: typeof markMessageFailed;
+  markMessageDone: typeof markMessageDone;
+  getChannel: typeof getChannel;
+  logMessage: typeof logMessage;
+  setBusy: typeof setBusy;
+  invokeAgent: typeof invokeAgent;
+  sendResponse: typeof sendResponse;
+}
+
+const queueExecutionDeps: QueueExecutionDeps = {
+  isAuthorizedQueueSender,
+  markMessageFailed,
+  markMessageDone,
+  getChannel,
+  logMessage,
+  setBusy,
+  invokeAgent,
+  sendResponse,
+};
+
+/** Execute one already-claimed row. Kept injectable for trust-boundary tests. */
+export async function executeClaimedMessage(
+  jid: string,
+  msg: QueuedMessage,
+  signal: AbortSignal,
+  overrides: Partial<QueueExecutionDeps> = {},
+): Promise<void> {
+  const deps = { ...queueExecutionDeps, ...overrides };
   const { rowid, sender_name: senderName, content } = msg;
 
-  const channel = getChannel(jid);
+  // Revalidate after claiming, before logs, reactions, pi, or Slack I/O.
+  if (!deps.isAuthorizedQueueSender(msg.sender)) {
+    deps.markMessageFailed(rowid);
+    logger.debug({ rowid, jid, sender: msg.sender }, 'Rejected unauthorized queued message');
+    return;
+  }
+
+  const channel = deps.getChannel(jid);
   if (!channel) {
     logger.warn({ jid }, 'Channel disappeared during processing');
-    markMessageFailed(rowid);
+    deps.markMessageFailed(rowid);
     return;
   }
 
@@ -212,23 +245,26 @@ async function processMessage(jid: string, msg: QueuedMessage, signal: AbortSign
   // Slack has no bot typing indicator; flag the triggering message with a busy
   // reaction instead. No-op when the message has no ts (e.g. scheduler runs).
   const busyCtx = { ts: msg.event_ts ?? undefined };
-  await setBusy(jid, true, busyCtx);
+  await deps.setBusy(jid, true, busyCtx);
 
-  // Reply into the triggering message's thread when it lived in one.
-  const replyCtx = { threadTs: msg.thread_ts ?? undefined };
+  // User-triggered responses always belong to the inbound message's root.
+  // Scheduled tasks have neither timestamp and therefore remain top-level.
+  const responseThreadTs = msg.thread_ts ?? msg.event_ts ?? undefined;
+  const replyCtx = { threadTs: responseThreadTs };
 
   try {
+    const fileSendCommand = `pi-tag-slack send --channel ${jid}${responseThreadTs ? ` --thread ${responseThreadTs}` : ''} --file <absolute-path>`;
     const prompt =
       `[Slack user: ${senderName}]\n` +
-      `[To share a file with the user, run: pitag send --channel ${jid} --file <absolute-path> ` +
+      `[To share a file with the user, run: ${fileSendCommand} ` +
       `(repeat --file for multiple). Do not paste file:// links — they are dead for Slack users.]\n` +
       content;
 
-    logMessage(jid, 'user', content);
+    deps.logMessage(jid, 'user', content);
 
     const effective = computeEffectiveChannelSettings(channel);
 
-    const result = await invokeAgent(channel.folder, prompt, {
+    const result = await deps.invokeAgent(channel.folder, prompt, {
       model: effective.rawModelRef || undefined,
       thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
       cwd: effective.effectiveCwd,
@@ -243,52 +279,22 @@ async function processMessage(jid: string, msg: QueuedMessage, signal: AbortSign
     }
 
     if (result.ok) {
-      // Safety net: if the agent still wrote file:// links instead of using
-      // `pitag send`, upload those files as real attachments and post the
-      // cleaned text. The cleaned text is only used when every referenced
-      // file is shareable, so no path information is ever lost.
-      const extracted = extractFileUris(result.text);
-      const shareable = extracted.paths.filter((path) => {
-        try {
-          const stats = statSync(path);
-          return (
-            stats.isFile() &&
-            (config.maxAttachmentBytes <= 0 || stats.size <= config.maxAttachmentBytes)
-          );
-        } catch {
-          return false;
-        }
-      });
-      const allShareable = shareable.length > 0 && shareable.length === extracted.paths.length;
-      const responseText = allShareable ? extracted.text : result.text;
-
-      const sent = await sendResponse(jid, responseText, replyCtx);
+      const sent = await deps.sendResponse(jid, result.text, replyCtx);
       if (!sent) {
-        markMessageFailed(rowid);
+        deps.markMessageFailed(rowid);
         logger.warn({ jid }, 'Agent response generated but could not be delivered to Slack');
         return;
       }
 
-      if (shareable.length > 0) {
-        const uploaded = await sendFiles(jid, shareable, replyCtx);
-        if (!uploaded) {
-          await sendResponse(
-            jid,
-            `⚠️ Could not upload: ${shareable.map((path) => basename(path)).join(', ')}`,
-            replyCtx,
-          );
-        }
-      }
-
-      logMessage(jid, 'assistant', result.text);
-      markMessageDone(rowid);
+      deps.logMessage(jid, 'assistant', result.text);
+      deps.markMessageDone(rowid);
       logger.info({ jid, responseLen: result.text.length }, 'Message processed');
       return;
     }
 
     const errMsg = `⚠️ Agent error: ${result.error?.slice(0, 300) || 'unknown error'}`;
-    await sendResponse(jid, errMsg, replyCtx);
-    markMessageFailed(rowid);
+    await deps.sendResponse(jid, errMsg, replyCtx);
+    deps.markMessageFailed(rowid);
     logger.warn({ jid, error: result.error }, 'Agent returned error');
   } catch (err: any) {
     if (signal.aborted) {
@@ -300,12 +306,12 @@ async function processMessage(jid: string, msg: QueuedMessage, signal: AbortSign
     logger.error({ jid, err: err.message }, 'processMessage failed');
     safeMarkMessageFailed(jid, rowid);
     try {
-      await sendResponse(jid, `⚠️ Internal error: ${err.message?.slice(0, 200)}`, replyCtx);
+      await deps.sendResponse(jid, `⚠️ Internal error: ${err.message?.slice(0, 200)}`, replyCtx);
     } catch {
       // Nothing else to do here.
     }
   } finally {
-    await setBusy(jid, false, busyCtx);
+    await deps.setBusy(jid, false, busyCtx);
   }
 }
 

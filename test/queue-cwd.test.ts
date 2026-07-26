@@ -69,7 +69,7 @@ describe('queue cwd selection', () => {
 });
 
 async function runQueuedMessage(cwdOverride: string): Promise<{ cwd?: string } | undefined> {
-  const tempDir = mkdtempSync(join(tmpdir(), 'pitag-queue-cwd-'));
+  const tempDir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-queue-cwd-'));
   tempDirs.push(tempDir);
 
   process.env.DB_PATH = ':memory:';
@@ -99,9 +99,10 @@ async function runQueuedMessage(cwdOverride: string): Promise<{ cwd?: string } |
       thinkingOverride: '',
       cwdOverride,
     });
+    db.addTrustedUser('U1');
     db.enqueueMessage({
       channelJid: 'sl:C123',
-      sender: 'u_1',
+      sender: 'U1',
       senderName: 'Alice',
       content: 'hello',
       timestamp: new Date().toISOString(),

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { AuthStorage, ModelRegistry, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, SettingsManager } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { minimatch } from 'minimatch';
 import { config } from '../config.js';
@@ -22,6 +22,7 @@ interface ModelCache {
   loadedAt: number;
   cwd: string;
   models: AvailableModelInfo[];
+  fromPiCli: boolean;
 }
 
 const cacheByCwd = new Map<string, ModelCache>();
@@ -57,14 +58,15 @@ export async function listSelectableModels(
     cwd,
     options?.allowStale ?? false,
   );
+  const models = catalog.fromPiCli ? catalog.models : await loadSdkModelCatalog();
   const settingsManager = SettingsManager.create(cwd);
   const patterns = settingsManager.getEnabledModels();
 
   if (!patterns?.length) {
-    return catalog.models;
+    return models;
   }
 
-  return resolveEnabledModelScope(patterns, catalog.models);
+  return resolveEnabledModelScope(patterns, models);
 }
 
 export function resolveModelReference(
@@ -282,19 +284,13 @@ function loadModelCatalog(forceRefresh: boolean, cwd: string, allowStale: boolea
     return cached;
   }
 
-  const authStorage = AuthStorage.create();
-  authStorage.reload();
-
-  const registry = createModelRegistry(authStorage);
-  registry.refresh();
-
-  const sdkModels = registry.getAvailable().map(toAvailableModelInfo);
   const cliModels = listModelsFromPiCli(config.piBin, cwd);
-  const models = mergeModelMetadata(cliModels ?? sdkModels, sdkModels).sort((a, b) =>
-    a.ref.localeCompare(b.ref),
-  );
-
-  const refreshed = { loadedAt: now, cwd, models };
+  const refreshed = {
+    loadedAt: now,
+    cwd,
+    models: (cliModels ?? []).sort((a, b) => a.ref.localeCompare(b.ref)),
+    fromPiCli: cliModels !== undefined,
+  };
   cacheByCwd.set(cwd, refreshed);
   return refreshed;
 }
@@ -351,34 +347,9 @@ export function parsePiModelList(output: string): AvailableModelInfo[] {
   });
 }
 
-function mergeModelMetadata(
-  sourceModels: AvailableModelInfo[],
-  sdkModels: AvailableModelInfo[],
-): AvailableModelInfo[] {
-  const sdkByRef = new Map(sdkModels.map((model) => [model.ref.toLowerCase(), model]));
-  return sourceModels.map((model) => {
-    const sdkModel = sdkByRef.get(model.ref.toLowerCase());
-    return sdkModel
-      ? {
-          ...model,
-          name: sdkModel.name,
-          supportsXhigh: sdkModel.supportsXhigh,
-        }
-      : model;
-  });
-}
-
-function createModelRegistry(authStorage: AuthStorage): ModelRegistry {
-  const registryClass = ModelRegistry as unknown as {
-    create?: (authStorage: AuthStorage) => ModelRegistry;
-    new (authStorage: AuthStorage): ModelRegistry;
-  };
-
-  if (typeof registryClass.create === 'function') {
-    return registryClass.create(authStorage);
-  }
-
-  return new registryClass(authStorage);
+async function loadSdkModelCatalog(): Promise<AvailableModelInfo[]> {
+  const runtime = await ModelRuntime.create();
+  return (await runtime.getAvailable()).map(toAvailableModelInfo);
 }
 
 function toAvailableModelInfo(model: Model<any>): AvailableModelInfo {

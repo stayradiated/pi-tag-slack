@@ -21,6 +21,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return 0;
     }
     case 'start': {
+      requireNoArgs(args, 'Usage: pi-tag-slack start');
       if (await maybeRunFirstTimeSetup()) return 0;
       checkPiDependencies();
       const { startGateway } = await import('../index.js');
@@ -28,6 +29,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return 0;
     }
     case 'status': {
+      requireNoArgs(args, 'Usage: pi-tag-slack status');
       const { runStatus } = await import('./status.js');
       await runStatus();
       return 0;
@@ -35,10 +37,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     case 'archive':
       await cliArchive(args);
       return 0;
+    case 'trust':
+      await cliTrust(args);
+      return 0;
     case 'task':
       await cliTask(args);
       return 0;
     case 'channels':
+      requireNoArgs(args, 'Usage: pi-tag-slack channels');
       await cliListChannels();
       return 0;
     case 'send':
@@ -51,8 +57,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       await cliUnregister(args);
       return 0;
     case 'daemon': {
-      if (!args[0]) {
-        throw new Error('Usage: pitag daemon <install|uninstall|start|stop|status|logs>');
+      if (args.length !== 1) {
+        throw new Error('Usage: pi-tag-slack daemon <install|uninstall|start|stop|status|logs>');
       }
 
       const { runDaemon } = await import('./daemon.js');
@@ -62,6 +68,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     case 'help':
     case '--help':
     case '-h':
+      requireNoArgs(args, 'Usage: pi-tag-slack help');
       printHelp();
       return 0;
     default:
@@ -84,30 +91,33 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
 export function formatHelpText(): string {
   return [
-    'pitag - Lightweight Slack gateway for pi coding agent',
+    'pi-tag-slack - Lightweight Slack gateway for pi coding agent',
     '',
     'USAGE:',
-    '  pitag setup [bot-token] [app-token]         Interactive setup wizard',
-    '  pitag start                                 Start the gateway in the foreground',
-    '  pitag status                                Show local diagnostics',
-    '  pitag archive list                          List archived sessions',
-    '  pitag archive cleanup [--dry-run]           Clean up archived sessions now',
-    '  pitag task add --name <n> --schedule <expr> --channel <jid> --prompt <text> [--once]',
-    '  pitag task list                             List scheduled tasks',
-    '  pitag task remove <id>                      Remove a scheduled task',
-    '  pitag task enable <id>                      Enable a scheduled task',
-    '  pitag task disable <id>                     Disable a scheduled task',
-    '  pitag channels                              List registered channels',
-    '  pitag send --channel <jid> [--text <message>] [--file <path> ...]',
-    '  pitag register <id> <name> [opts]           Register a Slack channel',
-    '  pitag unregister <id>                       Unregister a channel',
-    '  pitag daemon install                        Install background service (systemd/launchd)',
-    '  pitag daemon uninstall                      Remove background service',
-    '  pitag daemon start                          Start background service',
-    '  pitag daemon stop                           Stop background service',
-    '  pitag daemon status                         Show background service status',
-    '  pitag daemon logs                           Tail service logs',
-    '  pitag help                                  Show this help',
+    '  pi-tag-slack setup                                 Interactive setup wizard',
+    '  pi-tag-slack start                                 Start the gateway in the foreground',
+    '  pi-tag-slack status                                Show local diagnostics',
+    '  pi-tag-slack archive list                          List archived sessions',
+    '  pi-tag-slack archive cleanup [--dry-run]           Clean up archived sessions now',
+    '  pi-tag-slack task add --name <n> --schedule <expr> --channel <jid> --prompt <text> [--once]',
+    '  pi-tag-slack task list                             List scheduled tasks',
+    '  pi-tag-slack task remove <id>                      Remove a scheduled task',
+    '  pi-tag-slack task enable <id>                      Enable a scheduled task',
+    '  pi-tag-slack task disable <id>                     Disable a scheduled task',
+    '  pi-tag-slack channels                              List registered channels',
+    '  pi-tag-slack send --channel <jid> [--thread <slack-ts>] [--text <message>] [--file <path> ...]',
+    '  pi-tag-slack trust add <user-id>                    Trust a raw Slack U.../W... user ID',
+    '  pi-tag-slack trust remove <user-id>                 Revoke a trusted user',
+    '  pi-tag-slack trust list                             List trusted users',
+    '  pi-tag-slack register <id> <name> [opts]           Register a Slack channel',
+    '  pi-tag-slack unregister <id>                       Unregister a channel',
+    '  pi-tag-slack daemon install                        Install background service (systemd/launchd)',
+    '  pi-tag-slack daemon uninstall                      Remove background service',
+    '  pi-tag-slack daemon start                          Start background service',
+    '  pi-tag-slack daemon stop                           Stop background service',
+    '  pi-tag-slack daemon status                         Show background service status',
+    '  pi-tag-slack daemon logs                           Tail service logs',
+    '  pi-tag-slack help                                  Show this help',
     '',
     'CHANNEL IDS:',
     '  Copy the channel ID from Slack: open the channel details view and scroll to',
@@ -133,16 +143,16 @@ function printHelp(): void {
 async function cliRegister(args: string[]): Promise<void> {
   if (args.length < 2) {
     throw new Error(
-      'Usage: pitag register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+      'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
     );
   }
 
   const { validateSessionFolder } = await import('../session/path.js');
   const [channelId, name, ...optionArgs] = args;
-  const options = parseRegisterOptions(channelId, optionArgs, validateSessionFolder);
+  const jid = toSlackChannelJid(channelId);
+  const options = parseRegisterOptions(jid.slice(3), optionArgs, validateSessionFolder);
 
   await withDb(({ getChannel, registerChannel }) => {
-    const jid = toSlackChannelJid(channelId);
     const existing = getChannel(jid);
     const channel: RegisteredChannel = {
       jid,
@@ -167,8 +177,8 @@ async function cliRegister(args: string[]): Promise<void> {
 }
 
 async function cliUnregister(args: string[]): Promise<void> {
-  if (args.length < 1) {
-    throw new Error('Usage: pitag unregister <channel-id>');
+  if (args.length !== 1) {
+    throw new Error('Usage: pi-tag-slack unregister <channel-id>');
   }
 
   await withDb(({ unregisterChannel }) => {
@@ -187,13 +197,14 @@ async function cliArchive(args: string[]): Promise<void> {
 
   switch (subcommand) {
     case 'list':
+      requireNoArgs(subArgs, 'Usage: pi-tag-slack archive list');
       await cliArchiveList();
       return;
     case 'cleanup':
       await cliArchiveCleanup(subArgs);
       return;
     default:
-      throw new Error('Usage: pitag archive <list|cleanup [--dry-run]>');
+      throw new Error('Usage: pi-tag-slack archive <list|cleanup [--dry-run]>');
   }
 }
 
@@ -205,19 +216,23 @@ async function cliTask(args: string[]): Promise<void> {
       await cliAddTask(subArgs);
       return;
     case 'list':
+      requireNoArgs(subArgs, 'Usage: pi-tag-slack task list');
       await cliListTasks();
       return;
     case 'remove':
+      if (subArgs.length !== 1) throw new Error('Usage: pi-tag-slack task remove <id>');
       await cliRemoveTask(subArgs);
       return;
     case 'enable':
+      if (subArgs.length !== 1) throw new Error('Usage: pi-tag-slack task enable <id>');
       await cliEnableTask(subArgs);
       return;
     case 'disable':
+      if (subArgs.length !== 1) throw new Error('Usage: pi-tag-slack task disable <id>');
       await cliDisableTask(subArgs);
       return;
     default:
-      throw new Error('Usage: pitag task <add|list|remove|enable|disable> [options]');
+      throw new Error('Usage: pi-tag-slack task <add|list|remove|enable|disable> [options]');
   }
 }
 
@@ -237,29 +252,30 @@ async function cliListChannels(): Promise<void> {
 }
 
 async function cliSend(args: string[]): Promise<void> {
-  const usage = 'Usage: pitag send --channel <jid> [--text <message>] [--file <path> ...]';
+  const usage =
+    'Usage: pi-tag-slack send --channel <jid> [--thread <slack-ts>] [--text <message>] [--file <path> ...]';
   let channel: string | undefined;
+  let threadTs: string | undefined;
   let text: string | undefined;
   const files: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--channel':
-        if (!args[i + 1]) {
-          throw new Error(usage);
-        }
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
+        if (channel !== undefined) throw new Error(usage);
         channel = args[++i];
         break;
+      case '--thread':
+        if (!isOptionValue(args[i + 1]) || threadTs !== undefined) throw new Error(usage);
+        threadTs = args[++i];
+        break;
       case '--file':
-        if (!args[i + 1]) {
-          throw new Error(usage);
-        }
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
         files.push(args[++i]);
         break;
       case '--text':
-        if (!args[i + 1]) {
-          throw new Error(usage);
-        }
+        if (!isOptionValue(args[i + 1]) || text !== undefined) throw new Error(usage);
         text = args[++i];
         break;
       default:
@@ -271,19 +287,66 @@ async function cliSend(args: string[]): Promise<void> {
     throw new Error(usage);
   }
 
+  if (threadTs && !/^\d+\.\d+$/.test(threadTs)) throw new Error(usage);
+
   if (!text && files.length === 0) {
     throw new Error(`${usage}\nAt least one of --text or --file is required.`);
   }
 
   const { sendFilesToSlack } = await import('../slack/send.js');
   const channelJid = toSlackChannelJid(channel);
-  const result = await sendFilesToSlack({ channelJid, text, files });
+  const result = await sendFilesToSlack({
+    channelJid,
+    text,
+    ...(threadTs ? { threadTs } : {}),
+    files,
+  });
   if (result.sentFiles === 0) {
     console.log(`Sent message to ${channelJid}`);
     return;
   }
 
   console.log(`Sent ${result.sentFiles} file(s) to ${channelJid}`);
+}
+
+async function cliTrust(args: string[]): Promise<void> {
+  const [subcommand, userId] = args;
+  if ((subcommand === 'add' || subcommand === 'remove') && args.length !== 2) {
+    throw new Error(`Usage: pi-tag-slack trust ${subcommand} <user-id>`);
+  }
+  if (subcommand === 'list' && args.length !== 1) {
+    throw new Error('Usage: pi-tag-slack trust list');
+  }
+  await withDb(({ addTrustedUser, removeTrustedUser, getTrustedUsers, validateTrustedUserId }) => {
+    switch (subcommand) {
+      case 'add': {
+        if (!userId) throw new Error('Usage: pi-tag-slack trust add <user-id>');
+        const id = validateTrustedUserId(userId);
+        console.log(
+          addTrustedUser(id) ? `Trusted user added: ${id}` : `User is already trusted: ${id}`,
+        );
+        return;
+      }
+      case 'remove': {
+        if (!userId) throw new Error('Usage: pi-tag-slack trust remove <user-id>');
+        const result = removeTrustedUser(validateTrustedUserId(userId));
+        console.log(
+          result.removed
+            ? `Trusted user removed: ${userId}\nCleared ${result.clearedPending} pending message(s).`
+            : `Trusted user not found: ${userId}`,
+        );
+        return;
+      }
+      case 'list': {
+        const users = getTrustedUsers();
+        if (users.length === 0) console.log('No trusted users.');
+        else users.forEach((user) => console.log(`${user.userId}\t${user.createdAt}`));
+        return;
+      }
+      default:
+        throw new Error('Usage: pi-tag-slack trust <add|remove|list> [user-id]');
+    }
+  });
 }
 
 async function cliAddTask(args: string[]): Promise<void> {
@@ -333,7 +396,7 @@ async function cliListTasks(): Promise<void> {
 }
 
 async function cliRemoveTask(args: string[]): Promise<void> {
-  const id = parseTaskId(args[0], 'Usage: pitag task remove <id>');
+  const id = parseTaskId(args[0], 'Usage: pi-tag-slack task remove <id>');
 
   await withDb(({ removeScheduledTask }) => {
     const removed = removeScheduledTask(id);
@@ -342,7 +405,7 @@ async function cliRemoveTask(args: string[]): Promise<void> {
 }
 
 async function cliEnableTask(args: string[]): Promise<void> {
-  const id = parseTaskId(args[0], 'Usage: pitag task enable <id>');
+  const id = parseTaskId(args[0], 'Usage: pi-tag-slack task enable <id>');
 
   await withDb(({ enableScheduledTask }) => {
     const enabled = enableScheduledTask(id);
@@ -351,7 +414,7 @@ async function cliEnableTask(args: string[]): Promise<void> {
 }
 
 async function cliDisableTask(args: string[]): Promise<void> {
-  const id = parseTaskId(args[0], 'Usage: pitag task disable <id>');
+  const id = parseTaskId(args[0], 'Usage: pi-tag-slack task disable <id>');
 
   await withDb(({ disableScheduledTask }) => {
     const disabled = disableScheduledTask(id);
@@ -384,8 +447,8 @@ async function cliArchiveList(): Promise<void> {
 async function cliArchiveCleanup(args: string[]): Promise<void> {
   const dryRun = args.includes('--dry-run');
   const unknownArgs = args.filter((arg) => arg !== '--dry-run');
-  if (unknownArgs.length > 0) {
-    throw new Error('Usage: pitag archive cleanup [--dry-run]');
+  if (unknownArgs.length > 0 || args.filter((arg) => arg === '--dry-run').length > 1) {
+    throw new Error('Usage: pi-tag-slack archive cleanup [--dry-run]');
   }
 
   const [{ cleanupArchivedSessions }, { config }] = await Promise.all([
@@ -467,7 +530,7 @@ async function maybeRunFirstTimeSetup(): Promise<boolean> {
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   if (!interactive) {
     throw new Error(
-      `No config found at ${configPath}. Run "pitag setup" first, or set PITAG_CONFIG to point to your config file.`,
+      `No config found at ${configPath}. Run "pi-tag-slack setup" first, or set PI_TAG_SLACK_CONFIG to point to your config file.`,
     );
   }
 
@@ -542,21 +605,35 @@ function parseRegisterOptions(
     isMain: false,
   };
 
+  const seen = new Set<string>();
   for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
+    const flag = args[i];
+    if (seen.has(flag))
+      throw new Error(
+        'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+      );
+    seen.add(flag);
+    switch (flag) {
       case '--folder':
-        if (args[i + 1]) {
-          options.folder = validateSessionFolder(args[++i]);
-        }
+        if (!isOptionValue(args[i + 1]))
+          throw new Error(
+            'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+          );
+        options.folder = validateSessionFolder(args[++i]);
         break;
-      case '--cwd':
-        if (args[i + 1]) {
-          const cwdOverride = args[++i].trim();
-          if (cwdOverride) {
-            options.cwdOverride = cwdOverride;
-          }
-        }
+      case '--cwd': {
+        if (!isOptionValue(args[i + 1]))
+          throw new Error(
+            'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+          );
+        const cwdOverride = args[++i].trim();
+        if (!cwdOverride)
+          throw new Error(
+            'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+          );
+        options.cwdOverride = cwdOverride;
         break;
+      }
       case '--no-trigger':
         options.requiresTrigger = false;
         break;
@@ -564,6 +641,10 @@ function parseRegisterOptions(
         options.isMain = true;
         options.requiresTrigger = false;
         break;
+      default:
+        throw new Error(
+          'Usage: pi-tag-slack register <channel-id> <name> [--folder <name>] [--cwd <path>] [--no-trigger] [--main]',
+        );
     }
   }
 
@@ -587,18 +668,28 @@ function parseTaskAddOptions(args: string[]): {
     type: 'recurring',
   };
 
+  const seen = new Set<string>();
+  const usage =
+    'Usage: pi-tag-slack task add --name <n> --schedule <cron|iso> --channel <jid> --prompt <text> [--once]';
   for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
+    const flag = args[i];
+    if (seen.has(flag)) throw new Error(usage);
+    seen.add(flag);
+    switch (flag) {
       case '--name':
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
         options.name = args[++i];
         break;
       case '--schedule':
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
         options.schedule = args[++i];
         break;
       case '--channel':
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
         options.channel = args[++i];
         break;
       case '--prompt':
+        if (!isOptionValue(args[i + 1])) throw new Error(usage);
         options.prompt = args[++i];
         break;
       case '--once':
@@ -606,14 +697,14 @@ function parseTaskAddOptions(args: string[]): {
         break;
       default:
         throw new Error(
-          'Usage: pitag task add --name <n> --schedule <cron|iso> --channel <jid> --prompt <text> [--once]',
+          'Usage: pi-tag-slack task add --name <n> --schedule <cron|iso> --channel <jid> --prompt <text> [--once]',
         );
     }
   }
 
   if (!options.name || !options.schedule || !options.channel || !options.prompt) {
     throw new Error(
-      'Usage: pitag task add --name <n> --schedule <cron|iso> --channel <jid> --prompt <text> [--once]',
+      'Usage: pi-tag-slack task add --name <n> --schedule <cron|iso> --channel <jid> --prompt <text> [--once]',
     );
   }
 
@@ -626,17 +717,17 @@ function parseTaskAddOptions(args: string[]): {
   };
 }
 
+function isOptionValue(value: string | undefined): value is string {
+  return value !== undefined && !value.startsWith('--');
+}
+
 function parseTaskId(raw: string | undefined, usage: string): number {
-  if (!raw) {
-    throw new Error(usage);
-  }
+  if (!raw || !/^[1-9]\d*$/.test(raw)) throw new Error(usage);
+  return Number(raw);
+}
 
-  const id = Number.parseInt(raw, 10);
-  if (Number.isNaN(id)) {
-    throw new Error(usage);
-  }
-
-  return id;
+function requireNoArgs(args: string[], usage: string): void {
+  if (args.length !== 0) throw new Error(usage);
 }
 
 function formatChannelSummary(channel: RegisteredChannel): string {
@@ -655,8 +746,13 @@ function formatChannelSummary(channel: RegisteredChannel): string {
 }
 
 function toSlackChannelJid(channelId: string): string {
-  // Accept bare Slack channel IDs (C…/G…/D…) as well as already-prefixed jids.
-  return channelId.startsWith('sl:') ? channelId : `sl:${channelId}`;
+  const raw = channelId.startsWith('sl:') ? channelId.slice(3) : channelId;
+  if (!/^[CGD][A-Z0-9]+$/.test(raw)) {
+    throw new Error(
+      'Slack channel ID must be a raw uppercase C..., G..., or D... ID (optionally prefixed with sl:).',
+    );
+  }
+  return `sl:${raw}`;
 }
 
 if (isDirectExecution()) {

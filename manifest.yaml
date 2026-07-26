@@ -1,4 +1,4 @@
-# Slack app manifest for pi-tag.
+# Slack app manifest for pi-tag-slack.
 #
 # Create your app in one step:
 #   https://api.slack.com/apps -> "Create New App" -> "From a manifest"
@@ -11,7 +11,7 @@
 #      Workspace) and copy the Bot User OAuth Token (xoxb-...).
 #   2. Basic Information -> App-Level Tokens -> generate a token with the
 #      connections:write scope and copy it (xapp-...).
-#   3. Run `pitag setup` and paste both tokens.
+#   3. Run `pi-tag-slack setup` and paste both tokens.
 display_information:
   name: pi
   description: Chat with the pi coding agent from Slack — sessions, files, and scheduled tasks in any channel or DM

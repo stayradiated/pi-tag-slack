@@ -7,6 +7,7 @@ import { splitMessage, SLACK_MAX_MESSAGE_LENGTH } from './text.js';
 export interface SendRequest {
   channelJid: string;
   text?: string;
+  threadTs?: string;
   files: string[];
 }
 
@@ -63,7 +64,11 @@ export async function sendFilesToSlack(request: SendRequest): Promise<{ sentFile
     // Text-only; validateSendRequest guarantees text is present here.
     // Split like the gateway does — markdown_text rejects long payloads.
     for (const chunk of splitMessage(text ?? '', SLACK_MAX_MESSAGE_LENGTH)) {
-      await client.chat.postMessage({ channel: channelId, markdown_text: chunk });
+      await client.chat.postMessage({
+        channel: channelId,
+        markdown_text: chunk,
+        thread_ts: request.threadTs,
+      });
     }
     return { sentFiles: 0 };
   }
@@ -73,7 +78,11 @@ export async function sendFilesToSlack(request: SendRequest): Promise<{ sentFile
   let initialComment = text || undefined;
   if (initialComment && initialComment.length > SLACK_MAX_MESSAGE_LENGTH) {
     for (const chunk of splitMessage(initialComment, SLACK_MAX_MESSAGE_LENGTH)) {
-      await client.chat.postMessage({ channel: channelId, markdown_text: chunk });
+      await client.chat.postMessage({
+        channel: channelId,
+        markdown_text: chunk,
+        thread_ts: request.threadTs,
+      });
     }
     initialComment = undefined;
   }
@@ -81,6 +90,6 @@ export async function sendFilesToSlack(request: SendRequest): Promise<{ sentFile
   return uploadFilesExternal(
     client,
     request.files.map((filePath) => ({ filePath })),
-    { channelId, initialComment },
+    { channelId, threadTs: request.threadTs, initialComment },
   );
 }

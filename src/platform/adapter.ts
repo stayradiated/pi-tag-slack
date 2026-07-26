@@ -2,7 +2,7 @@
  * Platform adapter port — the single seam between the platform-neutral core
  * (queue, agent, sessions, scheduler) and a chat platform implementation.
  *
- * pi-tag ships exactly one implementation (src/slack/client.ts). The interface
+ * pi-tag-slack ships exactly one implementation (src/slack/client.ts). The interface
  * exists so the core never grows platform-specific imports beyond this shape,
  * and so a future shared gateway core can be extracted without refactoring.
  */
@@ -18,9 +18,7 @@ export interface PlatformAdapter {
 
   /**
    * Deliver agent output to a channel. `ctx.threadTs` carries the parent
-   * thread ts when the triggering message lived in a thread; implementations
-   * decide whether to honor it (e.g. Slack honors it when REPLY_IN_THREAD is
-   * enabled). Returns false when delivery failed.
+   * thread root ts for a user-triggered response. Returns false when delivery failed.
    */
   sendResponse(jid: string, text: string, ctx?: { threadTs?: string }): Promise<boolean>;
 
@@ -30,10 +28,4 @@ export interface PlatformAdapter {
    * message instead. Best-effort: implementations must never reject.
    */
   setBusy(jid: string, on: boolean, ctx?: { ts?: string }): Promise<void>;
-
-  /**
-   * Upload local files to a channel as native attachments (used when agent
-   * output references files on the gateway host). Returns false on failure.
-   */
-  sendFiles(jid: string, filePaths: string[], ctx?: { threadTs?: string }): Promise<boolean>;
 }

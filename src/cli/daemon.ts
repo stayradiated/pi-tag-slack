@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultDataDir, resolveConfigPath } from '../config.js';
 
-const SERVICE_NAME = 'pitag';
+const SERVICE_NAME = 'pi-tag-slack';
 const DATA_DIR = defaultDataDir();
 
 const isLinux = () => process.platform === 'linux';
@@ -59,7 +59,7 @@ function linuxInstall(): void {
     SYSTEMD_SERVICE_PATH,
     [
       '[Unit]',
-      'Description=pi-tag Slack Gateway',
+      'Description=pi-tag-slack Slack Gateway',
       'After=network-online.target',
       'Wants=network-online.target',
       '',
@@ -71,7 +71,7 @@ function linuxInstall(): void {
       'RestartSec=10',
       'StandardOutput=journal',
       'StandardError=journal',
-      `Environment=PITAG_CONFIG=${configPath}`,
+      `Environment=PI_TAG_SLACK_CONFIG=${configPath}`,
       '',
       '[Install]',
       'WantedBy=default.target',
@@ -95,8 +95,8 @@ function linuxUninstall(): void {
 // ─── macOS (launchd) ───
 
 const LAUNCH_AGENTS_DIR = resolve(homedir(), 'Library/LaunchAgents');
-const PLIST_PATH = resolve(LAUNCH_AGENTS_DIR, `com.${SERVICE_NAME}.plist`);
-const PLIST_LABEL = `com.${SERVICE_NAME}`;
+const PLIST_LABEL = 'com.stayradiated.pi-tag-slack';
+const PLIST_PATH = resolve(LAUNCH_AGENTS_DIR, `${PLIST_LABEL}.plist`);
 const STDOUT_LOG = resolve(DATA_DIR, 'daemon.stdout.log');
 const STDERR_LOG = resolve(DATA_DIR, 'daemon.stderr.log');
 
@@ -217,7 +217,7 @@ function buildPlist(options: {
     '',
     '  <key>EnvironmentVariables</key>',
     '  <dict>',
-    '    <key>PITAG_CONFIG</key>',
+    '    <key>PI_TAG_SLACK_CONFIG</key>',
     `    <string>${esc(configPath)}</string>`,
     '    <key>PATH</key>',
     `    <string>${esc(pathEnv)}</string>`,

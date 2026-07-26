@@ -1,10 +1,7 @@
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   buildTriggerPattern,
   containsBotMention,
-  extractFileUris,
   normalizeSlackText,
   resolveInboundContent,
   splitMessage,
@@ -130,51 +127,6 @@ describe('containsBotMention', () => {
     expect(containsBotMention('&lt;@U0BOT123&gt; hi', 'U0BOT123')).toBe(false);
     expect(containsBotMention('hello', 'U0BOT123')).toBe(false);
     expect(containsBotMention('<@U0BOT123> hi', '')).toBe(false);
-  });
-});
-
-describe('extractFileUris', () => {
-  // file:// URIs are platform-specific (Windows needs a drive letter, and
-  // fileURLToPath rejects POSIX-style URIs there), so test inputs are built
-  // from real platform paths via pathToFileURL.
-  const base = process.platform === 'win32' ? 'C:\\pi-tag-test' : '/pi-tag-test';
-  const filePath = (name: string) => join(base, name);
-  const fileUri = (name: string) => pathToFileURL(filePath(name)).href;
-
-  it('extracts a markdown file link and keeps its label', () => {
-    const { paths, text } = extractFileUris(`Here: [the report](${fileUri('report.pdf')})`);
-    expect(paths).toEqual([filePath('report.pdf')]);
-    expect(text).toBe('Here: the report');
-  });
-
-  it('extracts a bare file URI and shows the file name', () => {
-    const { paths, text } = extractFileUris(`Saved to ${fileUri('report.pdf')}`);
-    expect(paths).toEqual([filePath('report.pdf')]);
-    expect(text).toBe('Saved to 📎 report.pdf');
-  });
-
-  it('extracts angle-bracketed URIs and decodes percent-encoding', () => {
-    const uri = fileUri('my doc.txt');
-    expect(uri).toContain('%20');
-    const { paths } = extractFileUris(`<${uri}>`);
-    expect(paths).toEqual([filePath('my doc.txt')]);
-  });
-
-  it('strips trailing sentence punctuation', () => {
-    const { paths } = extractFileUris(`I wrote ${fileUri('out.csv')}.`);
-    expect(paths).toEqual([filePath('out.csv')]);
-  });
-
-  it('deduplicates repeated references', () => {
-    const { paths } = extractFileUris(`${fileUri('a.txt')} and again [a](${fileUri('a.txt')})`);
-    expect(paths).toEqual([filePath('a.txt')]);
-  });
-
-  it('leaves http links and plain text untouched', () => {
-    const input = 'see https://example.com/file.pdf and /home/u/not-a-link.txt';
-    const { paths, text } = extractFileUris(input);
-    expect(paths).toEqual([]);
-    expect(text).toBe(input);
   });
 });
 

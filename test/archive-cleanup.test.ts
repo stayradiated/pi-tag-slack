@@ -73,7 +73,7 @@ describe('listArchivedSessions', () => {
 });
 
 function createTempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'pitag-archive-'));
+  const dir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-archive-'));
   tempDirs.push(dir);
   return dir;
 }

@@ -7,8 +7,38 @@ import { type RegisteredChannel, type QueuedMessage, type ThinkingLevel } from '
 
 let db!: Database.Database;
 let dbOpen = false;
+let activeDbPath: string | undefined;
 
 export type ScheduledTaskType = 'once' | 'recurring';
+
+export class FinalTrustedUserError extends Error {
+  constructor() {
+    super('Cannot remove the final trusted user. Add another trusted user first.');
+    this.name = 'FinalTrustedUserError';
+  }
+}
+
+export function validateSlackId(value: string, prefixes: string): string {
+  if (!new RegExp(`^[${prefixes}][A-Z0-9]+$`).test(value)) {
+    throw new Error(
+      `Slack ID must be a raw uppercase ${prefixes.split('').join('... or ')}... ID.`,
+    );
+  }
+  return value;
+}
+
+export function validateTrustedUserId(userId: string): string {
+  try {
+    return validateSlackId(userId, 'UW');
+  } catch {
+    throw new Error('Slack user ID must be a raw uppercase U... or W... ID.');
+  }
+}
+
+/** The sole authorization rule for rows entering the agent queue. */
+export function isAuthorizedQueueSender(sender: string): boolean {
+  return sender === 'scheduler' || isTrustedUser(sender);
+}
 
 export interface ScheduledTaskRow {
   id: number;
@@ -24,16 +54,41 @@ export interface ScheduledTaskRow {
   created_by: string;
 }
 
-export function initDb(): void {
-  if (dbOpen) return;
+export function initDb(dbPath: string = config.dbPath): void {
+  if (dbOpen) {
+    if (activeDbPath === dbPath) return;
+    throw new Error(`Database is already open at ${activeDbPath}; cannot open ${dbPath}.`);
+  }
 
-  mkdirSync(dirname(config.dbPath), { recursive: true });
-  db = new Database(config.dbPath);
-  dbOpen = true;
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 5000');
+  let candidate: Database.Database | undefined;
+  try {
+    // SQLite's special in-memory path has no parent directory to create.
+    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+    candidate = new Database(dbPath);
+    candidate.pragma('journal_mode = WAL');
+    candidate.pragma('busy_timeout = 5000');
 
-  db.exec(`
+    const userVersion = Number(candidate.pragma('user_version', { simple: true }));
+    const hasApplicationTables = Boolean(
+      candidate
+        .prepare(
+          "select 1 from sqlite_master where type = 'table' and name in ('channels', 'message_queue', 'message_log', 'scheduled_tasks', 'trusted_users')",
+        )
+        .get(),
+    );
+    if (userVersion > 1) {
+      throw new Error(
+        `Unsupported database schema version ${userVersion}; this version supports schema 1.`,
+      );
+    }
+    if (userVersion === 0 && hasApplicationTables) {
+      throw new Error(
+        'Pre-release database schema detected. Delete and recreate the database before starting pi-tag-slack.',
+      );
+    }
+
+    candidate.transaction(() =>
+      candidate!.exec(`
     create table if not exists channels (
       jid              text primary key,
       name             text not null,
@@ -55,7 +110,10 @@ export function initDb(): void {
       timestamp     text not null,
       status        text not null default 'pending',
       created_at    text not null default (datetime('now')),
-      processed_at  text
+      processed_at  text,
+      attachments   text,
+      event_ts      text,
+      thread_ts     text
     );
 
     create index if not exists idx_queue_status on message_queue(status, channel_jid);
@@ -83,23 +141,30 @@ export function initDb(): void {
     );
 
     create index if not exists idx_scheduled_tasks_due on scheduled_tasks(enabled, next_run_at);
-  `);
 
-  ensureTableColumn('channels', 'model_override', "text not null default ''");
-  ensureTableColumn('channels', 'thinking_override', "text not null default ''");
-  ensureTableColumn('channels', 'cwd_override', "text not null default ''");
-  ensureTableColumn('message_queue', 'attachments', 'text');
-  ensureTableColumn('message_queue', 'event_ts', 'text');
-  ensureTableColumn('message_queue', 'thread_ts', 'text');
+    create table if not exists trusted_users (
+      user_id    text primary key,
+      created_at text not null default (datetime('now'))
+    );
+    pragma user_version = 1;
+  `),
+    )();
 
-  logger.info({ path: config.dbPath }, 'Database initialized');
-}
-
-function ensureTableColumn(table: string, column: string, ddl: string): void {
-  const rows = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
-  if (rows.some((row) => row.name === column)) return;
-  db.exec(`alter table ${table} add column ${column} ${ddl}`);
-  logger.info({ table, column }, 'Database migrated: added column');
+    // Publish only a fully validated connection.
+    db = candidate;
+    dbOpen = true;
+    activeDbPath = dbPath;
+    logger.info({ path: dbPath }, 'Database initialized');
+  } catch (error) {
+    try {
+      candidate?.close();
+    } catch {
+      // Preserve the initialization failure.
+    }
+    dbOpen = false;
+    activeDbPath = undefined;
+    throw error;
+  }
 }
 
 function normalizeTimestamp(timestamp: string | null): string | null {
@@ -113,6 +178,47 @@ function normalizeTimestamp(timestamp: string | null): string | null {
   }
 
   return parsed.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+// ── Trusted Slack users ──
+
+export function addTrustedUser(userId: string): boolean {
+  const result = db
+    .prepare('insert into trusted_users (user_id) values (?) on conflict(user_id) do nothing')
+    .run(validateTrustedUserId(userId));
+  return result.changes > 0;
+}
+
+export function removeTrustedUser(userId: string): { removed: boolean; clearedPending: number } {
+  const id = validateTrustedUserId(userId);
+  return db.transaction(() => {
+    const count = getTrustedUserCount();
+    const exists = isTrustedUser(id);
+    if (exists && count <= 1) throw new FinalTrustedUserError();
+    const removed = db.prepare('delete from trusted_users where user_id = ?').run(id).changes > 0;
+    const clearedPending = removed
+      ? db.prepare("delete from message_queue where sender = ? and status = 'pending'").run(id)
+          .changes
+      : 0;
+    return { removed, clearedPending };
+  })();
+}
+
+export function getTrustedUsers(): Array<{ userId: string; createdAt: string }> {
+  return db
+    .prepare(
+      'select user_id as userId, created_at as createdAt from trusted_users order by created_at, user_id',
+    )
+    .all() as Array<{ userId: string; createdAt: string }>;
+}
+
+export function isTrustedUser(userId: string): boolean {
+  return Boolean(db.prepare('select 1 from trusted_users where user_id = ?').get(userId));
+}
+
+export function getTrustedUserCount(): number {
+  return (db.prepare('select count(*) as count from trusted_users').get() as { count: number })
+    .count;
 }
 
 // ── Channel registration ──
@@ -285,11 +391,25 @@ export function clearPendingMessages(channelJid: string): number {
   return result.changes;
 }
 
-export function recoverStuckMessages(): number {
-  const result = db
-    .prepare("update message_queue set status = 'pending' where status = 'processing'")
-    .run();
-  return result.changes;
+export function recoverQueueForStartup(): {
+  recoveredProcessing: number;
+  rejectedUnauthorized: number;
+} {
+  return db.transaction(() => {
+    const recoveredProcessing = db
+      .prepare("update message_queue set status = 'pending' where status = 'processing'")
+      .run().changes;
+    const rejectedUnauthorized = db
+      .prepare(
+        `
+        update message_queue set status = 'failed', processed_at = datetime('now')
+        where status = 'pending' and sender != 'scheduler'
+          and not exists (select 1 from trusted_users where user_id = message_queue.sender)
+      `,
+      )
+      .run().changes;
+    return { recoveredProcessing, rejectedUnauthorized };
+  })();
 }
 
 /** Get channels that have pending messages */
@@ -423,6 +543,10 @@ export function logMessage(channelJid: string, role: string, content: string): v
 
 export function closeDb(): void {
   if (!dbOpen) return;
-  db.close();
-  dbOpen = false;
+  try {
+    db.close();
+  } finally {
+    dbOpen = false;
+    activeDbPath = undefined;
+  }
 }
