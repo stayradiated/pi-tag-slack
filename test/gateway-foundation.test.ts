@@ -14,8 +14,8 @@ import {
 } from '../src/db.js';
 import { dispatch, startControlServer } from '../src/control.js';
 import { main } from '../src/cli/index.js';
-import { startGateway } from '../src/index.js';
-import { processSlackEvent } from '../src/slack.js';
+import { startGateway, startupRecoveryPrompt } from '../src/index.js';
+import { GatewayCoordinator, processSlackEvent } from '../src/slack.js';
 import { validateConfiguredConversation } from '../src/slack-validation.js';
 import {
   clearSlackClient,
@@ -314,6 +314,74 @@ describe('control pagination', () => {
     };
     expect(second).toMatchObject({ items: [{ id: 'task-1' }], nextCursor: null });
     expect(() => request('task.list', { cursor: 'not-a-cursor' })).toThrow(/cursor is invalid/);
+  });
+});
+
+describe('task pi delivery and recovery', () => {
+  it('persists a manual task, then notifies pi and records acceptance only on success', async () => {
+    configuredDb();
+    const messages: string[] = [];
+    const services = {
+      coordinator: new GatewayCoordinator(),
+      notifier: {
+        async notify(message: string) {
+          messages.push(message);
+          return { acceptedAt: '2025-01-01T00:00:00.000Z', sessionId: 'session', runSequence: 7 };
+        },
+      },
+    };
+    await expect(
+      dispatch(
+        { version: 1, id: 'task-add', command: 'task.add', params: { title: 'Deploy', instructions: 'Ship it.' } },
+        services,
+      ),
+    ).resolves.toEqual({ id: 'task-1', notified: true });
+    expect(messages[0]).toContain('[New task; task-1]');
+    expect(messages[0]).toContain('Title: Deploy');
+    expect(messages[0]).toContain('task resolve task-1');
+    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+      rpc_accepted_at: '2025-01-01T00:00:00.000Z',
+      pi_session_id: 'session',
+      run_sequence: 7,
+    });
+  });
+
+  it('keeps a task open and unaccepted when pi notification fails', async () => {
+    configuredDb();
+    const services = {
+      coordinator: new GatewayCoordinator(),
+      notifier: { async notify() { throw new Error('pi unavailable'); } },
+    };
+    await expect(
+      dispatch(
+        { version: 1, id: 'task-add', command: 'task.add', params: { title: 'Deploy', instructions: 'Ship it.' } },
+        services,
+      ),
+    ).rejects.toMatchObject({ code: 'PARTIAL_SUCCESS' });
+    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+      state: 'open',
+      rpc_accepted_at: null,
+      pi_session_id: null,
+      run_sequence: null,
+    });
+  });
+
+  it('makes one neutral combined recovery summary without accepting individual work', () => {
+    configuredDb();
+    expect(startupRecoveryPrompt()).toBeUndefined();
+    dispatch({ version: 1, id: 'task', command: 'task.add', params: { title: 'Task', instructions: 'Do it.' } });
+    ingestSlackEvent({
+      eventId: 'Ev_recovery', kind: 'new-message', messageId: 'C0123456789:1', senderId: 'U0123456789',
+      senderLabel: 'User', content: 'Hello', messageTs: '1',
+    });
+    const summary = startupRecoveryPrompt();
+    expect(summary).toContain('Open inbox items: 1');
+    expect(summary).toContain('Open tasks: 1');
+    expect(summary).toContain('inbox-1');
+    expect(summary).toContain('task-1');
+    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+      rpc_accepted_at: null,
+    });
   });
 });
 

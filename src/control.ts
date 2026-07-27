@@ -5,6 +5,8 @@ import type Database from 'better-sqlite3';
 import { assertPrivateSocket, gatewayPaths, structuralPathExists } from './paths.js';
 import {
   addTrustedUser,
+  createManualTask,
+  markTaskAccepted,
   parsePublicId,
   publicId,
   readGatewayConfig,
@@ -16,6 +18,7 @@ import {
   updateGatewayConfig,
   type MutableConfigKey,
 } from './db.js';
+import type { PiNotifier, GatewayCoordinator } from './slack.js';
 import {
   replyToInbox,
   scheduleReactionReconciliation,
@@ -175,7 +178,12 @@ function resolveRows(
   })();
 }
 
-export function dispatch(request: Request): unknown {
+export type ControlServices = {
+  notifier: PiNotifier;
+  coordinator: GatewayCoordinator;
+};
+
+export function dispatch(request: Request, services?: ControlServices): unknown {
   const db = requireConfiguredDb();
   const params = request.params;
   switch (request.command) {
@@ -241,13 +249,42 @@ export function dispatch(request: Request): unknown {
     case 'task.show':
       return one(db, 'tasks', text(params.id, 'id'));
     case 'task.add': {
-      const stamp = new Date().toISOString();
-      const result = db
-        .prepare(
-          "insert into tasks (source, title, instructions, state, created_at) values ('manual', ?, ?, 'open', ?)",
-        )
-        .run(text(params.title, 'title'), text(params.instructions, 'instructions'), stamp);
-      return { id: publicId('task', Number(result.lastInsertRowid)) };
+      const title = text(params.title, 'title');
+      const instructions = text(params.instructions, 'instructions');
+      // The direct dispatch fallback is useful to offline unit tests. Runtime
+      // control-server task creation always receives daemon services below.
+      if (!services) {
+        const task = createManualTask(title, instructions);
+        return { id: publicId('task', Number(task.id)) };
+      }
+      const add = async () => {
+        // The durable row is deliberately committed before RPC: an RPC error is
+        // partial success, not a reason to lose work or retry task creation.
+        const task = createManualTask(title, instructions);
+        const id = Number(task.id);
+        const taskId = publicId('task', id);
+        try {
+          const acceptance = await services.notifier.notify(
+            `[New task; ${taskId}]\n` +
+              `Title: ${title}\nInstructions follow:\n---\n${instructions}\n---\n` +
+              'This is durable task work. Use pi-tag-slack task list, task show ' +
+              `${taskId}, and task resolve ${taskId} [--reason <text>] to inspect and complete it. ` +
+              'Other open inbox items or tasks may also exist.',
+          );
+          markTaskAccepted(id, acceptance);
+          return { id: taskId, notified: true };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown pi RPC failure.';
+          throw Object.assign(
+            new Error(
+              `Task ${taskId} was created and remains open, but pi notification failed: ${message}. ` +
+                'Do not retry task add; inspect the task and notify pi manually if needed.',
+            ),
+            { code: 'PARTIAL_SUCCESS' },
+          );
+        }
+      };
+      return services.coordinator.run(add);
     }
     case 'task.resolve':
       return resolveRows(db, 'tasks', ids(params.ids), text(params.reason ?? 'resolved', 'reason'));
@@ -353,7 +390,7 @@ function decodeFrame(frame: Buffer): Request {
   return value as Request;
 }
 
-function serve(socket: Socket): void {
+function serve(socket: Socket, services?: ControlServices): void {
   let buffer = Buffer.alloc(0);
   let answered = false;
   const timer = setTimeout(() => {
@@ -411,7 +448,7 @@ function serve(socket: Socket): void {
     try {
       const request = decodeFrame(buffer.subarray(0, newline));
       try {
-        Promise.resolve(dispatch(request))
+        Promise.resolve(dispatch(request, services))
           .then((result) => finish({ id: request.id, result }))
           .catch((error) => finish(errorReply(request.id, error)));
       } catch (error) {
@@ -438,7 +475,7 @@ async function staleSocket(path: string): Promise<boolean> {
   });
 }
 
-export async function startControlServer(): Promise<Server> {
+export async function startControlServer(services?: ControlServices): Promise<Server> {
   const path = gatewayPaths().socket;
   // existsSync deliberately returns false for dangling symlinks; lstat-based
   // structuralPathExists makes those unsafe paths a startup failure instead.
@@ -447,7 +484,7 @@ export async function startControlServer(): Promise<Server> {
     if (!(await staleSocket(path))) throw new Error(`Control socket is already live: ${path}`);
     unlinkSync(path);
   }
-  const server = createServer(serve);
+  const server = createServer((socket) => serve(socket, services));
   // Keep a runtime handler after bind. Without one, a later server error is an
   // unhandled EventEmitter error that can terminate the daemon unexpectedly.
   server.on('error', () => undefined);

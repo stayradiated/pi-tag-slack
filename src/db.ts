@@ -496,6 +496,51 @@ export function inboxSnapshot(id: number): Record<string, unknown> | undefined {
     Record<string, unknown> | undefined;
 }
 
+/** Creates a manual task before attempting its intentionally non-atomic pi delivery. */
+export function createManualTask(title: string, instructions: string): Record<string, unknown> {
+  const result = requireConfiguredDb()
+    .prepare(
+      "insert into tasks (source, title, instructions, state, created_at) values ('manual', ?, ?, 'open', ?)",
+    )
+    .run(title, instructions, now());
+  return requireConfiguredDb().prepare('select * from tasks where id=?').get(result.lastInsertRowid) as Record<
+    string,
+    unknown
+  >;
+}
+
+/** Records only an RPC command that pi has explicitly accepted. */
+export function markTaskAccepted(
+  id: number,
+  metadata: { acceptedAt: string; sessionId?: string; runSequence?: number },
+): void {
+  requireConfiguredDb()
+    .prepare('update tasks set rpc_accepted_at=?, pi_session_id=?, run_sequence=? where id=?')
+    .run(metadata.acceptedAt, metadata.sessionId ?? null, metadata.runSequence ?? null, id);
+}
+
+/** Existing work for a single startup/reset recovery message; this never changes acceptance metadata. */
+export function openWorkSummary(): {
+  inboxTotal: number;
+  inbox: Array<Record<string, unknown>>;
+  taskTotal: number;
+  tasks: Array<Record<string, unknown>>;
+} {
+  const d = requireConfiguredDb();
+  const recent = (table: 'inbox' | 'tasks') =>
+    d
+      .prepare(`select * from ${table} where state='open' order by created_at desc, id desc limit 3`)
+      .all() as Array<Record<string, unknown>>;
+  return {
+    inboxTotal: (d.prepare("select count(*) count from inbox where state='open'").get() as { count: number })
+      .count,
+    inbox: recent('inbox'),
+    taskTotal: (d.prepare("select count(*) count from tasks where state='open'").get() as { count: number })
+      .count,
+    tasks: recent('tasks'),
+  };
+}
+
 /** Records best-effort gateway reaction reconciliation without changing inbox lifecycle. */
 export function setInboxWorking(id: number): Record<string, unknown> {
   const d = requireConfiguredDb();
