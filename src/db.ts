@@ -355,6 +355,12 @@ export function requireConfiguredDb(): Database.Database {
   return d;
 }
 
+/** Validates schema v2 and the complete configuration singleton on an injected connection. */
+export function validateConfiguredDatabase(candidate: Database.Database): void {
+  validateSchema(candidate);
+  configuredRow(candidate);
+}
+
 const mutableConfigColumns = {
   defaultModel: 'default_model',
   defaultThinking: 'default_thinking',

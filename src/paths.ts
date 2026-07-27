@@ -146,7 +146,12 @@ function verifyLockFile(path: string, stat: Stats): void {
  */
 export function acquireGatewayLock(
   paths = gatewayPaths(),
-  options: { createLayout?: boolean } = {},
+  options: {
+    createLayout?: boolean;
+    createFile?: boolean;
+    writeMetadata?: boolean;
+    readOnly?: boolean;
+  } = {},
 ): GatewayLock {
   if (options.createLayout !== false) ensurePrivateLayout(paths);
   else assertOwnedPrivate(paths.dataDir, 0o700, 'directory');
@@ -158,9 +163,14 @@ export function acquireGatewayLock(
     try {
       before = lstatSync(paths.lock);
       verifyLockFile(paths.lock, before);
-      fd = openSync(paths.lock, constants.O_RDWR | constants.O_NOFOLLOW);
+      const noAtime = options.readOnly ? (constants.O_NOATIME ?? 0) : 0;
+      fd = openSync(
+        paths.lock,
+        (options.readOnly ? constants.O_RDONLY : constants.O_RDWR) | constants.O_NOFOLLOW | noAtime,
+      );
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || options.createFile === false)
+        throw error;
       // O_EXCL prevents an attacker from replacing a previously absent path
       // between lstat and open. O_NOFOLLOW protects both Linux and macOS.
       fd = openSync(
@@ -185,8 +195,11 @@ export function acquireGatewayLock(
     }
     locked = true;
     // Metadata is diagnostic only. A stale value never affects acquisition.
-    ftruncateSync(fd, 0);
-    writeFileSync(fd, `${process.pid}\n`, { encoding: 'utf8' });
+    // Offline doctor locks an existing read-only descriptor without rewriting it.
+    if (options.writeMetadata !== false) {
+      ftruncateSync(fd, 0);
+      writeFileSync(fd, `${process.pid}\n`, { encoding: 'utf8' });
+    }
 
     let released = false;
     return {

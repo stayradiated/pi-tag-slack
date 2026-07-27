@@ -16,13 +16,12 @@ import {
 } from '../db.js';
 import { resolveConfigPath, validateBootstrapConfigPath } from '../config.js';
 import { CONTROL_COMMAND_DEADLINE_MS, SLACK_NETWORK_DEADLINE_MS } from '../control.js';
+import { offlineDoctor, onlineDoctor } from '../doctor.js';
 import {
   acquireGatewayLock,
   ensurePrivateFile,
   ensurePrivateLayout,
   gatewayPaths,
-  pathDiagnostic,
-  pathDiagnostics,
   structuralPathExists,
 } from '../paths.js';
 
@@ -82,49 +81,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 }
 
 async function doctor(): Promise<number> {
-  const diagnostics = () => ({
-    paths: pathDiagnostics(),
-    bootstrapConfig: pathDiagnostic(resolveConfigPath()),
-  });
-  // Prefer the daemon: opening SQLite while it owns the gateway is forbidden.
+  // Prefer daemon-owned health. Only a genuine connection failure permits the
+  // lock-gated offline path; daemon/protocol errors are not bypassed with SQLite.
   try {
     const health = await request('health', {});
-    if (health.error) throw new Error(health.error.message);
-    console.log(
-      JSON.stringify({ ...diagnostics(), daemon: health.result, lock: 'held by daemon' }, null, 2),
-    );
-    return 0;
-  } catch {
-    // Socket absence is normal for offline inspection. Only acquire the lock;
-    // this path never creates or chmods structural directories.
-  }
-  try {
-    const lock = acquireGatewayLock(gatewayPaths(), { createLayout: false });
-    lock.release();
-    console.log(
-      JSON.stringify(
-        { ...diagnostics(), daemon: 'unavailable: offline diagnostics only', lock: 'acquired' },
-        null,
-        2,
-      ),
-    );
-    return 0;
+    if (health.error) {
+      const result = onlineDoctor({ control: 'error', error: health.error });
+      console.log(JSON.stringify(result.report, null, 2));
+      return result.exitCode;
+    }
+    const result = onlineDoctor(health.result);
+    console.log(JSON.stringify(result.report, null, 2));
+    return result.exitCode;
   } catch (error: unknown) {
-    console.log(
-      JSON.stringify(
-        {
-          ...diagnostics(),
-          daemon: 'unavailable: offline diagnostics only',
-          lock: `unavailable: ${
-            (error as { code?: string }).code ?? 'LOCK_ERROR'
-          }: ${(error as Error).message}`,
-        },
-        null,
-        2,
-      ),
-    );
-    return 1;
+    if ((error as { code?: string }).code !== 'DAEMON_UNAVAILABLE') {
+      const result = onlineDoctor({ control: 'error' });
+      console.log(JSON.stringify(result.report, null, 2));
+      return result.exitCode;
+    }
   }
+  const result = offlineDoctor();
+  console.log(JSON.stringify(result.report, null, 2));
+  return result.exitCode;
 }
 
 export async function setup(
