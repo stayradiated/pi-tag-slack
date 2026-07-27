@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 — 2026-07-27
+
+- Add `PATH_PREPEND` for tools needed by pi and its subprocesses when the gateway runs as a daemon.
+
 ## 0.1.0 — 2026-07-26
 
 First public release of **pi-tag-slack**.
