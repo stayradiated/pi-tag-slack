@@ -27,6 +27,7 @@ import {
 import type { PiNotifier, GatewayCoordinator } from './slack.js';
 import type { PiApplyResult, PiModel } from './pi-rpc.js';
 import { addSchedule, enableSchedule } from './scheduler.js';
+import { cleanupSessionArchives, listSessionArchives } from './session-archive.js';
 import {
   replyToInbox,
   scheduleReactionReconciliation,
@@ -267,6 +268,7 @@ export type ControlServices = {
   notifier: PiNotifier;
   coordinator: GatewayCoordinator;
   sessionStatus?: () => Promise<unknown>;
+  archivePath?: string;
   sessionControls?: {
     availableModels(): Promise<PiModel[]>;
     availableThinkingLevels(): Promise<string[]>;
@@ -304,6 +306,25 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       return services.coordinator.run(() =>
         services.sessionControls!.confirmReset!(params.confirm as string),
       );
+    }
+    case 'session.archive.list': {
+      if (!services?.archivePath)
+        fail('SESSION_UNAVAILABLE', 'Session archive controls are unavailable.');
+      const requestedLimit = limit(params.limit);
+      return services.coordinator.run(() =>
+        listSessionArchives(services.archivePath!, {
+          limit: requestedLimit,
+          cursor: params.cursor,
+        }),
+      );
+    }
+    case 'session.archive.cleanup': {
+      if (!services?.archivePath)
+        fail('SESSION_UNAVAILABLE', 'Session archive controls are unavailable.');
+      return services.coordinator.run(() => {
+        const retentionDays = Number(readGatewayConfig().archive_retention_days);
+        return cleanupSessionArchives(services.archivePath!, retentionDays);
+      });
     }
     case 'session.model.list':
       if (!services?.sessionControls)

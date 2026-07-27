@@ -6,10 +6,10 @@ import { PiRpcSession } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import { clearSlackClient, configureSlackClient, reconcileInboxReactions } from './slack-client.js';
-import { existsSync, mkdirSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { startControlServer } from './control.js';
 import { materializeDueSchedules, SchedulerService } from './scheduler.js';
+import { archiveActiveSession } from './session-archive.js';
 import { readResetJournal } from './reset-install.js';
 import {
   acquireGatewayLock,
@@ -92,15 +92,7 @@ export async function startGateway(): Promise<void> {
     const performReset = async () => {
       const old = pi!;
       await old.stop();
-      let counter = 0;
-      let archivePath: string;
-      do {
-        archivePath = join(
-          paths.archive,
-          `session-${new Date().toISOString().replace(/[:.]/g, '-')}-${counter++}`,
-        );
-      } while (existsSync(archivePath));
-      renameSync(paths.session, archivePath);
+      const archivePath = archiveActiveSession(paths);
       mkdirSync(paths.session, { mode: 0o700 });
       pi = createPi();
       await pi.start();
@@ -179,6 +171,7 @@ export async function startGateway(): Promise<void> {
       coordinator,
       sessionStatus: () => session.status(),
       sessionControls: session,
+      archivePath: paths.archive,
     });
     // Reconciliation is bounded and best-effort; it never affects Slack admission.
     void reconcileInboxReactions().catch(() => undefined);

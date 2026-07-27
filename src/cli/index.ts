@@ -38,6 +38,8 @@ Usage:
   pi-tag-slack config show|set|reset ...
   pi-tag-slack session status [--json]
   pi-tag-slack session reset [--confirm <session-id>:<run-sequence>]
+  pi-tag-slack session archive list [--limit <n>] [--cursor <opaque>] [--json]
+  pi-tag-slack session archive cleanup
   pi-tag-slack session model list [--json]|set <provider/model>|reset
   pi-tag-slack session thinking set <level>|reset
   pi-tag-slack doctor
@@ -63,12 +65,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (group === 'doctor') return doctor();
 
   const fileDownload = group === 'slack' && verb === 'file' && rest[0] === 'download';
-  const sessionNested = group === 'session' && (verb === 'model' || verb === 'thinking');
+  const sessionNested =
+    group === 'session' && (verb === 'model' || verb === 'thinking' || verb === 'archive');
   const command = fileDownload
     ? 'slack.file.download'
-    : sessionNested
-      ? `session.${verb}.${rest[0] ?? ''}`
-      : commandFor(group, verb);
+    : commandFor(group, verb, sessionNested ? rest[0] : undefined);
   if (!command) throw new Error(`Unsupported command.\n${help}`);
   const response = await request(
     command,
@@ -284,7 +285,7 @@ export async function setup(
   }
 }
 
-function commandFor(group: string, verb?: string): string | undefined {
+export function commandFor(group: string, verb?: string, nestedVerb?: string): string | undefined {
   const allowed = new Set([
     'inbox.list',
     'inbox.show',
@@ -314,17 +315,19 @@ function commandFor(group: string, verb?: string): string | undefined {
     'config.reset',
     'session.status',
     'session.reset',
+    'session.archive.list',
+    'session.archive.cleanup',
     'session.model.list',
     'session.model.set',
     'session.model.reset',
     'session.thinking.set',
     'session.thinking.reset',
   ]);
-  const command = `${group}.${verb ?? ''}`;
+  const command = nestedVerb ? `${group}.${verb ?? ''}.${nestedVerb}` : `${group}.${verb ?? ''}`;
   return allowed.has(command) ? command : undefined;
 }
 
-function paramsFor(command: string, args: string[]): Record<string, unknown> {
+export function paramsFor(command: string, args: string[]): Record<string, unknown> {
   if (command === 'slack.history') {
     const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
     return compact({ limit: numberFlag(flags.limit), cursor: flags.cursor });
@@ -352,6 +355,14 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
       text: flags.text,
       files: typeof flags.file === 'string' ? [flags.file] : flags.file,
     });
+  }
+  if (command === 'session.archive.list') {
+    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
+    return compact({ limit: numberFlag(flags.limit), cursor: flags.cursor });
+  }
+  if (command === 'session.archive.cleanup') {
+    parseFlags(args, new Set());
+    return {};
   }
   if (command.endsWith('.list')) {
     const flags = parseFlags(args, new Set(['state', 'limit', 'cursor', 'json']));
