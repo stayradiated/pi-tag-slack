@@ -475,6 +475,103 @@ export type SlackMutation = {
   attachments?: unknown[];
 };
 /** Atomically records a delivery and mutates an open source snapshot. Ignored mutations are deliberately not ledgered. */
+export function markSlackEventAccepted(
+  eventId: string,
+  metadata: { acceptedAt: string; sessionId?: string; runSequence?: number },
+): void {
+  requireConfiguredDb()
+    .prepare(
+      'update slack_events set rpc_accepted_at=?, pi_session_id=?, run_sequence=? where source_identity=?',
+    )
+    .run(
+      metadata.acceptedAt,
+      metadata.sessionId ?? null,
+      metadata.runSequence ?? null,
+      `slack:event:${eventId}`,
+    );
+}
+
+export function inboxSnapshot(id: number): Record<string, unknown> | undefined {
+  return requireConfiguredDb().prepare('select * from inbox where id=?').get(id) as
+    Record<string, unknown> | undefined;
+}
+
+/** Records best-effort gateway reaction reconciliation without changing inbox lifecycle. */
+export function setInboxWorking(id: number): Record<string, unknown> {
+  const d = requireConfiguredDb();
+  const row = inboxSnapshot(id);
+  if (!row) throw new Error(`Inbox item inbox-${id} was not found.`);
+  if (row.state !== 'open') throw new Error('Inbox item is already resolved.');
+  d.prepare(
+    "update inbox set reaction_desired='hourglass_flowing_sand', reaction_error=null, updated_at=? where id=?",
+  ).run(now(), id);
+  return inboxSnapshot(id)!;
+}
+
+/** Resolves an open inbox after a confirmed Slack reply, preserving terminal snapshots. */
+export function recordInboxReply(id: number, replyTs: string): void {
+  const d = requireConfiguredDb();
+  d.transaction(() => {
+    const row = inboxSnapshot(id);
+    if (!row) throw new Error(`Inbox item inbox-${id} was not found.`);
+    if (row.source_deleted_at) {
+      const error = new Error('The Slack source message was deleted.') as Error & { code: string };
+      error.code = 'SOURCE_DELETED';
+      throw error;
+    }
+    const stamp = now();
+    if (row.state === 'open') {
+      d.prepare(
+        "update inbox set state='resolved', resolution_reason='replied', resolved_at=?, latest_reply_ts=?, latest_reply_at=?, reaction_desired=null, reaction_error=null, updated_at=? where id=?",
+      ).run(stamp, replyTs, stamp, stamp, id);
+    } else {
+      d.prepare(
+        'update inbox set latest_reply_ts=?, latest_reply_at=?, updated_at=? where id=?',
+      ).run(replyTs, stamp, stamp, id);
+    }
+  })();
+}
+
+export function recordInboxReaction(
+  id: number,
+  state: {
+    desired?: string | null;
+    actual?: string | null;
+    error?: string | null;
+    nextAttemptAt?: string | null;
+  },
+): void {
+  const d = requireConfiguredDb();
+  const fields: string[] = ['updated_at=?'];
+  const values: unknown[] = [now()];
+  if (Object.hasOwn(state, 'desired')) {
+    fields.push('reaction_desired=?');
+    values.push(state.desired);
+  }
+  if (Object.hasOwn(state, 'actual')) {
+    fields.push('reaction_actual=?');
+    values.push(state.actual);
+  }
+  if (Object.hasOwn(state, 'error')) {
+    fields.push('reaction_error=?');
+    values.push(state.error);
+  }
+  if (Object.hasOwn(state, 'nextAttemptAt')) {
+    fields.push('reaction_next_attempt_at=?');
+    values.push(state.nextAttemptAt);
+  }
+  values.push(id);
+  d.prepare(`update inbox set ${fields.join(', ')} where id=?`).run(...values);
+}
+
+export function inboxReactionsDue(limit: number): Array<Record<string, unknown>> {
+  return requireConfiguredDb()
+    .prepare(
+      'select * from inbox where (reaction_desired is not reaction_actual) and (reaction_next_attempt_at is null or reaction_next_attempt_at <= ?) order by updated_at, id limit ?',
+    )
+    .all(now(), limit) as Array<Record<string, unknown>>;
+}
+
 export function ingestSlackEvent(event: SlackMutation): {
   duplicate: boolean;
   ignored: boolean;

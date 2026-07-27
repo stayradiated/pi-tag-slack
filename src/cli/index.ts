@@ -26,7 +26,7 @@ const help = `pi-tag-slack
 
 Usage:
   pi-tag-slack setup --channel <C...|G...> --label <name> --cwd <path> --model <ref>
-  pi-tag-slack inbox list|show|resolve ...
+  pi-tag-slack inbox list|show|working|respond|resolve ...
   pi-tag-slack task add|list|show|resolve ...
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
@@ -220,6 +220,8 @@ function commandFor(group: string, verb?: string): string | undefined {
     'inbox.list',
     'inbox.show',
     'inbox.resolve',
+    'inbox.working',
+    'inbox.respond',
     'task.list',
     'task.show',
     'task.add',
@@ -240,7 +242,11 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
     const flags = parseFlags(args, new Set(['state', 'limit', 'cursor', 'json']));
     return compact({ state: flags.state, limit: numberFlag(flags.limit), cursor: flags.cursor });
   }
-  if (command.endsWith('.show')) return { id: args[0] };
+  if (command.endsWith('.show') || command === 'inbox.working') return { id: args[0] };
+  if (command === 'inbox.respond') {
+    const flags = parseFlags(args, new Set(['text']));
+    return { id: positional(args, new Set(['text']))[0], text: flags.text };
+  }
   if (command.endsWith('.resolve')) {
     const flags = parseFlags(args, new Set(['reason']));
     return {

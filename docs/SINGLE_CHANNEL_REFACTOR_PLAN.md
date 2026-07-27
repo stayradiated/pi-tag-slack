@@ -18,7 +18,7 @@ Legend:
 - `[~]` Private structural directory/file handling and an atomic lock file. Existing database symlinks, structural-path ancestor symlinks, foreign-owned data-layout paths, unsafe bootstrap files, and dangling control-socket paths are rejected during covered flows; staged setup reopens/quick-checks its database and validates its bootstrap candidate. Comprehensive parent-layout, durability, and rollback handling remain incomplete. The lock is not an OS-held lock.
 - `[~]` Schema version 2 creates exactly the six planned `STRICT` tables, basic inbox/task indexes, no-reopen triggers, the configuration singleton, public IDs, and a synchronous transactional event-ledger/inbox mutation helper. Schema validation compares complete canonical table/index/trigger SQL definitions as well as structural names, but complete non-config row validators and the remaining lifecycle/timestamp/JSON constraints are incomplete.
 - `[~]` WAL, `synchronous=FULL`, foreign keys, busy timeout, and `trusted_schema=OFF` are applied. They are not comprehensively read back and verified, and setup does not run the required `quick_check`/reopen validation.
-- `[~]` Typed persistence exists for non-structural configuration. Pi catalog validation, desired/effective state, safe-boundary application, and degraded-state reporting do not.
+- `[~]` Typed persistence exists for non-structural configuration. Pi catalog validation, desired/effective state, safe-boundary application, and degraded-state reporting do not. The daemon now launches one basic persistent pi RPC child and validates the configured Slack conversation before starting its Socket Mode client, but neither integration is contract-complete.
 - `[~]` The daemon owns SQLite and a Unix control server. Server-side one-request LF framing, UTF-8/JSON validation, frame bounds, timeout/EOF handling, trailing-data rejection, and request-ID echoing exist. The CLI client validates bounded fatal-UTF-8 single-frame responses, response schema, and correlation ID, but command deadlines and broader protocol tests remain incomplete.
 - `[~]` Minimal JSON-only commands exist for inbox list/show/resolve, task add/list/show/resolve, trust add/list/remove, and config show/set/reset. This is not the complete CLI contract; stable error mapping, human output, JSON error envelopes, trust validation/pagination, and response-size bounds are incomplete.
 - `[~]` A simple non-interactive first-time setup stages a database and bootstrap token file. It does not perform the required pi/Slack validation, durable staging validation, reset, backup, journal, rollback, or recovery flows.
@@ -46,32 +46,32 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 
 #### Slack gateway
 
-- [ ] Start one Socket Mode Slack client and parse real top-level Events API bodies.
-- [ ] Validate `event_id`, event shape, configured conversation, conversation type, bot membership, sender attribution/trust, bot authorship, and raw mention requirements in the required pre-ack order.
-- [ ] Atomically implement new-message, edit, and deletion admission with duplicate/no-op behavior and restart/concurrency tests.
-- [ ] Store attachment metadata without downloading, strip only the real bot mention from agent-visible content, and support mentioned attachment-only messages.
-- [ ] Add post-commit acknowledgements, notifications, and best-effort reaction reconciliation without putting Slack network calls on the pre-ack path.
+- [~] Start one Socket Mode Slack client and parse real top-level Events API message bodies. The runtime obtains the bot ID with `auth.test`, validates configured-conversation access/type/membership with `conversations.info`, starts Bolt Socket Mode, and serializes deliveries. Reconnect/health handling and live integration tests remain absent.
+- [~] Basic local admission validates message subtype/bot authorship, configured conversation, an event-provided public/private conversation type, trusted sender, top-level `event_id`, and raw bot mention before durable insertion. Startup verifies bot membership, but not all real Slack payload variants; the exact normative ordering/coverage needs further tests.
+- [~] The existing transactional event ledger/inbox create, edit, deletion, duplicate, and ignored-mutation behavior is now invoked by Socket Mode. Focused admission tests cover post-ack pi notification ordering, duplicate suppression, and untrusted ignore behavior; restart/concurrency and live-delivery tests remain absent.
+- [~] Ingestion stores a reduced file metadata snapshot without downloading, strips exact raw bot mentions from new-message text, and accepts `file_share` attachment-only messages. Attachment schema/validation and complete Slack file payload handling remain incomplete.
+- [~] Relevant events are acknowledged after SQLite admission and then notify pi; ignored events are acknowledged without persistence. Newly created items also attempt a post-commit `👀` reaction and retain actual/error diagnostics. Broader post-commit enrichment, reaction retries/backoff/reconciliation, lifecycle cleanup, and tests remain unimplemented.
 - [ ] Implement live history/message/thread navigation, configured-conversation enforcement, pagination, response bounds, send/reply behavior, and outcome-unknown handling.
 - [ ] Implement validated on-demand download and upload with file ownership, type, symlink, size, sanitization, and re-stat checks.
 
 #### Persistent pi RPC session
 
-- [ ] Launch the configured pi binary in persistent RPC mode with the canonical session directory and working directory.
+- [~] Launch the configured pi binary in persistent RPC mode with the canonical session directory and configured working directory. Process supervision/restart policy, startup recovery, and version enforcement are not implemented.
 - [ ] Enforce the minimum version and perform a runtime-validated capability/model/state handshake.
-- [ ] Implement strict LF-delimited JSONL parsing, command correlation, lifecycle state, graceful shutdown/escalation, and process-exit handling.
-- [ ] Configure one-at-a-time follow-ups and serialize Slack mutation, trust changes, prompt/follow-up dispatch, scheduler work, and reset through one coordinator.
-- [ ] Send `prompt` while idle and `follow_up` while active; record RPC acceptance metadata only after successful acceptance.
+- [~] The RPC child uses strict byte-level LF JSONL splitting, fatal UTF-8/JSON parsing, command IDs, basic `agent_start`/`agent_settled` state, and stdin-close shutdown. Frame limits/schema validation, graceful escalation, robust exit health, and protocol tests remain incomplete.
+- [~] RPC startup sets `one-at-a-time`; Slack deliveries and their pi dispatch are serialized by a coordinator. Trust changes, scheduler work, reset, and all other mutations are not yet included in that coordinator.
+- [~] New admitted Slack work uses `prompt` while idle and `follow_up` while active, then persists event RPC acceptance metadata only after a successful RPC response. Session/run identity semantics and failure/recovery behavior remain incomplete.
 - [ ] Implement neutral startup/session-reset recovery summaries and the specified no-replay behavior for automatic child restarts.
 - [ ] Implement bounded restart backoff, failure thresholds, new-work retry behavior, and degraded session health.
 - [ ] Ensure ordinary assistant stdout is never automatically posted to Slack.
 
 #### Inbox, tasks, schedules, reactions, and trust
 
-- [ ] Implement `inbox respond` and `inbox working`, including `SOURCE_DELETED`, additional replies to resolved items, Slack/SQLite partial success, and managed-reaction cleanup.
-- [ ] Finish atomic multi-ID inbox/task resolution, immutable resolved source snapshots, conventional default reasons, and stable errors.
+- [~] Implement basic `inbox respond` and `inbox working`. `working` durably requests `⏳`; `respond` posts to the configured conversation/source thread, resolves open items as `replied`, records extra replies on resolved non-deleted items, rejects structured deleted sources with `SOURCE_DELETED`, and reports Slack-success/SQLite-failure as `PARTIAL_SUCCESS`. File uploads, outcome-unknown handling, response/reaction cleanup, request deadlines, and comprehensive partial-failure tests remain incomplete.
+- [~] Multi-ID inbox/task resolution validates all transitions in one transaction and inbox resolution now requests `✅`. Immutable terminal-source coverage, conventional documented default reasons, reaction reconciliation, and stable-error coverage remain incomplete.
 - [ ] Implement the complete task repository and direct notification metadata.
 - [ ] Implement one-time and Croner-backed recurring schedules, timezone/offset validation, occurrence keys, atomic task creation/advancement, enable/disable/remove behavior, and coalesced downtime catch-up.
-- [ ] Implement `👀 -> ⏳`, silent-resolution `✅`, response cleanup, crash/reset reversion, desired/actual/error state, bounded reconciliation, and preservation of user reactions.
+- [~] Receipt insertion requests `👀`; `inbox working` requests `⏳`; silent `inbox resolve` requests `✅`; and successful receipt attempts retain actual/error diagnostics. A bounded startup/15-second reconciliation pass now replaces only the gateway's own reaction, coalesces post-transition work, and records retry eligibility with in-process exponential backoff. Response cleanup is now requested after replies through the same reconciler. Crash/reset reversion, durable retry-attempt accounting, source-deletion handling coverage, and preservation-of-user-reactions verification remain incomplete.
 - [ ] Complete Slack-validated trust list pagination and preserve event-time-only trust semantics, including an empty list.
 
 #### Configuration and session controls

@@ -10,10 +10,18 @@ import {
   createGatewayConfig,
   ingestSlackEvent,
   initDb,
+  recordInboxReaction,
 } from '../src/db.js';
 import { dispatch, startControlServer } from '../src/control.js';
 import { main } from '../src/cli/index.js';
 import { startGateway } from '../src/index.js';
+import { processSlackEvent } from '../src/slack.js';
+import { validateConfiguredConversation } from '../src/slack-validation.js';
+import {
+  clearSlackClient,
+  configureSlackClient,
+  reconcileInboxReactions,
+} from '../src/slack-client.js';
 import { ensurePrivateLayout, gatewayPaths } from '../src/paths.js';
 
 const directories: string[] = [];
@@ -306,6 +314,159 @@ describe('control pagination', () => {
     };
     expect(second).toMatchObject({ items: [{ id: 'task-1' }], nextCursor: null });
     expect(() => request('task.list', { cursor: 'not-a-cursor' })).toThrow(/cursor is invalid/);
+  });
+});
+
+describe('Slack startup validation', () => {
+  it('rejects inaccessible, DM, and non-member configured conversations', async () => {
+    const client = (channel: Record<string, unknown>) => ({
+      conversations: { info: async () => ({ ok: true, channel }) },
+    });
+    await expect(
+      validateConfiguredConversation(client({ is_im: true, is_member: true }), 'D123'),
+    ).rejects.toThrow(/public channel or private channel/);
+    await expect(
+      validateConfiguredConversation(client({ is_channel: true, is_member: false }), 'C123'),
+    ).rejects.toThrow(/not a member/);
+    await expect(
+      validateConfiguredConversation(client({ is_group: true, is_member: true }), 'G123'),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('Socket Mode admission', () => {
+  it('admits a mentioned trusted event only once and notifies pi after acknowledgement', async () => {
+    configuredDb();
+    const order: string[] = [];
+    const notifier = {
+      async notify(message: string) {
+        order.push(`notify:${message.includes('hello')}`);
+        return { acceptedAt: new Date().toISOString(), sessionId: 'session', runSequence: 1 };
+      },
+    };
+    const body = {
+      event_id: 'Ev_socket_new',
+      event: {
+        type: 'message',
+        channel: 'C0123456789',
+        channel_type: 'channel',
+        user: 'U0123456789',
+        ts: '123.456',
+        text: '<@U_BOT> hello',
+      },
+    };
+    const ack = async () => order.push('ack');
+    await expect(processSlackEvent(body, 'U_BOT', notifier, ack)).resolves.toBe('accepted');
+    await expect(processSlackEvent(body, 'U_BOT', notifier, ack)).resolves.toBe('duplicate');
+    expect(order).toEqual(['ack', 'notify:true', 'ack']);
+  });
+
+  it('ignores unmentioned and untrusted messages without persistence or pi work', async () => {
+    configuredDb();
+    let acknowledgements = 0;
+    let notifications = 0;
+    const notifier = {
+      async notify() {
+        notifications += 1;
+        return { acceptedAt: new Date().toISOString(), runSequence: 1 };
+      },
+    };
+    await expect(
+      processSlackEvent(
+        {
+          event_id: 'Ev_untrusted',
+          event: {
+            type: 'message',
+            channel: 'C0123456789',
+            channel_type: 'channel',
+            user: 'U_NOT_TRUSTED',
+            ts: '1.0',
+            text: '<@U_BOT> hi',
+          },
+        },
+        'U_BOT',
+        notifier,
+        () => acknowledgements++,
+      ),
+    ).resolves.toBe('ignored');
+    expect(acknowledgements).toBe(1);
+    expect(notifications).toBe(0);
+  });
+});
+
+describe('inbox lifecycle controls', () => {
+  it('marks an open item working and resolves it with a managed completion reaction', () => {
+    configuredDb();
+    ingestSlackEvent({
+      eventId: 'Ev_working',
+      kind: 'new-message',
+      messageId: 'C0123456789:working',
+      senderId: 'U0123456789',
+      senderLabel: 'Ada',
+      content: 'work',
+      messageTs: '2.0',
+    });
+    expect(
+      dispatch({ version: 1, id: 'working', command: 'inbox.working', params: { id: 'inbox-1' } }),
+    ).toMatchObject({
+      id: 'inbox-1',
+      reaction_desired: 'hourglass_flowing_sand',
+    });
+    expect(
+      dispatch({
+        version: 1,
+        id: 'resolve',
+        command: 'inbox.resolve',
+        params: { ids: ['inbox-1'] },
+      }),
+    ).toEqual({
+      resolved: ['inbox-1'],
+    });
+    expect(
+      dispatch({ version: 1, id: 'show', command: 'inbox.show', params: { id: 'inbox-1' } }),
+    ).toMatchObject({
+      state: 'resolved',
+      reaction_desired: 'white_check_mark',
+    });
+  });
+});
+
+describe('reaction reconciliation', () => {
+  it('replaces only the gateway reaction to match durable desired state', async () => {
+    configuredDb();
+    ingestSlackEvent({
+      eventId: 'Ev_reaction',
+      kind: 'new-message',
+      messageId: 'C0123456789:reaction',
+      senderId: 'U0123456789',
+      senderLabel: 'Ada',
+      content: 'work',
+      messageTs: '3.0',
+    });
+    dispatch({ version: 1, id: 'working', command: 'inbox.working', params: { id: 'inbox-1' } });
+    recordInboxReaction(1, { actual: 'eyes' });
+    const calls: string[] = [];
+    configureSlackClient(
+      {
+        reactions: {
+          remove: async ({ name }: { name: string }) => {
+            calls.push(`remove:${name}`);
+            return { ok: true };
+          },
+          add: async ({ name }: { name: string }) => {
+            calls.push(`add:${name}`);
+            return { ok: true };
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await reconcileInboxReactions();
+      expect(calls).toEqual(['remove:eyes', 'add:hourglass_flowing_sand']);
+    } finally {
+      clearSlackClient();
+    }
   });
 });
 

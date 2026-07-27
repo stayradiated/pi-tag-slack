@@ -10,10 +10,13 @@ import {
   readGatewayConfig,
   removeTrustedUser,
   requireConfiguredDb,
+  recordInboxReply,
+  setInboxWorking,
   resetGatewayConfig,
   updateGatewayConfig,
   type MutableConfigKey,
 } from './db.js';
+import { replyToInbox, scheduleReactionReconciliation } from './slack-client.js';
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const IDLE_TIMEOUT_MS = 5_000;
@@ -150,8 +153,10 @@ function resolveRows(
     for (const id of numericIds) {
       const updatedAt = table === 'inbox' ? ', updated_at = ?' : '';
       const values = table === 'inbox' ? [reason, stamp, stamp, id] : [reason, stamp, id];
+      const reaction =
+        table === 'inbox' ? ", reaction_desired = 'white_check_mark', reaction_error = null" : '';
       db.prepare(
-        `update ${table} set state = 'resolved', resolution_reason = ?, resolved_at = ?${updatedAt} where id = ?`,
+        `update ${table} set state = 'resolved', resolution_reason = ?, resolved_at = ?${reaction}${updatedAt} where id = ?`,
       ).run(...values);
     }
     return { resolved: values };
@@ -168,8 +173,42 @@ export function dispatch(request: Request): unknown {
       return rows(db, 'inbox', state(params.state), limit(params.limit), params.cursor);
     case 'inbox.show':
       return one(db, 'inbox', text(params.id, 'id'));
-    case 'inbox.resolve':
-      return resolveRows(db, 'inbox', ids(params.ids), text(params.reason ?? 'resolved', 'reason'));
+    case 'inbox.resolve': {
+      const result = resolveRows(
+        db,
+        'inbox',
+        ids(params.ids),
+        text(params.reason ?? 'resolved', 'reason'),
+      );
+      scheduleReactionReconciliation();
+      return result;
+    }
+    case 'inbox.working': {
+      const id = parsePublicId('inbox', text(params.id, 'id'));
+      const result = { ...setInboxWorking(id), id: publicId('inbox', id) };
+      scheduleReactionReconciliation();
+      return result;
+    }
+    case 'inbox.respond': {
+      const idText = text(params.id, 'id');
+      const id = parsePublicId('inbox', idText);
+      const row = one(db, 'inbox', idText) as Record<string, unknown>;
+      if (row.source_deleted_at) fail('SOURCE_DELETED', 'The Slack source message was deleted.');
+      return replyToInbox(String(row.thread_ts), text(params.text, 'text')).then((replyTs) => {
+        try {
+          recordInboxReply(id, replyTs);
+        } catch {
+          throw Object.assign(
+            new Error(`Slack reply succeeded at ${replyTs}, but local update failed.`),
+            {
+              code: 'PARTIAL_SUCCESS',
+            },
+          );
+        }
+        scheduleReactionReconciliation();
+        return { id: idText, replyTs, resolved: row.state === 'open' };
+      });
+    }
     case 'task.list':
       return rows(db, 'tasks', state(params.state), limit(params.limit), params.cursor);
     case 'task.show':
@@ -345,7 +384,9 @@ function serve(socket: Socket): void {
     try {
       const request = decodeFrame(buffer.subarray(0, newline));
       try {
-        finish({ id: request.id, result: dispatch(request) });
+        Promise.resolve(dispatch(request))
+          .then((result) => finish({ id: request.id, result }))
+          .catch((error) => finish(errorReply(request.id, error)));
       } catch (error) {
         finish(errorReply(request.id, error));
       }
