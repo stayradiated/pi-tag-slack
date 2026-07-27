@@ -27,6 +27,7 @@ const help = `pi-tag-slack
 Usage:
   pi-tag-slack setup --channel <C...|G...> --label <name> --cwd <path> --model <ref>
   pi-tag-slack inbox list|show|working|respond|resolve ...
+  pi-tag-slack slack history|message|thread|send ...
   pi-tag-slack task add|list|show|resolve ...
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
@@ -222,6 +223,10 @@ function commandFor(group: string, verb?: string): string | undefined {
     'inbox.resolve',
     'inbox.working',
     'inbox.respond',
+    'slack.history',
+    'slack.message',
+    'slack.thread',
+    'slack.send',
     'task.list',
     'task.show',
     'task.add',
@@ -238,6 +243,26 @@ function commandFor(group: string, verb?: string): string | undefined {
 }
 
 function paramsFor(command: string, args: string[]): Record<string, unknown> {
+  if (command === 'slack.history') {
+    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
+    return compact({ limit: numberFlag(flags.limit), cursor: flags.cursor });
+  }
+  if (command === 'slack.message') {
+    parseFlags(args, new Set(['json']));
+    return { messageTs: positional(args, new Set(['json']))[0] };
+  }
+  if (command === 'slack.thread') {
+    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
+    return compact({
+      threadTs: positional(args, new Set(['limit', 'cursor', 'json']))[0],
+      limit: numberFlag(flags.limit),
+      cursor: flags.cursor,
+    });
+  }
+  if (command === 'slack.send') {
+    const flags = parseFlags(args, new Set(['thread', 'text']));
+    return compact({ threadTs: flags.thread, text: flags.text });
+  }
   if (command.endsWith('.list')) {
     const flags = parseFlags(args, new Set(['state', 'limit', 'cursor', 'json']));
     return compact({ state: flags.state, limit: numberFlag(flags.limit), cursor: flags.cursor });

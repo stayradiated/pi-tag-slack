@@ -75,14 +75,112 @@ export function scheduleReactionReconciliation(): void {
   });
 }
 
-export async function replyToInbox(threadTs: string, text: string): Promise<string> {
+type SlackPage = { items: unknown[]; nextCursor: string | null };
+
+type SlackFailure = Error & { code: 'NOT_FOUND' | 'SLACK_UNAVAILABLE' | 'SLACK_ERROR' };
+
+function slackError(error: unknown): SlackFailure {
+  const details = error as { code?: string; message?: string; data?: { error?: string } };
+  const reason = details.data?.error ?? details.code;
+  const message = details.message ?? `Slack request failed: ${reason ?? 'unknown error'}.`;
+  const code: SlackFailure['code'] =
+    reason === 'channel_not_found' ||
+    reason === 'message_not_found' ||
+    reason === 'thread_not_found' ||
+    reason === 'not_found'
+      ? 'NOT_FOUND'
+      : /^(ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN)$/.test(String(reason))
+        ? 'SLACK_UNAVAILABLE'
+        : 'SLACK_ERROR';
+  return Object.assign(new Error(message), { code });
+}
+
+async function slackCall<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if ((error as { code?: string }).code === 'SLACK_UNAVAILABLE') throw error;
+    throw slackError(error);
+  }
+}
+
+function cursor(response: { response_metadata?: { next_cursor?: string } }): string | null {
+  return response.response_metadata?.next_cursor || null;
+}
+
+/** Fetches only live messages in the configured conversation. */
+export async function slackHistory(limit: number, nextCursor?: string): Promise<SlackPage> {
   const runtime = requireClient();
-  const result = await runtime.client.chat.postMessage({
-    channel: runtime.channelId,
-    thread_ts: threadTs,
-    text,
-  });
+  const response = await slackCall(() =>
+    runtime.client.conversations.history({
+      channel: runtime.channelId,
+      limit,
+      ...(nextCursor ? { cursor: nextCursor } : {}),
+    }),
+  );
+  if (!response.ok)
+    throw slackError(Object.assign(new Error('Slack history request failed.'), response));
+  return { items: response.messages ?? [], nextCursor: cursor(response) };
+}
+
+/** Looks up an exact timestamp without ever searching another conversation. */
+export async function slackMessage(messageTs: string): Promise<unknown> {
+  const runtime = requireClient();
+  const response = await slackCall(() =>
+    runtime.client.conversations.history({
+      channel: runtime.channelId,
+      oldest: messageTs,
+      latest: messageTs,
+      inclusive: true,
+      limit: 1,
+    }),
+  );
+  if (!response.ok)
+    throw slackError(Object.assign(new Error('Slack message lookup failed.'), response));
+  const message = response.messages?.find((item) => item.ts === messageTs);
+  if (!message) {
+    throw Object.assign(new Error(`Slack message ${messageTs} was not found.`), {
+      code: 'NOT_FOUND',
+    });
+  }
+  return message;
+}
+
+/** Fetches one configured-conversation thread with Slack's cursor unchanged. */
+export async function slackThread(
+  threadTs: string,
+  limit: number,
+  nextCursor?: string,
+): Promise<SlackPage> {
+  const runtime = requireClient();
+  const response = await slackCall(() =>
+    runtime.client.conversations.replies({
+      channel: runtime.channelId,
+      ts: threadTs,
+      limit,
+      ...(nextCursor ? { cursor: nextCursor } : {}),
+    }),
+  );
+  if (!response.ok)
+    throw slackError(Object.assign(new Error('Slack thread request failed.'), response));
+  return { items: response.messages ?? [], nextCursor: cursor(response) };
+}
+
+/** Sends a message (or thread reply) without modifying any inbox/task state. */
+export async function sendSlackMessage(text: string, threadTs?: string): Promise<{ ts: string }> {
+  const runtime = requireClient();
+  const result = await slackCall(() =>
+    runtime.client.chat.postMessage({
+      channel: runtime.channelId,
+      text,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+    }),
+  );
   if (!result.ok || !result.ts)
-    throw new Error(`Slack reply failed: ${result.error ?? 'unknown error'}.`);
-  return result.ts;
+    throw slackError(Object.assign(new Error('Slack send failed.'), result));
+  return { ts: result.ts };
+}
+
+export async function replyToInbox(threadTs: string, text: string): Promise<string> {
+  return (await sendSlackMessage(text, threadTs)).ts;
 }

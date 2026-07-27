@@ -2,9 +2,9 @@
 
 ## Engineering handoff and implementation status
 
-**Status: not shippable — foundation only.** The active runtime has been hard-cut away from the legacy queue implementation, but it does not currently connect to Slack or start pi. Treat every unchecked item in this section and every unimplemented requirement in the normative sections below as release-blocking unless it is explicitly moved out of scope.
+**Status: not shippable — partial gateway implementation.** The active runtime has been hard-cut away from the legacy queue implementation and now starts a persistent pi RPC child plus one configured-conversation Slack client. Treat every unchecked item in this section and every unimplemented requirement in the normative sections below as release-blocking unless it is explicitly moved out of scope.
 
-This status was verified against the working tree containing `src/config.ts`, `src/paths.ts`, `src/db.ts`, `src/control.ts`, `src/index.ts`, `src/cli/index.ts`, and `test/gateway-foundation.test.ts`. At that point formatting, lint, the 10 foundation tests, and the TypeScript build passed. Passing that small suite is not evidence that the product contract is complete.
+This status was verified against the working tree containing `src/config.ts`, `src/paths.ts`, `src/db.ts`, `src/control.ts`, `src/index.ts`, `src/cli/index.ts`, `src/slack-client.ts`, and `test/gateway-foundation.test.ts`. Formatting, lint, 22 foundation tests, and the TypeScript build passed. Passing that small suite is not evidence that the product contract is complete.
 
 Legend:
 
@@ -20,10 +20,10 @@ Legend:
 - `[~]` WAL, `synchronous=FULL`, foreign keys, busy timeout, and `trusted_schema=OFF` are applied. They are not comprehensively read back and verified, and setup does not run the required `quick_check`/reopen validation.
 - `[~]` Typed persistence exists for non-structural configuration. Pi catalog validation, desired/effective state, safe-boundary application, and degraded-state reporting do not. The daemon now launches one basic persistent pi RPC child and validates the configured Slack conversation before starting its Socket Mode client, but neither integration is contract-complete.
 - `[~]` The daemon owns SQLite and a Unix control server. Server-side one-request LF framing, UTF-8/JSON validation, frame bounds, timeout/EOF handling, trailing-data rejection, and request-ID echoing exist. The CLI client validates bounded fatal-UTF-8 single-frame responses, response schema, and correlation ID, but command deadlines and broader protocol tests remain incomplete.
-- `[~]` Minimal JSON-only commands exist for inbox list/show/resolve, task add/list/show/resolve, trust add/list/remove, and config show/set/reset. This is not the complete CLI contract; stable error mapping, human output, JSON error envelopes, trust validation/pagination, and response-size bounds are incomplete.
+- `[~]` Minimal JSON-only commands exist for inbox list/show/resolve, task add/list/show/resolve, trust add/list/remove, config show/set/reset, and live Slack history/message/thread/send. Slack list cursors are passed through and common live-Slack failures have basic stable codes. This is not the complete CLI contract; human output, JSON error envelopes, trust validation/pagination, response-size bounds, and comprehensive error mapping are incomplete.
 - `[~]` A simple non-interactive first-time setup stages a database and bootstrap token file. It does not perform the required pi/Slack validation, durable staging validation, reset, backup, journal, rollback, or recovery flows.
 - `[x]` The manifest removes slash commands, interactivity, App Home, DM/MPIM events/scopes, and `app_mention`, and retains `message.channels` and `message.groups`.
-- `[~]` Ten foundation tests cover selected schema rejection, database-symlink rejection, sequential event deduplication, no-reopen behavior, limited server framing/ID echoing, task pagination, and typed configuration. Most tests specified later in this document do not exist.
+- `[~]` Twenty-two foundation tests cover selected schema rejection, database-symlink rejection, sequential event deduplication, no-reopen behavior, limited server framing/ID echoing, task pagination, typed configuration, and configured-conversation Slack history/thread/message/send behavior. Most tests specified later in this document do not exist.
 
 ### Correctness work required before building on the foundation
 
@@ -34,7 +34,7 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 - [ ] Replace the atomic PID file with the specified portable OS-held exclusive lock. Until then, at minimum ensure every failure after lock creation closes the descriptor and removes the partial lock without deleting a replacement path.
 - [ ] Harden control-socket startup and shutdown: detect dangling symlinks with `lstat`, close/unlink the server after every post-bind failure, retain a runtime server error handler, and avoid unlinking a path that is no longer the socket instance created by this process.
 - [x] Implement client-side response byte limits, fatal UTF-8 decoding, exactly-one-LF-frame validation, response schema validation, and request-ID correlation.
-- [ ] Introduce and test a stable error-code mapping. Invalid IDs/config/users must not become `INTERNAL`, and internal SQLite details must not leak as public errors.
+- [~] Introduce and test a stable error-code mapping. Live Slack navigation/send now maps unavailable clients, missing messages, and common Slack failures to `SLACK_UNAVAILABLE`, `NOT_FOUND`, and `SLACK_ERROR`; invalid live-Slack parameters use `INVALID_PARAMS`. Invalid IDs/config/users must not become `INTERNAL`, and internal SQLite details must not leak as public errors.
 - [ ] Make CLI failures honor the required JSON error envelope and exit behavior, while preserving clear human-mode errors.
 - [~] Validate complete schema definitions or otherwise make malformed same-name constraints, indexes, triggers, and foreign keys fail startup. Canonical SQL definitions are now checked; add complete row validators and the missing lifecycle/timestamp/JSON constraints.
 - [ ] Make `trust add` call Slack to validate and label the user before commit. Until Slack exists, do not represent the current syntactic-only command as contract-complete.
@@ -51,7 +51,7 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 - [~] The existing transactional event ledger/inbox create, edit, deletion, duplicate, and ignored-mutation behavior is now invoked by Socket Mode. Focused admission tests cover post-ack pi notification ordering, duplicate suppression, and untrusted ignore behavior; restart/concurrency and live-delivery tests remain absent.
 - [~] Ingestion stores a reduced file metadata snapshot without downloading, strips exact raw bot mentions from new-message text, and accepts `file_share` attachment-only messages. Attachment schema/validation and complete Slack file payload handling remain incomplete.
 - [~] Relevant events are acknowledged after SQLite admission and then notify pi; ignored events are acknowledged without persistence. Newly created items also attempt a post-commit `👀` reaction and retain actual/error diagnostics. Broader post-commit enrichment, reaction retries/backoff/reconciliation, lifecycle cleanup, and tests remain unimplemented.
-- [ ] Implement live history/message/thread navigation, configured-conversation enforcement, pagination, response bounds, send/reply behavior, and outcome-unknown handling.
+- [~] Implement live history/message/thread navigation, configured-conversation enforcement, pagination, response bounds, send/reply behavior, and outcome-unknown handling. `slack history`, `slack message`, `slack thread`, and `slack send [--thread]` now use only the daemon-owned configured-conversation client; history/thread pass Slack cursors through and return `{ items, nextCursor }`, while lookup returns the exact requested timestamp or `NOT_FOUND`. Explicit Slack response-byte budgeting, `OUTCOME_UNKNOWN`, retry policy, exhaustive error classification, and refined human formatting remain.
 - [ ] Implement validated on-demand download and upload with file ownership, type, symlink, size, sanitization, and re-stat checks.
 
 #### Persistent pi RPC session

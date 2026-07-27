@@ -16,7 +16,14 @@ import {
   updateGatewayConfig,
   type MutableConfigKey,
 } from './db.js';
-import { replyToInbox, scheduleReactionReconciliation } from './slack-client.js';
+import {
+  replyToInbox,
+  scheduleReactionReconciliation,
+  sendSlackMessage,
+  slackHistory,
+  slackMessage,
+  slackThread,
+} from './slack-client.js';
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const IDLE_TIMEOUT_MS = 5_000;
@@ -81,6 +88,11 @@ function decodeCursor(value: unknown): ListCursor | undefined {
   } catch {
     fail('INVALID_PARAMS', 'cursor is invalid.');
   }
+}
+
+function optionalCursor(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  return text(value, 'cursor');
 }
 
 function encodeCursor(row: { created_at: string; id: number }): string {
@@ -209,6 +221,21 @@ export function dispatch(request: Request): unknown {
         return { id: idText, replyTs, resolved: row.state === 'open' };
       });
     }
+    case 'slack.history':
+      return slackHistory(limit(params.limit), optionalCursor(params.cursor));
+    case 'slack.message':
+      return slackMessage(text(params.messageTs ?? params.ts, 'messageTs'));
+    case 'slack.thread':
+      return slackThread(
+        text(params.threadTs ?? params.ts, 'threadTs'),
+        limit(params.limit),
+        optionalCursor(params.cursor),
+      );
+    case 'slack.send':
+      return sendSlackMessage(
+        text(params.text, 'text'),
+        params.threadTs === undefined ? undefined : text(params.threadTs, 'threadTs'),
+      );
     case 'task.list':
       return rows(db, 'tasks', state(params.state), limit(params.limit), params.cursor);
     case 'task.show':

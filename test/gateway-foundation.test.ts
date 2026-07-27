@@ -470,6 +470,132 @@ describe('reaction reconciliation', () => {
   });
 });
 
+describe('Slack live navigation and send controls', () => {
+  it('uses the configured conversation for all live Slack API calls', async () => {
+    configuredDb();
+    const calls: Array<Record<string, unknown>> = [];
+    configureSlackClient(
+      {
+        conversations: {
+          history: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, messages: [{ ts: '1.0' }] };
+          },
+          replies: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, messages: [{ ts: '2.0' }] };
+          },
+        },
+        chat: {
+          postMessage: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, ts: '3.0' };
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await dispatch({ version: 1, id: 'history', command: 'slack.history', params: {} });
+      await dispatch({
+        version: 1,
+        id: 'thread',
+        command: 'slack.thread',
+        params: { threadTs: '2.0' },
+      });
+      await dispatch({ version: 1, id: 'send', command: 'slack.send', params: { text: 'hello' } });
+      expect(calls.every((call) => call.channel === 'C0123456789')).toBe(true);
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  it('passes Slack pagination cursors through and returns Slack cursors unchanged', async () => {
+    configuredDb();
+    const calls: Array<Record<string, unknown>> = [];
+    configureSlackClient(
+      {
+        conversations: {
+          history: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, messages: [], response_metadata: { next_cursor: 'next-history' } };
+          },
+          replies: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, messages: [], response_metadata: { next_cursor: 'next-thread' } };
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'history',
+          command: 'slack.history',
+          params: { limit: 7, cursor: 'history-cursor' },
+        }),
+      ).resolves.toEqual({ items: [], nextCursor: 'next-history' });
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'thread',
+          command: 'slack.thread',
+          params: { threadTs: '2.0', limit: 8, cursor: 'thread-cursor' },
+        }),
+      ).resolves.toEqual({ items: [], nextCursor: 'next-thread' });
+      expect(calls).toMatchObject([
+        { limit: 7, cursor: 'history-cursor' },
+        { ts: '2.0', limit: 8, cursor: 'thread-cursor' },
+      ]);
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  it('returns only the requested live message and reports a missing timestamp as NOT_FOUND', async () => {
+    configuredDb();
+    configureSlackClient(
+      {
+        conversations: {
+          history: async (params: { oldest: string }) => ({
+            ok: true,
+            messages: [{ ts: params.oldest }],
+          }),
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'message',
+          command: 'slack.message',
+          params: { messageTs: 'requested' },
+        }),
+      ).resolves.toMatchObject({ ts: 'requested' });
+      configureSlackClient(
+        {
+          conversations: { history: async () => ({ ok: true, messages: [{ ts: 'other' }] }) },
+        } as any,
+        'C0123456789',
+      );
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'missing-message',
+          command: 'slack.message',
+          params: { messageTs: 'requested' },
+        }),
+      ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    } finally {
+      clearSlackClient();
+    }
+  });
+});
+
 describe('Slack event ledger', () => {
   it('never permits a resolved inbox item to reopen', () => {
     const path = configuredDb();
