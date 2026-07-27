@@ -34,6 +34,8 @@ Usage:
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
   pi-tag-slack session status [--json]
+  pi-tag-slack session model list [--json]|set <provider/model>|reset
+  pi-tag-slack session thinking set <level>|reset
   pi-tag-slack doctor
   pi-tag-slack start
 
@@ -57,9 +59,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (group === 'doctor') return doctor();
 
   const fileDownload = group === 'slack' && verb === 'file' && rest[0] === 'download';
-  const command = fileDownload ? 'slack.file.download' : commandFor(group, verb);
+  const sessionNested = group === 'session' && (verb === 'model' || verb === 'thinking');
+  const command = fileDownload
+    ? 'slack.file.download'
+    : sessionNested
+      ? `session.${verb}.${rest[0] ?? ''}`
+      : commandFor(group, verb);
   if (!command) throw new Error(`Unsupported command.\n${help}`);
-  const response = await request(command, paramsFor(command, fileDownload ? rest.slice(1) : rest));
+  const response = await request(
+    command,
+    paramsFor(command, fileDownload ? rest.slice(1) : sessionNested ? rest.slice(1) : rest),
+  );
   if (response.error)
     throw Object.assign(new Error(response.error.message), { code: response.error.code });
   console.log(JSON.stringify(response.result));
@@ -249,6 +259,11 @@ function commandFor(group: string, verb?: string): string | undefined {
     'config.set',
     'config.reset',
     'session.status',
+    'session.model.list',
+    'session.model.set',
+    'session.model.reset',
+    'session.thinking.set',
+    'session.thinking.reset',
   ]);
   const command = `${group}.${verb ?? ''}`;
   return allowed.has(command) ? command : undefined;
@@ -329,9 +344,21 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   if (command === 'trust.remove') return { userId: args[0] };
   if (command === 'config.set') return { key: args[0], value: args[1] };
   if (command === 'config.reset') return { key: args[0] };
-  if (command === 'session.status') {
+  if (command === 'session.status' || command === 'session.model.list') {
     parseFlags(args, new Set(['json']));
     return {};
+  }
+  if (command === 'session.model.set') {
+    parseFlags(args, new Set());
+    return { ref: positional(args, new Set())[0] };
+  }
+  if (command === 'session.model.reset' || command === 'session.thinking.reset') {
+    parseFlags(args, new Set());
+    return {};
+  }
+  if (command === 'session.thinking.set') {
+    parseFlags(args, new Set());
+    return { level: positional(args, new Set())[0] };
   }
   return {};
 }

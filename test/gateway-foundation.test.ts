@@ -448,6 +448,7 @@ describe('pi RPC session status', () => {
       desiredThinking: 'medium',
       effectiveModel: 'anthropic/claude-test',
       effectiveThinking: 'high',
+      pending: true,
     });
     malformed = true;
     await expect(session.status()).resolves.toMatchObject({

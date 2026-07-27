@@ -77,7 +77,15 @@ export async function startGateway(): Promise<void> {
         };
       },
     });
+    pi.setSafeBoundaryHandler(() => {
+      // Lifecycle events originate outside the coordinator, so re-enter its
+      // lane before changing RPC settings at the settled safe boundary.
+      void coordinator.run(() => pi!.applyDesired());
+    });
     await pi.start();
+    // Restore persisted desired overrides/defaults before presenting work.
+    // A failed application is retained as desired state and reflected in health.
+    await coordinator.run(() => pi!.applyDesired());
     // A recovery is aggregate-only: it deliberately does not update per-item
     // RPC acceptance fields and is sent at most once per daemon startup.
     const recovery = startupRecoveryPrompt();
@@ -97,7 +105,8 @@ export async function startGateway(): Promise<void> {
     server = await startControlServer({
       notifier: pi,
       coordinator,
-      sessionStatus: () => pi!.status(),
+      sessionStatus: () => coordinator.run(() => pi!.status()),
+      sessionControls: pi,
     });
     // Reconciliation is bounded and best-effort; it never affects Slack admission.
     void reconcileInboxReactions().catch(() => undefined);

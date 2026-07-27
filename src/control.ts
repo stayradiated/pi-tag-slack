@@ -23,6 +23,7 @@ import {
   type MutableConfigKey,
 } from './db.js';
 import type { PiNotifier, GatewayCoordinator } from './slack.js';
+import type { PiApplyResult, PiModel } from './pi-rpc.js';
 import { addSchedule, enableSchedule } from './scheduler.js';
 import {
   replyToInbox,
@@ -254,6 +255,11 @@ export type ControlServices = {
   notifier: PiNotifier;
   coordinator: GatewayCoordinator;
   sessionStatus?: () => Promise<unknown>;
+  sessionControls?: {
+    availableModels(): Promise<PiModel[]>;
+    availableThinkingLevels(): Promise<string[]>;
+    applyDesired(): Promise<PiApplyResult>;
+  };
 };
 
 export function dispatch(request: Request, services?: ControlServices): unknown {
@@ -271,7 +277,64 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     case 'session.status':
       if (!services?.sessionStatus)
         fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
-      return services.sessionStatus();
+      return services.coordinator.run(() => services.sessionStatus!());
+    case 'session.model.list':
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
+      return services.coordinator.run(async () => ({ models: await services.sessionControls!.availableModels() }));
+    case 'session.model.set': {
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
+      const ref = text(params.ref ?? params.model, 'ref');
+      return services.coordinator.run(async () => {
+        const models = await services.sessionControls!.availableModels();
+        if (!models.some((model) => model.ref === ref))
+          fail('INVALID_PARAMS', `Unknown pi model: ${ref}.`);
+        updateGatewayConfig('sessionModelOverride', ref);
+        return {
+          desiredModel: ref,
+          ...(await services.sessionControls!.applyDesired()),
+        };
+      });
+    }
+    case 'session.model.reset': {
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
+      return services.coordinator.run(async () => {
+        const config = readGatewayConfig();
+        const desiredModel = String(config.default_model);
+        const models = await services.sessionControls!.availableModels();
+        if (!models.some((model) => model.ref === desiredModel))
+          fail('INVALID_PARAMS', `Unknown configured pi model: ${desiredModel}.`);
+        resetGatewayConfig('sessionModelOverride');
+        return { desiredModel, ...(await services.sessionControls!.applyDesired()) };
+      });
+    }
+    case 'session.thinking.set': {
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
+      const level = text(params.level, 'level');
+      return services.coordinator.run(async () => {
+        const levels = await services.sessionControls!.availableThinkingLevels();
+        if (!levels.includes(level))
+          fail('INVALID_PARAMS', `Unsupported pi thinking level: ${level}.`);
+        updateGatewayConfig('sessionThinkingOverride', level);
+        return { desiredThinking: level, ...(await services.sessionControls!.applyDesired()) };
+      });
+    }
+    case 'session.thinking.reset': {
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
+      return services.coordinator.run(async () => {
+        const config = readGatewayConfig();
+        const desiredThinking = String(config.default_thinking);
+        const levels = await services.sessionControls!.availableThinkingLevels();
+        if (!levels.includes(desiredThinking))
+          fail('INVALID_PARAMS', `Unsupported configured pi thinking level: ${desiredThinking}.`);
+        resetGatewayConfig('sessionThinkingOverride');
+        return { desiredThinking, ...(await services.sessionControls!.applyDesired()) };
+      });
+    }
     case 'inbox.list':
       return rows(db, 'inbox', state(params.state), limit(params.limit), params.cursor);
     case 'inbox.show':
@@ -487,7 +550,7 @@ function errorReply(id: string, error: unknown): Reply {
   // Persistence deliberately throws ordinary Errors; map expected caller input
   // failures here and never expose SQLite implementation details.
   if (
-    /^(Invalid (inbox|task|schedule) ID:|Slack user ID must be|Configured Slack conversation|Gateway configuration contains|Invalid (default )?thinking level:|Invalid log level:|Configuration value|Unsupported configuration key:|Configuration key cannot be reset:|--at must be|Cron expression must be|Invalid cron expression|Invalid IANA timezone:|title and instructions must be|Specify exactly|Cannot enable a one-time schedule)/.test(
+    /^(Invalid (inbox|task|schedule) ID:|Slack user ID must be|Configured Slack conversation|Gateway configuration contains|Invalid (default )?thinking level:|Invalid log level:|Configuration value|Unsupported configuration key:|Configuration key cannot be reset:|Unknown (configured )?pi model:|Unsupported (configured )?pi thinking level:|--at must be|Cron expression must be|Invalid cron expression|Invalid IANA timezone:|title and instructions must be|Specify exactly|Cannot enable a one-time schedule)/.test(
       message,
     )
   ) {

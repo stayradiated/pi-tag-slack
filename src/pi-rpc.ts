@@ -14,9 +14,13 @@ export type PiSessionStatus = {
   desiredThinking: string | null;
   effectiveModel: string | null;
   effectiveThinking: string | null;
+  pending: boolean;
 };
 type Frame = Record<string, unknown>;
 type DesiredSessionSettings = { model: string | null; thinking: string | null };
+export type PiModel = { provider: string; id: string; ref: string };
+export type PiApplyResult = { application: 'applied' | 'pending' | 'failed' };
+const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 /** A single persistent, strictly-LF-framed pi RPC child. */
 export class PiRpcSession {
@@ -32,6 +36,7 @@ export class PiRpcSession {
   private lastError: string | undefined;
   private effectiveModel: string | undefined;
   private effectiveThinking: string | undefined;
+  private safeBoundaryHandler: (() => void) | undefined;
 
   constructor(
     private readonly options: {
@@ -65,6 +70,95 @@ export class PiRpcSession {
     });
     await this.command('set_follow_up_mode', { mode: 'one-at-a-time' });
     this.applyState(await this.getState());
+  }
+
+  /** Run desired configuration only after pi reports a settled safe boundary. */
+  setSafeBoundaryHandler(handler: () => void): void {
+    this.safeBoundaryHandler = handler;
+  }
+
+  async availableModels(): Promise<PiModel[]> {
+    const response = await this.command('get_available_models');
+    const models = response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+      ? (response.data as Frame).models
+      : undefined;
+    if (
+      response.type !== 'response' ||
+      response.command !== 'get_available_models' ||
+      response.success !== true ||
+      !Array.isArray(models) ||
+      models.some(
+        (model) =>
+          !model ||
+          typeof model !== 'object' ||
+          typeof (model as Frame).provider !== 'string' ||
+          !(model as Frame).provider ||
+          typeof (model as Frame).id !== 'string' ||
+          !(model as Frame).id,
+      )
+    ) {
+      throw new Error('Invalid get_available_models response from pi RPC.');
+    }
+    return models.map((model) => {
+      const value = model as Frame;
+      const provider = value.provider as string;
+      const id = value.id as string;
+      return { provider, id, ref: `${provider}/${id}` };
+    });
+  }
+
+  async availableThinkingLevels(): Promise<string[]> {
+    const response = await this.command('get_available_thinking_levels');
+    const levels = response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+      ? (response.data as Frame).levels
+      : undefined;
+    if (
+      response.type !== 'response' ||
+      response.command !== 'get_available_thinking_levels' ||
+      response.success !== true ||
+      !Array.isArray(levels) ||
+      levels.some((level) => typeof level !== 'string' || !thinkingLevels.has(level))
+    ) {
+      throw new Error('Invalid get_available_thinking_levels response from pi RPC.');
+    }
+    return levels as string[];
+  }
+
+  /** Applies the persisted desired values only while no agent turn is active. */
+  async applyDesired(): Promise<PiApplyResult> {
+    if (!this.child) return { application: 'pending' };
+    try {
+      this.applyState(await this.getState());
+      if (this.streaming) return { application: 'pending' };
+      const desired = this.options.desired?.() ?? { model: null, thinking: null };
+      if (desired.model && desired.model !== this.effectiveModel) {
+        const slash = desired.model.indexOf('/');
+        if (slash < 1 || slash === desired.model.length - 1)
+          throw new Error(`Invalid desired model reference: ${desired.model}`);
+        const response = await this.command('set_model', {
+          provider: desired.model.slice(0, slash),
+          modelId: desired.model.slice(slash + 1),
+        });
+        if (response.type !== 'response' || response.command !== 'set_model' || response.success !== true)
+          throw new Error('pi rejected set_model.');
+      }
+      // Model selection can change which thinking levels pi supports.
+      this.applyState(await this.getState());
+      if (desired.thinking && desired.thinking !== this.effectiveThinking) {
+        const response = await this.command('set_thinking_level', { level: desired.thinking });
+        if (
+          response.type !== 'response' ||
+          response.command !== 'set_thinking_level' ||
+          response.success !== true
+        )
+          throw new Error('pi rejected set_thinking_level.');
+      }
+      this.applyState(await this.getState());
+      return { application: 'applied' };
+    } catch (error) {
+      this.recordFailure(error instanceof Error ? error : new Error(String(error)));
+      return { application: 'failed' };
+    }
   }
 
   async notify(message: string): Promise<PiAcceptance> {
@@ -108,6 +202,10 @@ export class PiRpcSession {
       desiredThinking: desired.thinking,
       effectiveModel: this.effectiveModel ?? null,
       effectiveThinking: this.effectiveThinking ?? null,
+      pending:
+        this.streaming &&
+        ((desired.model !== null && desired.model !== this.effectiveModel) ||
+          (desired.thinking !== null && desired.thinking !== this.effectiveThinking)),
     };
   }
 
@@ -180,7 +278,10 @@ export class PiRpcSession {
         const frame = JSON.parse(text) as Frame;
         if (!frame || typeof frame.type !== 'string') throw new Error('invalid RPC frame');
         if (frame.type === 'agent_start') this.streaming = true;
-        if (frame.type === 'agent_settled') this.streaming = false;
+        if (frame.type === 'agent_settled') {
+          this.streaming = false;
+          this.safeBoundaryHandler?.();
+        }
         if (typeof frame.id === 'string' && this.pending.has(frame.id)) {
           const pending = this.pending.get(frame.id)!;
           this.pending.delete(frame.id);
