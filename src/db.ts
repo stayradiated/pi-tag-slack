@@ -503,10 +503,9 @@ export function createManualTask(title: string, instructions: string): Record<st
       "insert into tasks (source, title, instructions, state, created_at) values ('manual', ?, ?, 'open', ?)",
     )
     .run(title, instructions, now());
-  return requireConfiguredDb().prepare('select * from tasks where id=?').get(result.lastInsertRowid) as Record<
-    string,
-    unknown
-  >;
+  return requireConfiguredDb()
+    .prepare('select * from tasks where id=?')
+    .get(result.lastInsertRowid) as Record<string, unknown>;
 }
 
 export type ScheduleRow = {
@@ -534,26 +533,56 @@ export function createScheduleRow(input: {
 }): ScheduleRow {
   const d = requireConfiguredDb();
   const stamp = now();
-  const result = d.prepare(
-    'insert into schedules (title,instructions,kind,at_time,cron_expression,timezone,enabled,next_run_at,created_at,updated_at) values (?,?,?,?,?,?,1,?,?,?)',
-  ).run(input.title, input.instructions, input.kind, input.at ?? null, input.cron ?? null, input.timezone ?? null, input.kind === 'at' ? input.at : input.nextRunAt, stamp, stamp);
+  const result = d
+    .prepare(
+      'insert into schedules (title,instructions,kind,at_time,cron_expression,timezone,enabled,next_run_at,created_at,updated_at) values (?,?,?,?,?,?,1,?,?,?)',
+    )
+    .run(
+      input.title,
+      input.instructions,
+      input.kind,
+      input.at ?? null,
+      input.cron ?? null,
+      input.timezone ?? null,
+      input.kind === 'at' ? input.at : input.nextRunAt,
+      stamp,
+      stamp,
+    );
   return d.prepare('select * from schedules where id=?').get(result.lastInsertRowid) as ScheduleRow;
 }
 
 export function scheduleRow(id: number): ScheduleRow | undefined {
-  return requireConfiguredDb().prepare('select * from schedules where id=?').get(id) as ScheduleRow | undefined;
+  return requireConfiguredDb().prepare('select * from schedules where id=?').get(id) as
+    ScheduleRow | undefined;
 }
 
-export function listScheduleRows(limit: number, cursor?: { createdAt: string; id: number }): ScheduleRow[] {
+export function listScheduleRows(
+  limit: number,
+  cursor?: { createdAt: string; id: number },
+): ScheduleRow[] {
   const d = requireConfiguredDb();
-  return (cursor
-    ? d.prepare('select * from schedules where created_at < ? or (created_at = ? and id < ?) order by created_at desc, id desc limit ?').all(cursor.createdAt, cursor.createdAt, cursor.id, limit)
-    : d.prepare('select * from schedules order by created_at desc, id desc limit ?').all(limit)) as ScheduleRow[];
+  return (
+    cursor
+      ? d
+          .prepare(
+            'select * from schedules where created_at < ? or (created_at = ? and id < ?) order by created_at desc, id desc limit ?',
+          )
+          .all(cursor.createdAt, cursor.createdAt, cursor.id, limit)
+      : d.prepare('select * from schedules order by created_at desc, id desc limit ?').all(limit)
+  ) as ScheduleRow[];
 }
 
-export function setScheduleEnabled(id: number, enabled: boolean, nextRunAt: string | null): ScheduleRow {
+export function setScheduleEnabled(
+  id: number,
+  enabled: boolean,
+  nextRunAt: string | null,
+): ScheduleRow {
   const d = requireConfiguredDb();
-  if (d.prepare('update schedules set enabled=?, next_run_at=?, updated_at=? where id=?').run(enabled ? 1 : 0, nextRunAt, now(), id).changes !== 1)
+  if (
+    d
+      .prepare('update schedules set enabled=?, next_run_at=?, updated_at=? where id=?')
+      .run(enabled ? 1 : 0, nextRunAt, now(), id).changes !== 1
+  )
     throw new Error(`Schedule schedule-${id} was not found.`);
   return scheduleRow(id)!;
 }
@@ -570,20 +599,41 @@ export function materializeDueScheduleTasks(
   const d = requireConfiguredDb();
   const batch = Number((configuredRow(d) as any).scheduler_batch_limit);
   return d.transaction(() => {
-    const due = d.prepare("select * from schedules where enabled=1 and next_run_at is not null and next_run_at <= ? order by next_run_at, id limit ?").all(current, batch) as ScheduleRow[];
+    const due = d
+      .prepare(
+        'select * from schedules where enabled=1 and next_run_at is not null and next_run_at <= ? order by next_run_at, id limit ?',
+      )
+      .all(current, batch) as ScheduleRow[];
     const created: Array<Record<string, unknown>> = [];
     for (const row of due) {
       const occurrence = row.next_run_at!;
       const key = `schedule:${row.id}:at:${occurrence}`;
-      const inserted = d.prepare("insert into tasks (source,occurrence_key,schedule_id,title,instructions,state,created_at) values ('schedule',?,?,?,?, 'open', ? ) on conflict(occurrence_key) do nothing").run(key, row.id, row.title, row.instructions, current);
-      if (inserted.changes) created.push(d.prepare('select * from tasks where id=?').get(inserted.lastInsertRowid) as Record<string, unknown>);
+      const inserted = d
+        .prepare(
+          "insert into tasks (source,occurrence_key,schedule_id,title,instructions,state,created_at) values ('schedule',?,?,?,?, 'open', ? ) on conflict(occurrence_key) do nothing",
+        )
+        .run(key, row.id, row.title, row.instructions, current);
+      if (inserted.changes)
+        created.push(
+          d.prepare('select * from tasks where id=?').get(inserted.lastInsertRowid) as Record<
+            string,
+            unknown
+          >,
+        );
       if (row.kind === 'at') {
-        d.prepare('update schedules set enabled=0, next_run_at=null, updated_at=? where id=?').run(current, row.id);
+        d.prepare('update schedules set enabled=0, next_run_at=null, updated_at=? where id=?').run(
+          current,
+          row.id,
+        );
       } else {
         let next = nextCron(row, occurrence);
         // A delayed tick intentionally produces one task, then skips to a future run.
         while (next <= current) next = nextCron(row, next);
-        d.prepare('update schedules set next_run_at=?, updated_at=? where id=?').run(next, current, row.id);
+        d.prepare('update schedules set next_run_at=?, updated_at=? where id=?').run(
+          next,
+          current,
+          row.id,
+        );
       }
     }
     return created;
@@ -610,14 +660,18 @@ export function openWorkSummary(): {
   const d = requireConfiguredDb();
   const recent = (table: 'inbox' | 'tasks') =>
     d
-      .prepare(`select * from ${table} where state='open' order by created_at desc, id desc limit 3`)
+      .prepare(
+        `select * from ${table} where state='open' order by created_at desc, id desc limit 3`,
+      )
       .all() as Array<Record<string, unknown>>;
   return {
-    inboxTotal: (d.prepare("select count(*) count from inbox where state='open'").get() as { count: number })
-      .count,
+    inboxTotal: (
+      d.prepare("select count(*) count from inbox where state='open'").get() as { count: number }
+    ).count,
     inbox: recent('inbox'),
-    taskTotal: (d.prepare("select count(*) count from tasks where state='open'").get() as { count: number })
-      .count,
+    taskTotal: (
+      d.prepare("select count(*) count from tasks where state='open'").get() as { count: number }
+    ).count,
     tasks: recent('tasks'),
   };
 }

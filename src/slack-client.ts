@@ -77,6 +77,8 @@ export function scheduleReactionReconciliation(): void {
 
 type SlackPage = { items: unknown[]; nextCursor: string | null };
 
+export type SlackUser = { id: string; label: string };
+
 type SlackFailure = Error & { code: 'NOT_FOUND' | 'SLACK_UNAVAILABLE' | 'SLACK_ERROR' };
 
 function slackError(error: unknown): SlackFailure {
@@ -85,6 +87,7 @@ function slackError(error: unknown): SlackFailure {
   const message = details.message ?? `Slack request failed: ${reason ?? 'unknown error'}.`;
   const code: SlackFailure['code'] =
     reason === 'channel_not_found' ||
+    reason === 'user_not_found' ||
     reason === 'message_not_found' ||
     reason === 'thread_not_found' ||
     reason === 'not_found'
@@ -106,6 +109,21 @@ async function slackCall<T>(call: () => Promise<T>): Promise<T> {
 
 function cursor(response: { response_metadata?: { next_cursor?: string } }): string | null {
   return response.response_metadata?.next_cursor || null;
+}
+
+/** Validates a Slack user and derives the non-authoritative cosmetic display label. */
+export async function slackUser(userId: string): Promise<SlackUser> {
+  const runtime = requireClient();
+  const response = await slackCall(() => runtime.client.users.info({ user: userId }));
+  if (!response.ok || !response.user) {
+    throw slackError(Object.assign(new Error(`Slack user ${userId} was not found.`), response));
+  }
+  const user = response.user as unknown as Record<string, unknown>;
+  const profile = user.profile as Record<string, unknown> | undefined;
+  const label = [profile?.display_name, profile?.real_name, user.real_name, user.name, userId].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0,
+  )!;
+  return { id: userId, label: label.trim() };
 }
 
 /** Fetches only live messages in the configured conversation. */

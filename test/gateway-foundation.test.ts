@@ -62,7 +62,11 @@ afterEach(() => {
 describe('schedules', () => {
   it('materializes one-time and recurring work exactly once', () => {
     configuredDb();
-    const once = addSchedule({ title: 'once', instructions: 'do it', at: '2030-01-01T00:00:00+00:00' });
+    const once = addSchedule({
+      title: 'once',
+      instructions: 'do it',
+      at: '2030-01-01T00:00:00+00:00',
+    });
     const recurring = addSchedule(
       { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
       () => new Date('2030-01-01T00:00:00Z'),
@@ -78,9 +82,15 @@ describe('schedules', () => {
 
   it('rejects offset-less times, invalid cron, and invalid timezones', () => {
     configuredDb();
-    expect(() => addSchedule({ title: 'x', instructions: 'x', at: '2030-01-01T00:00:00' })).toThrow(/explicit UTC offset/);
-    expect(() => addSchedule({ title: 'x', instructions: 'x', cron: '* * * * * *', timezone: 'UTC' })).toThrow(/five fields/);
-    expect(() => addSchedule({ title: 'x', instructions: 'x', cron: '* * * * *', timezone: 'Mars/Olympus' })).toThrow(/IANA timezone/);
+    expect(() => addSchedule({ title: 'x', instructions: 'x', at: '2030-01-01T00:00:00' })).toThrow(
+      /explicit UTC offset/,
+    );
+    expect(() =>
+      addSchedule({ title: 'x', instructions: 'x', cron: '* * * * * *', timezone: 'UTC' }),
+    ).toThrow(/five fields/);
+    expect(() =>
+      addSchedule({ title: 'x', instructions: 'x', cron: '* * * * *', timezone: 'Mars/Olympus' }),
+    ).toThrow(/IANA timezone/);
   });
 
   it('notifies runtime-created schedule tasks and keeps failed notifications open', async () => {
@@ -88,7 +98,12 @@ describe('schedules', () => {
     addSchedule({ title: 'once', instructions: 'do it', at: '2030-01-01T00:00:00Z' });
     const notified: string[] = [];
     const service = new SchedulerService(
-      { notify: async (prompt) => { notified.push(prompt); return { acceptedAt: '2030-01-01T00:00:01.000Z' }; } },
+      {
+        notify: async (prompt) => {
+          notified.push(prompt);
+          return { acceptedAt: '2030-01-01T00:00:01.000Z' };
+        },
+      },
       new GatewayCoordinator(),
       () => new Date('2030-01-01T00:00:01Z'),
     );
@@ -319,7 +334,11 @@ describe('control configuration', () => {
       dispatch(
         { version: 1, id: 'health', command: 'health', params: {} },
         {
-          notifier: { async notify() { return { acceptedAt: '', runSequence: 0 }; } },
+          notifier: {
+            async notify() {
+              return { acceptedAt: '', runSequence: 0 };
+            },
+          },
           coordinator: new GatewayCoordinator(),
           sessionStatus: async () => session,
         },
@@ -454,14 +473,21 @@ describe('task pi delivery and recovery', () => {
     };
     await expect(
       dispatch(
-        { version: 1, id: 'task-add', command: 'task.add', params: { title: 'Deploy', instructions: 'Ship it.' } },
+        {
+          version: 1,
+          id: 'task-add',
+          command: 'task.add',
+          params: { title: 'Deploy', instructions: 'Ship it.' },
+        },
         services,
       ),
     ).resolves.toEqual({ id: 'task-1', notified: true });
     expect(messages[0]).toContain('[New task; task-1]');
     expect(messages[0]).toContain('Title: Deploy');
     expect(messages[0]).toContain('task resolve task-1');
-    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+    expect(
+      dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } }),
+    ).toMatchObject({
       rpc_accepted_at: '2025-01-01T00:00:00.000Z',
       pi_session_id: 'session',
       run_sequence: 7,
@@ -472,15 +498,26 @@ describe('task pi delivery and recovery', () => {
     configuredDb();
     const services = {
       coordinator: new GatewayCoordinator(),
-      notifier: { async notify() { throw new Error('pi unavailable'); } },
+      notifier: {
+        async notify() {
+          throw new Error('pi unavailable');
+        },
+      },
     };
     await expect(
       dispatch(
-        { version: 1, id: 'task-add', command: 'task.add', params: { title: 'Deploy', instructions: 'Ship it.' } },
+        {
+          version: 1,
+          id: 'task-add',
+          command: 'task.add',
+          params: { title: 'Deploy', instructions: 'Ship it.' },
+        },
         services,
       ),
     ).rejects.toMatchObject({ code: 'PARTIAL_SUCCESS' });
-    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+    expect(
+      dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } }),
+    ).toMatchObject({
       state: 'open',
       rpc_accepted_at: null,
       pi_session_id: null,
@@ -491,17 +528,29 @@ describe('task pi delivery and recovery', () => {
   it('makes one neutral combined recovery summary without accepting individual work', () => {
     configuredDb();
     expect(startupRecoveryPrompt()).toBeUndefined();
-    dispatch({ version: 1, id: 'task', command: 'task.add', params: { title: 'Task', instructions: 'Do it.' } });
+    dispatch({
+      version: 1,
+      id: 'task',
+      command: 'task.add',
+      params: { title: 'Task', instructions: 'Do it.' },
+    });
     ingestSlackEvent({
-      eventId: 'Ev_recovery', kind: 'new-message', messageId: 'C0123456789:1', senderId: 'U0123456789',
-      senderLabel: 'User', content: 'Hello', messageTs: '1',
+      eventId: 'Ev_recovery',
+      kind: 'new-message',
+      messageId: 'C0123456789:1',
+      senderId: 'U0123456789',
+      senderLabel: 'User',
+      content: 'Hello',
+      messageTs: '1',
     });
     const summary = startupRecoveryPrompt();
     expect(summary).toContain('Open inbox items: 1');
     expect(summary).toContain('Open tasks: 1');
     expect(summary).toContain('inbox-1');
     expect(summary).toContain('task-1');
-    expect(dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } })).toMatchObject({
+    expect(
+      dispatch({ version: 1, id: 'show', command: 'task.show', params: { id: 'task-1' } }),
+    ).toMatchObject({
       rpc_accepted_at: null,
     });
   });
@@ -783,6 +832,185 @@ describe('Slack live navigation and send controls', () => {
     } finally {
       clearSlackClient();
     }
+  });
+});
+
+describe('Slack-validated trust management', () => {
+  it('validates a user through Slack and persists its cosmetic profile label', async () => {
+    configuredDb();
+    configureSlackClient(
+      {
+        users: {
+          info: async ({ user }: { user: string }) => ({
+            ok: true,
+            user: { profile: { display_name: `Display ${user}` } },
+          }),
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'trust',
+          command: 'trust.add',
+          params: { userId: 'U9999999999' },
+        }),
+      ).resolves.toEqual({ added: true, label: 'Display U9999999999' });
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'duplicate',
+          command: 'trust.add',
+          params: { userId: 'U9999999999' },
+        }),
+      ).resolves.toEqual({ added: false, label: 'Display U9999999999' });
+      const listed = dispatch({ version: 1, id: 'list', command: 'trust.list', params: {} }) as {
+        items: Array<{ userId: string; label: string; createdAt: string }>;
+      };
+      expect(listed.items).toContainEqual({
+        userId: 'U9999999999',
+        label: 'Display U9999999999',
+        createdAt: expect.any(String),
+      });
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  it('rejects malformed IDs locally and leaves state unchanged when Slack cannot validate a user', async () => {
+    configuredDb();
+    let calls = 0;
+    configureSlackClient(
+      {
+        users: {
+          info: async () => {
+            calls++;
+            throw Object.assign(new Error('unknown'), { data: { error: 'user_not_found' } });
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      expect(() =>
+        dispatch({ version: 1, id: 'bad', command: 'trust.add', params: { userId: 'not-a-user' } }),
+      ).toThrow(/raw uppercase/);
+      expect(calls).toBe(0);
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'unknown',
+          command: 'trust.add',
+          params: { userId: 'U9999999999' },
+        }),
+      ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      configureSlackClient(
+        {
+          users: {
+            info: async () => {
+              throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' });
+            },
+          },
+        } as any,
+        'C0123456789',
+      );
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'offline',
+          command: 'trust.add',
+          params: { userId: 'U8888888888' },
+        }),
+      ).rejects.toMatchObject({ code: 'SLACK_UNAVAILABLE' });
+      expect(dispatch({ version: 1, id: 'list', command: 'trust.list', params: {} })).toMatchObject(
+        { items: [{ userId: 'U0123456789' }] },
+      );
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  it('paginates deterministically, permits an empty final list, and only applies removal to future events', async () => {
+    configuredDb();
+    const notifier = { notify: async () => ({ acceptedAt: '2030-01-01T00:00:00.000Z' }) };
+    const accepted = {
+      event_id: 'Ev_before_removal',
+      event: {
+        type: 'message',
+        channel: 'C0123456789',
+        user: 'U0123456789',
+        ts: '1.0',
+        text: '<@B1> keep this',
+      },
+    };
+    await expect(processSlackEvent(accepted, 'B1', notifier, () => undefined)).resolves.toBe(
+      'accepted',
+    );
+    addTrustedUser('U1111111111', 'one');
+    addTrustedUser('U2222222222', 'two');
+    const first = dispatch({
+      version: 1,
+      id: 'first',
+      command: 'trust.list',
+      params: { limit: 2 },
+    }) as { items: Array<{ userId: string }>; nextCursor: string };
+    const second = dispatch({
+      version: 1,
+      id: 'second',
+      command: 'trust.list',
+      params: { limit: 2, cursor: first.nextCursor },
+    }) as { items: Array<{ userId: string }>; nextCursor: null };
+    expect([...first.items, ...second.items].map((item) => item.userId)).toEqual([
+      'U0123456789',
+      'U1111111111',
+      'U2222222222',
+    ]);
+    expect(
+      dispatch({
+        version: 1,
+        id: 'remove-first',
+        command: 'trust.remove',
+        params: { userId: 'U0123456789' },
+      }),
+    ).toEqual({ removed: true });
+    await expect(
+      processSlackEvent(
+        {
+          event_id: 'Ev_after_removal',
+          event: {
+            type: 'message',
+            channel: 'C0123456789',
+            user: 'U0123456789',
+            ts: '2.0',
+            text: '<@B1> ignore this',
+          },
+        },
+        'B1',
+        notifier,
+        () => undefined,
+      ),
+    ).resolves.toBe('ignored');
+    expect(
+      dispatch({ version: 1, id: 'inbox', command: 'inbox.list', params: { state: 'all' } }),
+    ).toMatchObject({ items: [{ content: 'keep this' }] });
+    dispatch({
+      version: 1,
+      id: 'remove-second',
+      command: 'trust.remove',
+      params: { userId: 'U1111111111' },
+    });
+    dispatch({
+      version: 1,
+      id: 'remove-final',
+      command: 'trust.remove',
+      params: { userId: 'U2222222222' },
+    });
+    expect(dispatch({ version: 1, id: 'empty', command: 'trust.list', params: {} })).toEqual({
+      items: [],
+      nextCursor: null,
+    });
   });
 });
 

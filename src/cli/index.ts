@@ -294,9 +294,20 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   }
   if (command === 'schedule.add') {
     const flags = parseFlags(args, new Set(['title', 'instructions', 'at', 'cron', 'timezone']));
-    return compact({ title: flags.title, instructions: flags.instructions, at: flags.at, cron: flags.cron, timezone: flags.timezone });
+    return compact({
+      title: flags.title,
+      instructions: flags.instructions,
+      at: flags.at,
+      cron: flags.cron,
+      timezone: flags.timezone,
+    });
   }
-  if (command === 'schedule.enable' || command === 'schedule.disable' || command === 'schedule.remove') return { id: args[0] };
+  if (
+    command === 'schedule.enable' ||
+    command === 'schedule.disable' ||
+    command === 'schedule.remove'
+  )
+    return { id: args[0] };
   if (command === 'trust.add') return { userId: args[0] };
   if (command === 'trust.remove') return { userId: args[0] };
   if (command === 'config.set') return { key: args[0], value: args[1] };

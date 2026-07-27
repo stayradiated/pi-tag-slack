@@ -59,7 +59,9 @@ export class PiRpcSession {
     child.on('exit', (code, signal) => {
       this.child = undefined;
       this.streaming = false;
-      this.recordFailure(new Error(`pi RPC process exited (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`));
+      this.recordFailure(
+        new Error(`pi RPC process exited (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`),
+      );
     });
     await this.command('set_follow_up_mode', { mode: 'one-at-a-time' });
     this.applyState(await this.getState());
@@ -120,9 +122,12 @@ export class PiRpcSession {
       typeof data !== 'object' ||
       Array.isArray(data) ||
       typeof (data as Frame).isStreaming !== 'boolean' ||
-      (data as Frame).sessionId !== undefined && typeof (data as Frame).sessionId !== 'string' ||
-      (data as Frame).thinkingLevel !== undefined && typeof (data as Frame).thinkingLevel !== 'string' ||
-      (data as Frame).model !== undefined && (data as Frame).model !== null && typeof (data as Frame).model !== 'object'
+      ((data as Frame).sessionId !== undefined && typeof (data as Frame).sessionId !== 'string') ||
+      ((data as Frame).thinkingLevel !== undefined &&
+        typeof (data as Frame).thinkingLevel !== 'string') ||
+      ((data as Frame).model !== undefined &&
+        (data as Frame).model !== null &&
+        typeof (data as Frame).model !== 'object')
     ) {
       throw new Error('Invalid get_state response from pi RPC.');
     }
@@ -132,7 +137,8 @@ export class PiRpcSession {
   private applyState(state: Frame): void {
     this.streaming = state.isStreaming === true;
     this.sessionId = typeof state.sessionId === 'string' ? state.sessionId : undefined;
-    this.effectiveThinking = typeof state.thinkingLevel === 'string' ? state.thinkingLevel : undefined;
+    this.effectiveThinking =
+      typeof state.thinkingLevel === 'string' ? state.thinkingLevel : undefined;
     const model = state.model;
     if (model && typeof model === 'object') {
       const value = model as Frame;

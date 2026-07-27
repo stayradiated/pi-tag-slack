@@ -31,6 +31,7 @@ import {
   slackHistory,
   slackMessage,
   slackThread,
+  slackUser,
 } from './slack-client.js';
 
 const MAX_FRAME_BYTES = 1024 * 1024;
@@ -101,6 +102,35 @@ function decodeCursor(value: unknown): ListCursor | undefined {
 function optionalCursor(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   return text(value, 'cursor');
+}
+
+type TrustCursor = { createdAt: string; userId: string };
+function decodeTrustCursor(value: unknown): TrustCursor | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !value)
+    fail('INVALID_PARAMS', 'cursor must be a non-empty string.');
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as unknown;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof (parsed as TrustCursor).createdAt !== 'string' ||
+      !/^[UW][A-Z0-9]+$/.test(String((parsed as TrustCursor).userId))
+    )
+      throw new Error('invalid');
+    return parsed as TrustCursor;
+  } catch {
+    fail('INVALID_PARAMS', 'cursor is invalid.');
+  }
+}
+function encodeTrustCursor(row: { createdAt: string; userId: string }): string {
+  return Buffer.from(JSON.stringify(row)).toString('base64url');
+}
+function trustUserId(value: unknown): string {
+  const userId = text(value, 'userId');
+  if (!/^[UW][A-Z0-9]+$/.test(userId))
+    fail('INVALID_PARAMS', 'Slack user ID must be a raw uppercase U... or W... ID.');
+  return userId;
 }
 
 function encodeCursor(row: { created_at: string; id: number }): string {
@@ -198,9 +228,12 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
   switch (request.command) {
     case 'health':
       if (!services?.sessionStatus) return { database: 'ok', control: 'ok' };
-      return services.sessionStatus().then((session) => ({ database: 'ok', control: 'ok', session }));
+      return services
+        .sessionStatus()
+        .then((session) => ({ database: 'ok', control: 'ok', session }));
     case 'session.status':
-      if (!services?.sessionStatus) fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
+      if (!services?.sessionStatus)
+        fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
       return services.sessionStatus();
     case 'inbox.list':
       return rows(db, 'inbox', state(params.state), limit(params.limit), params.cursor);
@@ -307,10 +340,13 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
         const instructions = text(params.instructions, 'instructions');
         const at = params.at === undefined ? undefined : text(params.at, 'at');
         const cron = params.cron === undefined ? undefined : text(params.cron, 'cron');
-        const timezone = params.timezone === undefined ? undefined : text(params.timezone, 'timezone');
+        const timezone =
+          params.timezone === undefined ? undefined : text(params.timezone, 'timezone');
         if ((at ? 1 : 0) + (cron ? 1 : 0) !== 1 || (cron && !timezone) || (at && timezone))
           fail('INVALID_PARAMS', 'Specify exactly --at, or --cron with --timezone.');
-        const row = at ? addSchedule({ title, instructions, at }) : addSchedule({ title, instructions, cron: cron!, timezone: timezone! });
+        const row = at
+          ? addSchedule({ title, instructions, at })
+          : addSchedule({ title, instructions, cron: cron!, timezone: timezone! });
         return { ...row, id: publicId('schedule', row.id) };
       });
     case 'schedule.list': {
@@ -319,7 +355,10 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       const result = listScheduleRows(requestedLimit + 1, cursor);
       const hasNext = result.length > requestedLimit;
       const page = hasNext ? result.slice(0, requestedLimit) : result;
-      return { items: page.map((row) => ({ ...row, id: publicId('schedule', row.id) })), nextCursor: hasNext ? encodeCursor(page[page.length - 1]) : null };
+      return {
+        items: page.map((row) => ({ ...row, id: publicId('schedule', row.id) })),
+        nextCursor: hasNext ? encodeCursor(page[page.length - 1]) : null,
+      };
     }
     case 'schedule.show': {
       const value = text(params.id, 'id');
@@ -350,24 +389,38 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
         if (!removeScheduleRow(id)) fail('NOT_FOUND', `schedule-${id} was not found.`);
         return { removed: true };
       });
-    case 'trust.list':
-      return {
-        items: db
-          .prepare(
-            'select user_id as userId, label, created_at as createdAt from trusted_users order by created_at, user_id limit ?',
-          )
-          .all(limit(params.limit)),
-        nextCursor: null,
+    case 'trust.list': {
+      const requestedLimit = limit(params.limit);
+      const cursor = decodeTrustCursor(params.cursor);
+      const values: unknown[] = [];
+      const where = cursor ? 'where (created_at > ? or (created_at = ? and user_id > ?))' : '';
+      if (cursor) values.push(cursor.createdAt, cursor.createdAt, cursor.userId);
+      const result = db
+        .prepare(
+          `select user_id as userId, label, created_at as createdAt from trusted_users ${where} order by created_at asc, user_id asc limit ?`,
+        )
+        .all(...values, requestedLimit + 1) as Array<{
+        userId: string;
+        label: string;
+        createdAt: string;
+      }>;
+      const hasNext = result.length > requestedLimit;
+      const items = hasNext ? result.slice(0, requestedLimit) : result;
+      return { items, nextCursor: hasNext ? encodeTrustCursor(items[items.length - 1]) : null };
+    }
+    case 'trust.add': {
+      const userId = trustUserId(params.userId); // Validate locally before contacting Slack.
+      const add = async () => {
+        const user = await slackUser(userId);
+        return { added: addTrustedUser(userId, user.label), label: user.label };
       };
-    case 'trust.add':
-      return {
-        added: addTrustedUser(
-          text(params.userId, 'userId'),
-          text(params.label ?? params.userId, 'label'),
-        ),
-      };
-    case 'trust.remove':
-      return { removed: removeTrustedUser(text(params.userId, 'userId')) };
+      return services ? services.coordinator.run(add) : add();
+    }
+    case 'trust.remove': {
+      const userId = trustUserId(params.userId);
+      const remove = () => ({ removed: removeTrustedUser(userId) });
+      return services ? services.coordinator.run(remove) : remove();
+    }
     case 'config.show':
       return readGatewayConfig();
     case 'config.set':

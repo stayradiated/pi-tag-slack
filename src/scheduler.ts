@@ -45,26 +45,49 @@ export function nextCronOccurrence(expression: string, timezone: string, after: 
   return next.toISOString();
 }
 
-export function addSchedule(input: ScheduleInput, clock: () => Date = () => new Date()): ScheduleRow {
-  if (!input.title.trim() || !input.instructions.trim()) throw new Error('title and instructions must be non-empty.');
+export function addSchedule(
+  input: ScheduleInput,
+  clock: () => Date = () => new Date(),
+): ScheduleRow {
+  if (!input.title.trim() || !input.instructions.trim())
+    throw new Error('title and instructions must be non-empty.');
   if ('at' in input) {
     const at = parseAt(input.at);
-    return createScheduleRow({ title: input.title.trim(), instructions: input.instructions.trim(), kind: 'at', at });
+    return createScheduleRow({
+      title: input.title.trim(),
+      instructions: input.instructions.trim(),
+      kind: 'at',
+      at,
+    });
   }
   const expression = input.cron.trim();
   const timezone = input.timezone.trim();
   const nextRunAt = nextCronOccurrence(expression, timezone, clock());
-  return createScheduleRow({ title: input.title.trim(), instructions: input.instructions.trim(), kind: 'cron', cron: expression, timezone, nextRunAt });
+  return createScheduleRow({
+    title: input.title.trim(),
+    instructions: input.instructions.trim(),
+    kind: 'cron',
+    cron: expression,
+    timezone,
+    nextRunAt,
+  });
 }
 
-export function enableSchedule(row: ScheduleRow, clock: () => Date = () => new Date()): ScheduleRow {
+export function enableSchedule(
+  row: ScheduleRow,
+  clock: () => Date = () => new Date(),
+): ScheduleRow {
   const now = clock();
   if (row.kind === 'at') {
     if (!row.at_time || new Date(row.at_time).getTime() <= now.getTime())
       throw new Error('Cannot enable a one-time schedule whose time is in the past.');
     return setScheduleEnabled(row.id, true, row.at_time);
   }
-  return setScheduleEnabled(row.id, true, nextCronOccurrence(row.cron_expression!, row.timezone!, now));
+  return setScheduleEnabled(
+    row.id,
+    true,
+    nextCronOccurrence(row.cron_expression!, row.timezone!, now),
+  );
 }
 
 export function materializeDueSchedules(clock: () => Date = () => new Date()) {
