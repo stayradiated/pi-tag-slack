@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +28,7 @@ import {
   reconcileInboxReactions,
 } from '../src/slack-client.js';
 import { ensurePrivateLayout, gatewayPaths } from '../src/paths.js';
+import { PiRpcSession } from '../src/pi-rpc.js';
 
 const directories: string[] = [];
 
@@ -308,6 +312,21 @@ describe('control configuration', () => {
     });
   });
 
+  it('includes the same session status in online daemon health', async () => {
+    configuredDb();
+    const session = { running: true, health: 'healthy', sessionId: 'session-123' };
+    await expect(
+      dispatch(
+        { version: 1, id: 'health', command: 'health', params: {} },
+        {
+          notifier: { async notify() { return { acceptedAt: '', runSequence: 0 }; } },
+          coordinator: new GatewayCoordinator(),
+          sessionStatus: async () => session,
+        },
+      ),
+    ).resolves.toEqual({ database: 'ok', control: 'ok', session });
+  });
+
   it('updates only typed non-structural settings and resets session overrides', () => {
     configuredDb();
     const request = (command: string, params: Record<string, unknown>) =>
@@ -331,6 +350,69 @@ describe('control configuration', () => {
     expect(() => request('config.set', { key: 'schedulerBatchLimit', value: '0' })).toThrow(
       /out of range/,
     );
+  });
+});
+
+describe('pi RPC session status', () => {
+  it('reports a validated fake get_state snapshot and degrades on a malformed refresh', async () => {
+    const stdout = new PassThrough();
+    const stdin = new PassThrough();
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout,
+      stderr: new PassThrough(),
+      kill: () => true,
+    }) as unknown as ChildProcessWithoutNullStreams;
+    let malformed = false;
+    stdin.on('data', (chunk: Buffer) => {
+      const request = JSON.parse(chunk.toString()) as { id: string; type: string };
+      if (request.type === 'get_state') {
+        stdout.write(
+          JSON.stringify({
+            id: request.id,
+            type: 'response',
+            command: 'get_state',
+            success: true,
+            data: malformed
+              ? { isStreaming: 'yes' }
+              : {
+                  isStreaming: true,
+                  sessionId: 'session-123',
+                  model: { provider: 'anthropic', id: 'claude-test' },
+                  thinkingLevel: 'high',
+                },
+          }) + '\n',
+        );
+      } else {
+        stdout.write(JSON.stringify({ id: request.id, type: 'response', success: true }) + '\n');
+      }
+    });
+    const session = new PiRpcSession({
+      binary: 'fake-pi',
+      sessionDir: '/tmp/session',
+      cwd: '/tmp',
+      desired: () => ({ model: 'configured/model', thinking: 'medium' }),
+      spawn: (() => child) as typeof spawn,
+    });
+    await session.start();
+    await expect(session.status()).resolves.toEqual({
+      running: true,
+      health: 'healthy',
+      sessionId: 'session-123',
+      activity: 'active',
+      runSequence: 0,
+      lastError: null,
+      desiredModel: 'configured/model',
+      desiredThinking: 'medium',
+      effectiveModel: 'anthropic/claude-test',
+      effectiveThinking: 'high',
+    });
+    malformed = true;
+    await expect(session.status()).resolves.toMatchObject({
+      running: true,
+      health: 'degraded',
+      lastError: 'Invalid get_state response from pi RPC.',
+    });
   });
 });
 

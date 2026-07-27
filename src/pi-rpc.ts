@@ -3,7 +3,20 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 
 export type PiAcceptance = { acceptedAt: string; sessionId?: string; runSequence: number };
+export type PiSessionStatus = {
+  running: boolean;
+  health: 'healthy' | 'degraded';
+  sessionId: string | null;
+  activity: 'active' | 'idle';
+  runSequence: number;
+  lastError: string | null;
+  desiredModel: string | null;
+  desiredThinking: string | null;
+  effectiveModel: string | null;
+  effectiveThinking: string | null;
+};
 type Frame = Record<string, unknown>;
+type DesiredSessionSettings = { model: string | null; thinking: string | null };
 
 /** A single persistent, strictly-LF-framed pi RPC child. */
 export class PiRpcSession {
@@ -16,12 +29,23 @@ export class PiRpcSession {
   private streaming = false;
   private sessionId: string | undefined;
   private sequence = 0;
+  private lastError: string | undefined;
+  private effectiveModel: string | undefined;
+  private effectiveThinking: string | undefined;
 
-  constructor(private readonly options: { binary: string; sessionDir: string; cwd: string }) {}
+  constructor(
+    private readonly options: {
+      binary: string;
+      sessionDir: string;
+      cwd: string;
+      desired?: () => DesiredSessionSettings;
+      spawn?: typeof spawn;
+    },
+  ) {}
 
   async start(): Promise<void> {
     if (this.child) return;
-    const child = spawn(
+    const child = (this.options.spawn ?? spawn)(
       this.options.binary,
       ['--mode', 'rpc', '--session-dir', this.options.sessionDir, '--continue', '--approve'],
       {
@@ -31,16 +55,14 @@ export class PiRpcSession {
     );
     this.child = child;
     child.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
-    child.on('error', (error) => this.failAll(error));
-    child.on('exit', () => {
+    child.on('error', (error) => this.recordFailure(error));
+    child.on('exit', (code, signal) => {
       this.child = undefined;
       this.streaming = false;
-      this.failAll(new Error('pi RPC process exited.'));
+      this.recordFailure(new Error(`pi RPC process exited (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`));
     });
     await this.command('set_follow_up_mode', { mode: 'one-at-a-time' });
-    const state = await this.command('get_state');
-    this.streaming = state.isStreaming === true;
-    this.sessionId = typeof state.sessionName === 'string' ? state.sessionName : undefined;
+    this.applyState(await this.getState());
   }
 
   async notify(message: string): Promise<PiAcceptance> {
@@ -61,6 +83,68 @@ export class PiRpcSession {
     if (!child) return;
     child.stdin.end();
     await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  }
+
+  /** Returns a read-only, runtime-validated view of the child session. */
+  async status(): Promise<PiSessionStatus> {
+    if (this.child) {
+      try {
+        this.applyState(await this.getState());
+      } catch (error) {
+        this.recordFailure(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+    const desired = this.options.desired?.() ?? { model: null, thinking: null };
+    return {
+      running: Boolean(this.child),
+      health: this.child && !this.lastError ? 'healthy' : 'degraded',
+      sessionId: this.sessionId ?? null,
+      activity: this.streaming ? 'active' : 'idle',
+      runSequence: this.sequence,
+      lastError: this.lastError ?? null,
+      desiredModel: desired.model,
+      desiredThinking: desired.thinking,
+      effectiveModel: this.effectiveModel ?? null,
+      effectiveThinking: this.effectiveThinking ?? null,
+    };
+  }
+
+  private async getState(): Promise<Record<string, unknown>> {
+    const response = await this.command('get_state');
+    const data = response.data;
+    if (
+      response.type !== 'response' ||
+      response.command !== 'get_state' ||
+      response.success !== true ||
+      !data ||
+      typeof data !== 'object' ||
+      Array.isArray(data) ||
+      typeof (data as Frame).isStreaming !== 'boolean' ||
+      (data as Frame).sessionId !== undefined && typeof (data as Frame).sessionId !== 'string' ||
+      (data as Frame).thinkingLevel !== undefined && typeof (data as Frame).thinkingLevel !== 'string' ||
+      (data as Frame).model !== undefined && (data as Frame).model !== null && typeof (data as Frame).model !== 'object'
+    ) {
+      throw new Error('Invalid get_state response from pi RPC.');
+    }
+    return data as Frame;
+  }
+
+  private applyState(state: Frame): void {
+    this.streaming = state.isStreaming === true;
+    this.sessionId = typeof state.sessionId === 'string' ? state.sessionId : undefined;
+    this.effectiveThinking = typeof state.thinkingLevel === 'string' ? state.thinkingLevel : undefined;
+    const model = state.model;
+    if (model && typeof model === 'object') {
+      const value = model as Frame;
+      this.effectiveModel =
+        typeof value.provider === 'string' && typeof value.id === 'string'
+          ? `${value.provider}/${value.id}`
+          : typeof value.id === 'string'
+            ? value.id
+            : undefined;
+    } else {
+      this.effectiveModel = undefined;
+    }
   }
 
   private command(type: string, values: Record<string, unknown> = {}): Promise<Frame> {
@@ -97,13 +181,14 @@ export class PiRpcSession {
           pending.resolve(frame);
         }
       } catch (error) {
-        this.failAll(new Error(`Invalid pi RPC frame: ${(error as Error).message}`));
+        this.recordFailure(new Error(`Invalid pi RPC frame: ${(error as Error).message}`));
         this.child?.kill();
       }
     }
   }
 
-  private failAll(error: Error): void {
+  private recordFailure(error: Error): void {
+    this.lastError = error.message;
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
   }

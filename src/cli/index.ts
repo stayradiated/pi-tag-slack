@@ -32,6 +32,7 @@ Usage:
   pi-tag-slack schedule add|list|show|enable|disable|remove ...
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
+  pi-tag-slack session status [--json]
   pi-tag-slack doctor
   pi-tag-slack start
 
@@ -244,6 +245,7 @@ function commandFor(group: string, verb?: string): string | undefined {
     'config.show',
     'config.set',
     'config.reset',
+    'session.status',
   ]);
   const command = `${group}.${verb ?? ''}`;
   return allowed.has(command) ? command : undefined;
@@ -299,6 +301,10 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   if (command === 'trust.remove') return { userId: args[0] };
   if (command === 'config.set') return { key: args[0], value: args[1] };
   if (command === 'config.reset') return { key: args[0] };
+  if (command === 'session.status') {
+    parseFlags(args, new Set(['json']));
+    return {};
+  }
   return {};
 }
 

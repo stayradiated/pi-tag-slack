@@ -69,6 +69,13 @@ export async function startGateway(): Promise<void> {
       binary: String(config.pi_binary),
       sessionDir: paths.session,
       cwd: String(config.working_directory),
+      desired: () => {
+        const current = readGatewayConfig();
+        return {
+          model: String(current.session_model_override ?? current.default_model),
+          thinking: String(current.session_thinking_override ?? current.default_thinking),
+        };
+      },
     });
     await pi.start();
     // A recovery is aggregate-only: it deliberately does not update per-item
@@ -87,7 +94,11 @@ export async function startGateway(): Promise<void> {
       notifier: pi,
       coordinator,
     });
-    server = await startControlServer({ notifier: pi, coordinator });
+    server = await startControlServer({
+      notifier: pi,
+      coordinator,
+      sessionStatus: () => pi!.status(),
+    });
     // Reconciliation is bounded and best-effort; it never affects Slack admission.
     void reconcileInboxReactions().catch(() => undefined);
     reactionTimer = setInterval(

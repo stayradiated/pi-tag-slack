@@ -186,6 +186,7 @@ function resolveRows(
 export type ControlServices = {
   notifier: PiNotifier;
   coordinator: GatewayCoordinator;
+  sessionStatus?: () => Promise<unknown>;
 };
 
 export function dispatch(request: Request, services?: ControlServices): unknown {
@@ -196,7 +197,11 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     services ? services.coordinator.run(operation) : operation();
   switch (request.command) {
     case 'health':
-      return { database: 'ok', control: 'ok' };
+      if (!services?.sessionStatus) return { database: 'ok', control: 'ok' };
+      return services.sessionStatus().then((session) => ({ database: 'ok', control: 'ok', session }));
+    case 'session.status':
+      if (!services?.sessionStatus) fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
+      return services.sessionStatus();
     case 'inbox.list':
       return rows(db, 'inbox', state(params.state), limit(params.limit), params.cursor);
     case 'inbox.show':
