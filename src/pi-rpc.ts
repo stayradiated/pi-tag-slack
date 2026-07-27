@@ -76,12 +76,42 @@ export class PiRpcSession {
       desired?: () => DesiredSessionSettings;
       spawn?: typeof spawn;
       version?: (binary: string) => Promise<string>;
+      /** Injectable only to make restart supervision deterministic in tests. */
+      restartBaseMs?: number;
+      restartMaxMs?: number;
+      restartFailureThreshold?: number;
+      setTimeout?: typeof setTimeout;
+      clearTimeout?: typeof clearTimeout;
     },
   ) {}
 
+  private startPromise: Promise<void> | undefined;
+  private restartTimer: ReturnType<typeof setTimeout> | undefined;
+  private consecutiveFailures = 0;
+  private stopping = false;
+  private restartAfterStart = false;
+
   async start(): Promise<void> {
     if (this.child) return;
+    if (this.startPromise) return this.startPromise;
+    this.cancelRestart();
+    const operation = this.startChild();
+    this.startPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.startPromise === operation) this.startPromise = undefined;
+      if (this.restartAfterStart) {
+        this.restartAfterStart = false;
+        this.scheduleRestart();
+      }
+    }
+  }
+
+  private async startChild(): Promise<void> {
+    if (this.stopping) throw new Error('pi RPC session is stopping.');
     const output = await (this.options.version ?? piVersion)(this.options.binary);
+    if (this.stopping) throw new Error('pi RPC session is stopping.');
     requireSupportedPiVersion(output);
     const child = (this.options.spawn ?? spawn)(
       this.options.binary,
@@ -91,15 +121,11 @@ export class PiRpcSession {
     this.child = child;
     child.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
     child.on('error', (error) => {
-      if (this.child === child) this.recordFailure(error);
+      this.handleUnexpectedExit(child, error);
     });
     child.on('exit', (code, signal) => {
-      // A rejected startup already detached and terminated this child; preserve
-      // that actionable handshake error instead of replacing it with its exit.
-      if (this.child !== child) return;
-      this.child = undefined;
-      this.streaming = false;
-      this.recordFailure(
+      this.handleUnexpectedExit(
+        child,
         new Error(`pi RPC process exited (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`),
       );
     });
@@ -121,6 +147,9 @@ export class PiRpcSession {
         throw new Error(`Configured model is unavailable from pi: ${desired.model}`);
       if (desired.thinking && !levels.includes(desired.thinking))
         throw new Error(`Configured thinking level is unavailable from pi: ${desired.thinking}`);
+      // A fully validated handshake is the only point a restart is healthy.
+      this.consecutiveFailures = 0;
+      this.lastError = undefined;
     } catch (error) {
       this.failStart(child, error instanceof Error ? error : new Error(String(error)));
       throw error;
@@ -223,9 +252,21 @@ export class PiRpcSession {
   }
 
   async notify(message: string): Promise<PiAcceptance> {
-    if (!this.child) await this.start();
+    if (this.stopping) throw new Error('pi RPC session is stopping.');
+    let reopenedExhaustedWindow = false;
+    if (!this.child) {
+      // Exhaustion suppresses background restarts, not newly durable work. A
+      // new event/task opens exactly one fresh attempt window.
+      if (this.isExhausted()) {
+        this.consecutiveFailures = 0;
+        reopenedExhaustedWindow = true;
+      }
+      await this.start();
+    }
     const command = this.streaming ? 'follow_up' : 'prompt';
-    const response = await this.command(command, { message });
+    const response = await this.command(command, {
+      message: reopenedExhaustedWindow ? `${message}\nOther open work may exist.` : message,
+    });
     if (response.success !== true) throw new Error(`pi rejected ${command}.`);
     this.sequence += 1;
     return {
@@ -236,6 +277,10 @@ export class PiRpcSession {
   }
 
   async stop(): Promise<void> {
+    // This is terminal daemon shutdown. It must win races with exit handlers
+    // and with a timer that was already queued.
+    this.stopping = true;
+    this.cancelRestart();
     const child = this.child;
     if (!child) return;
     child.stdin.end();
@@ -356,15 +401,68 @@ export class PiRpcSession {
   }
 
   private failStart(child: ChildProcessWithoutNullStreams, error: Error): void {
-    this.recordFailure(error);
+    if (!this.stopping) this.recordFailure(error);
     if (this.child === child) this.child = undefined;
     this.streaming = false;
     child.stdin.end();
     child.kill();
   }
 
+  private handleUnexpectedExit(child: ChildProcessWithoutNullStreams, error: Error): void {
+    // `error` and `exit` can both arrive. Only the owner of this child gets to
+    // reject commands and schedule its successor.
+    if (this.child !== child) return;
+    this.child = undefined;
+    this.streaming = false;
+    if (this.stopping) {
+      this.rejectPending(new Error('pi RPC process stopped.'));
+      return;
+    }
+    this.recordFailure(error);
+    this.consecutiveFailures += 1;
+    this.scheduleRestart();
+  }
+
+  private isExhausted(): boolean {
+    return this.consecutiveFailures >= (this.options.restartFailureThreshold ?? 3);
+  }
+
+  private scheduleRestart(): void {
+    if (this.stopping || this.isExhausted() || this.restartTimer) return;
+    if (this.startPromise) {
+      this.restartAfterStart = true;
+      return;
+    }
+    const base = this.options.restartBaseMs ?? 250;
+    const cap = this.options.restartMaxMs ?? 10_000;
+    const delay = Math.min(cap, base * 2 ** Math.max(0, this.consecutiveFailures - 1));
+    const schedule = this.options.setTimeout ?? setTimeout;
+    this.restartTimer = schedule(() => {
+      this.restartTimer = undefined;
+      if (this.stopping || this.isExhausted() || this.child || this.startPromise) return;
+      // Failure is deliberately swallowed: it is reflected in status and the
+      // next unexpected-exit/start failure schedules the next bounded retry.
+      void this.start().catch((error: unknown) => {
+        if (this.stopping) return;
+        this.recordFailure(error instanceof Error ? error : new Error(String(error)));
+        this.consecutiveFailures += 1;
+        this.scheduleRestart();
+      });
+    }, delay);
+  }
+
+  private cancelRestart(): void {
+    if (!this.restartTimer) return;
+    (this.options.clearTimeout ?? clearTimeout)(this.restartTimer);
+    this.restartTimer = undefined;
+  }
+
   private recordFailure(error: Error): void {
     this.lastError = error.message;
+    this.rejectPending(error);
+  }
+
+  private rejectPending(error: Error): void {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
   }
