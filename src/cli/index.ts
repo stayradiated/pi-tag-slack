@@ -6,7 +6,15 @@ import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
 import { createResetBackupBundle } from '../reset-backup.js';
-import { installFreshReset, recoverInterruptedReset } from '../reset-install.js';
+import { installFreshReset, readResetJournal, recoverInterruptedReset } from '../reset-install.js';
+import { daemon } from '../daemon.js';
+import {
+  collectInteractiveSetup,
+  confirmInteractiveRecovery,
+  confirmInteractiveReset,
+  systemSetupPrompts,
+  type SetupPrompts,
+} from '../setup-interactive.js';
 import {
   addTrustedUser,
   closeDb,
@@ -111,9 +119,130 @@ async function doctor(): Promise<number> {
   return result.exitCode;
 }
 
+export interface SetupDependencies {
+  /** Interactive seams keep tests away from terminals and service managers. */
+  isInteractive(): boolean;
+  prompts: SetupPrompts;
+  installAndStartDaemon(): void;
+}
+
+export function systemSetupDependencies(): SetupDependencies {
+  return {
+    isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+    prompts: systemSetupPrompts,
+    installAndStartDaemon: () => {
+      daemon('install');
+      daemon('start');
+    },
+  };
+}
+
+function setupSuccess(interactive: boolean, dependencies: SetupDependencies): void {
+  if (interactive) {
+    dependencies.installAndStartDaemon();
+    console.log('Setup complete and daemon service started.');
+  } else {
+    console.log('Next steps:\n  pi-tag-slack daemon install\n  pi-tag-slack daemon start');
+  }
+}
+
 export async function setup(
   args: string[],
   validationDependencies?: SetupValidationDependencies,
+  dependencies = systemSetupDependencies(),
+): Promise<number> {
+  const options = parseFlags(
+    args,
+    new Set([
+      'channel',
+      'cwd',
+      'pi-bin',
+      'model',
+      'thinking',
+      'bot-token',
+      'app-token',
+      'trusted-user',
+      'reset',
+      'yes',
+    ]),
+  );
+  const reset = options.reset === true;
+  const yes = options.yes === true;
+  const paths = ensurePrivateLayout();
+  const journal = structuralPathExists(paths.journal) ? readResetJournal(paths.journal) : undefined;
+  const incompleteJournal = journal !== undefined && journal.phase !== 'complete';
+  const interactive = dependencies.isInteractive();
+  if (!reset && incompleteJournal) {
+    if (yes) {
+      console.log(`Recovering interrupted reset from ${paths.journal}.`);
+      recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
+      console.log(`Recovered interrupted reset at ${paths.db}.`);
+      setupSuccess(interactive, dependencies);
+      return 0;
+    }
+    if (!interactive)
+      throw new Error('An interrupted reset requires recovery. Run pi-tag-slack setup --yes.');
+    console.log(`Interrupted reset detected: ${paths.journal}`);
+    if (!(await confirmInteractiveRecovery(dependencies.prompts))) return 1;
+    console.log(`Recovering interrupted reset from ${paths.journal}.`);
+    recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
+    console.log(`Recovered interrupted reset at ${paths.db}.`);
+    setupSuccess(true, dependencies);
+    return 0;
+  }
+  // --yes is reserved for deterministic reset-journal recovery, never setup consent.
+  if (!reset && yes) {
+    recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
+    console.log(`Recovered interrupted reset at ${paths.db}.`);
+    setupSuccess(interactive, dependencies);
+    return 0;
+  }
+  const required = ['channel', 'cwd', 'model', 'bot-token', 'app-token', 'trusted-user'];
+  const missingRequired = required.some((name) => typeof options[name] !== 'string');
+  if (interactive && missingRequired) {
+    const values = await collectInteractiveSetup(dependencies.prompts);
+    if (!values) return 1;
+    const collected = [
+      '--channel',
+      values.channel,
+      '--cwd',
+      values.cwd,
+      '--pi-bin',
+      values.piBin,
+      '--model',
+      values.model,
+      '--thinking',
+      values.thinking,
+      '--bot-token',
+      values.botToken,
+      '--app-token',
+      values.appToken,
+      '--trusted-user',
+      values.trustedUser,
+      ...(reset ? ['--reset'] : []),
+    ];
+    return setupCore(collected, validationDependencies, async (message) =>
+      confirmInteractiveReset(dependencies.prompts, message),
+    ).then((result) => {
+      if (result === 0) setupSuccess(true, dependencies);
+      return result;
+    });
+  }
+  const result = await setupCore(
+    args,
+    validationDependencies,
+    interactive && reset && !yes
+      ? async (message) => confirmInteractiveReset(dependencies.prompts, message)
+      : undefined,
+  );
+  if (result === 0) setupSuccess(interactive, dependencies);
+  return result;
+}
+
+async function setupCore(
+  args: string[],
+  validationDependencies?: SetupValidationDependencies,
+  confirmReset?: (message: string) => Promise<boolean>,
 ): Promise<number> {
   const options = parseFlags(
     args,
@@ -133,14 +262,6 @@ export async function setup(
   const value = (name: string) => (typeof options[name] === 'string' ? options[name] : undefined);
   const reset = options.reset === true;
   const yes = options.yes === true;
-  // A bare non-interactive setup is normally invalid. Its sole exception is
-  // deterministic repair of a reset journal left by an interrupted reset.
-  if (yes && !reset) {
-    const paths = ensurePrivateLayout();
-    recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
-    console.log(`Recovered interrupted reset at ${paths.db}.`);
-    return 0;
-  }
   const channel = value('channel');
   const cwd = value('cwd');
   const model = value('model');
@@ -177,9 +298,8 @@ export async function setup(
         'Gateway state already exists; plain setup never replaces it. Use setup --reset.',
       );
     }
-    // Interactive confirmation belongs to the surrounding setup flow. This
-    // non-interactive API deliberately requires explicit --yes for reset.
-    if (reset && !yes) throw new Error('setup --reset requires --yes in non-interactive mode.');
+    if (reset && !yes && !confirmReset)
+      throw new Error('setup --reset requires --yes in non-interactive mode.');
     // All local, RPC, and Slack validation runs before SQLite/config staging.
     const validated = await validateFirstTimeSetup(
       {
@@ -197,6 +317,15 @@ export async function setup(
     console.warn(
       "Warning: trusted Slack users can influence an agent with this daemon account's local capabilities.",
     );
+    if (reset && !yes) {
+      const confirmed = await confirmReset?.(
+        `Type RESET to replace:\n  config: ${configPath}\n  database: ${paths.db}\n  session: ${paths.session}\nBackup bundle: ${paths.backups}/reset-<UTC>-<counter>/`,
+      );
+      if (!confirmed) {
+        console.log('Reset cancelled; no changes were made.');
+        return 1;
+      }
+    }
 
     // Build all durable state off to the side first. Nothing active is changed
     // until validation of the complete database singleton has succeeded.
