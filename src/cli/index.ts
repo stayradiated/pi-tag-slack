@@ -42,6 +42,7 @@ Usage:
   pi-tag-slack session model list [--json]|set <provider/model>|reset
   pi-tag-slack session thinking set <level>|reset
   pi-tag-slack doctor
+  pi-tag-slack daemon install|uninstall|start|stop|status|logs
   pi-tag-slack start
 
 Runtime commands use the daemon control socket. Run setup before starting the daemon.`;
@@ -62,6 +63,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (group === 'doctor') return doctor();
+  if (group === 'daemon') {
+    const { daemon } = await import('../daemon.js');
+    daemon(verb ?? '');
+    return 0;
+  }
 
   const fileDownload = group === 'slack' && verb === 'file' && rest[0] === 'download';
   const sessionNested =
