@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 
 export type PiAcceptance = { acceptedAt: string; sessionId?: string; runSequence: number };
@@ -21,6 +21,36 @@ type DesiredSessionSettings = { model: string | null; thinking: string | null };
 export type PiModel = { provider: string; id: string; ref: string };
 export type PiApplyResult = { application: 'applied' | 'pending' | 'failed' };
 const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const minimumPiVersion = [0, 82, 0] as const;
+
+/** Run the configured executable's version command before opening an RPC session. */
+export async function piVersion(binary: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(binary, ['--version'], { encoding: 'utf8' }, (error, stdout) => {
+      if (error) {
+        reject(new Error(`Unable to run ${binary} --version: ${error.message}`));
+        return;
+      }
+      resolve(String(stdout));
+    });
+  });
+}
+
+export function requireSupportedPiVersion(output: string): void {
+  // pi has emitted both `0.x.y` and `pi 0.x.y`; accept only those complete forms.
+  const match = /^(?:pi\s+)?v?(\d+)\.(\d+)\.(\d+)\s*$/.exec(output);
+  if (!match) throw new Error('Malformed pi --version output. Expected a semantic version.');
+  const version = match.slice(1).map(Number);
+  if (
+    version[0] < minimumPiVersion[0] ||
+    (version[0] === minimumPiVersion[0] && version[1] < minimumPiVersion[1]) ||
+    (version[0] === minimumPiVersion[0] &&
+      version[1] === minimumPiVersion[1] &&
+      version[2] < minimumPiVersion[2])
+  ) {
+    throw new Error('pi 0.82.0 or later is required.');
+  }
+}
 
 /** A single persistent, strictly-LF-framed pi RPC child. */
 export class PiRpcSession {
@@ -45,31 +75,56 @@ export class PiRpcSession {
       cwd: string;
       desired?: () => DesiredSessionSettings;
       spawn?: typeof spawn;
+      version?: (binary: string) => Promise<string>;
     },
   ) {}
 
   async start(): Promise<void> {
     if (this.child) return;
+    const output = await (this.options.version ?? piVersion)(this.options.binary);
+    requireSupportedPiVersion(output);
     const child = (this.options.spawn ?? spawn)(
       this.options.binary,
       ['--mode', 'rpc', '--session-dir', this.options.sessionDir, '--continue', '--approve'],
-      {
-        cwd: this.options.cwd,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      },
+      { cwd: this.options.cwd, stdio: ['pipe', 'pipe', 'pipe'] },
     );
     this.child = child;
     child.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
-    child.on('error', (error) => this.recordFailure(error));
+    child.on('error', (error) => {
+      if (this.child === child) this.recordFailure(error);
+    });
     child.on('exit', (code, signal) => {
+      // A rejected startup already detached and terminated this child; preserve
+      // that actionable handshake error instead of replacing it with its exit.
+      if (this.child !== child) return;
       this.child = undefined;
       this.streaming = false;
       this.recordFailure(
         new Error(`pi RPC process exited (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`),
       );
     });
-    await this.command('set_follow_up_mode', { mode: 'one-at-a-time' });
-    this.applyState(await this.getState());
+    try {
+      const followUp = await this.command('set_follow_up_mode', { mode: 'one-at-a-time' });
+      if (
+        followUp.type !== 'response' ||
+        followUp.command !== 'set_follow_up_mode' ||
+        followUp.success !== true
+      )
+        throw new Error('Invalid set_follow_up_mode response from pi RPC.');
+      this.applyState(await this.getState());
+      const [models, levels] = await Promise.all([
+        this.availableModels(),
+        this.availableThinkingLevels(),
+      ]);
+      const desired = this.options.desired?.() ?? { model: null, thinking: null };
+      if (desired.model && !models.some((model) => model.ref === desired.model))
+        throw new Error(`Configured model is unavailable from pi: ${desired.model}`);
+      if (desired.thinking && !levels.includes(desired.thinking))
+        throw new Error(`Configured thinking level is unavailable from pi: ${desired.thinking}`);
+    } catch (error) {
+      this.failStart(child, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
   }
 
   /** Run desired configuration only after pi reports a settled safe boundary. */
@@ -79,9 +134,10 @@ export class PiRpcSession {
 
   async availableModels(): Promise<PiModel[]> {
     const response = await this.command('get_available_models');
-    const models = response.data && typeof response.data === 'object' && !Array.isArray(response.data)
-      ? (response.data as Frame).models
-      : undefined;
+    const models =
+      response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+        ? (response.data as Frame).models
+        : undefined;
     if (
       response.type !== 'response' ||
       response.command !== 'get_available_models' ||
@@ -109,9 +165,10 @@ export class PiRpcSession {
 
   async availableThinkingLevels(): Promise<string[]> {
     const response = await this.command('get_available_thinking_levels');
-    const levels = response.data && typeof response.data === 'object' && !Array.isArray(response.data)
-      ? (response.data as Frame).levels
-      : undefined;
+    const levels =
+      response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+        ? (response.data as Frame).levels
+        : undefined;
     if (
       response.type !== 'response' ||
       response.command !== 'get_available_thinking_levels' ||
@@ -139,7 +196,11 @@ export class PiRpcSession {
           provider: desired.model.slice(0, slash),
           modelId: desired.model.slice(slash + 1),
         });
-        if (response.type !== 'response' || response.command !== 'set_model' || response.success !== true)
+        if (
+          response.type !== 'response' ||
+          response.command !== 'set_model' ||
+          response.success !== true
+        )
           throw new Error('pi rejected set_model.');
       }
       // Model selection can change which thinking levels pi supports.
@@ -292,6 +353,14 @@ export class PiRpcSession {
         this.child?.kill();
       }
     }
+  }
+
+  private failStart(child: ChildProcessWithoutNullStreams, error: Error): void {
+    this.recordFailure(error);
+    if (this.child === child) this.child = undefined;
+    this.streaming = false;
+    child.stdin.end();
+    child.kill();
   }
 
   private recordFailure(error: Error): void {

@@ -408,26 +408,24 @@ describe('pi RPC session status', () => {
     let malformed = false;
     stdin.on('data', (chunk: Buffer) => {
       const request = JSON.parse(chunk.toString()) as { id: string; type: string };
-      if (request.type === 'get_state') {
-        stdout.write(
-          JSON.stringify({
-            id: request.id,
-            type: 'response',
-            command: 'get_state',
-            success: true,
-            data: malformed
-              ? { isStreaming: 'yes' }
-              : {
-                  isStreaming: true,
-                  sessionId: 'session-123',
-                  model: { provider: 'anthropic', id: 'claude-test' },
-                  thinkingLevel: 'high',
-                },
-          }) + '\n',
-        );
-      } else {
-        stdout.write(JSON.stringify({ id: request.id, type: 'response', success: true }) + '\n');
-      }
+      const data = request.type === 'get_state'
+        ? malformed
+          ? { isStreaming: 'yes' }
+          : {
+              isStreaming: true,
+              sessionId: 'session-123',
+              model: { provider: 'anthropic', id: 'claude-test' },
+              thinkingLevel: 'high',
+            }
+        : request.type === 'get_available_models'
+          ? { models: [{ provider: 'configured', id: 'model' }] }
+          : request.type === 'get_available_thinking_levels'
+            ? { levels: ['medium'] }
+            : undefined;
+      stdout.write(JSON.stringify({
+        id: request.id, type: 'response', command: request.type, success: true,
+        ...(data === undefined ? {} : { data }),
+      }) + '\n');
     });
     const session = new PiRpcSession({
       binary: 'fake-pi',
@@ -435,6 +433,7 @@ describe('pi RPC session status', () => {
       cwd: '/tmp',
       desired: () => ({ model: 'configured/model', thinking: 'medium' }),
       spawn: (() => child) as typeof spawn,
+      version: async () => '0.82.0',
     });
     await session.start();
     await expect(session.status()).resolves.toEqual({

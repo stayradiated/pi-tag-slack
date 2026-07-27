@@ -67,6 +67,7 @@ function fakeSession(options: { streaming?: boolean; malformedModels?: boolean; 
       };
     },
     spawn: (() => child) as typeof spawn,
+    version: async () => '0.82.0',
   });
   return { session, commands, settle: () => { streaming = false; stdout.write('{"type":"agent_settled"}\n'); } };
 }
@@ -85,8 +86,8 @@ describe('session desired/effective controls', () => {
     await expect(request('session.model.list', {}, services(valid.session))).resolves.toEqual({
       models: expect.arrayContaining([expect.objectContaining({ ref: 'provider/new' })]),
     });
-    const malformed = fakeSession({ malformedModels: true }); await malformed.session.start();
-    await expect(request('session.model.set', { ref: 'provider/new' }, services(malformed.session))).rejects.toThrow(/Invalid get_available_models/);
+    const malformed = fakeSession({ malformedModels: true });
+    await expect(malformed.session.start()).rejects.toThrow(/Invalid get_available_models/);
     expect(readGatewayConfig().session_model_override).toBeNull();
   });
 
