@@ -275,6 +275,7 @@ pi-tag-slack daemon stop && pi-tag-slack daemon start
 | `SLACK_BOT_TOKEN`            | required                       | Bot User OAuth Token (`xoxb-…`)                                    |
 | `SLACK_APP_TOKEN`            | required                       | App-level Socket Mode token (`xapp-…`) with `connections:write`    |
 | `PI_BIN`                     | `pi`                           | Path to the pi binary                                              |
+| `PATH_PREPEND`               | none                           | Colon-separated directories prepended for pi and its subprocesses  |
 | `PI_MODEL`                   | none                           | Default model override                                             |
 | `PI_THINKING`                | none                           | Default thinking level                                             |
 | `PI_CWD`                     | `$HOME`                        | Default working directory; may be overridden per channel           |
@@ -294,6 +295,8 @@ pi-tag-slack daemon stop && pi-tag-slack daemon start
 | `SESSIONS_DIR`               | platform default `/sessions`   | Session storage directory                                          |
 | `DB_PATH`                    | platform default `/gateway.db` | SQLite database path                                               |
 | `LOG_LEVEL`                  | `info`                         | `debug`, `info`, `warn`, or `error`                                |
+
+`PATH_PREPEND` is useful when the gateway runs as a daemon and tools are installed outside the service's default PATH. For example, it can include mise-managed tool directories without making the gateway depend on mise.
 
 Application data lives in `~/.local/share/pi-tag-slack/` on Linux and `~/Library/Application Support/pi-tag-slack/` on macOS.
 

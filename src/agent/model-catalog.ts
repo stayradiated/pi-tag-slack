@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { commandEnv } from '../command-env.js';
 import { ModelRuntime, SettingsManager } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { minimatch } from 'minimatch';
@@ -299,7 +300,7 @@ function listModelsFromPiCli(piBin: string, cwd: string): AvailableModelInfo[] |
   const { bin, args } = resolvePiSpawn(piBin, ['--list-models']);
   const result = spawnSync(bin, args, {
     cwd,
-    env: process.env,
+    env: commandEnv(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 10 * 1024 * 1024,

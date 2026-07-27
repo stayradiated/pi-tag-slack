@@ -3,6 +3,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { WebClient } from '@slack/web-api';
+import { commandEnv, commandPath } from '../command-env.js';
 import { config, resolveConfigPath, validateSlackTokens } from '../config.js';
 import { closeDb, getAllChannels, initDb } from '../db.js';
 
@@ -25,6 +26,7 @@ export async function runStatus(): Promise<void> {
     '',
     `Pi binary: ${piPath || 'not found'}`,
     `Pi version: ${piVersion || 'unknown'}`,
+    `Command PATH: ${commandPath() || '(empty)'}`,
     `Pi auth: ${authStatus ? `found (${AUTH_PATH})` : `missing (${AUTH_PATH})`}`,
     `Pi working dir: ${config.piCwd}`,
     `Slack auth: ${slackAuth}`,
@@ -144,14 +146,18 @@ function readCommandOutput(command: string): string | undefined {
     const stdout = execSync(command, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: commandEnv(),
     }).trim();
     if (stdout) return stdout;
   } catch {}
   // Some commands (e.g. pi --version) output to stderr — retry with merge
   try {
     return (
-      execSync(command + ' 2>&1', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() ||
-      undefined
+      execSync(command + ' 2>&1', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: commandEnv(),
+      }).trim() || undefined
     );
   } catch {
     return undefined;
