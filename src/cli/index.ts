@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync }
 import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
+import { presentFailure, presentSuccess } from './presentation.js';
 import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
 import { createResetBackupBundle } from '../reset-backup.js';
 import { installFreshReset, readResetJournal, recoverInterruptedReset } from '../reset-install.js';
@@ -77,20 +78,27 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 0;
   }
 
-  const fileDownload = group === 'slack' && verb === 'file' && rest[0] === 'download';
+  const json = argv.includes('--json');
+  // Presentation is a CLI concern, not a control-protocol parameter. Removing
+  // it here lets every runtime command support the flag consistently.
+  const runtimeArgs = rest.filter((argument) => argument !== '--json');
+  const fileDownload = group === 'slack' && verb === 'file' && runtimeArgs[0] === 'download';
   const sessionNested =
     group === 'session' && (verb === 'model' || verb === 'thinking' || verb === 'archive');
   const command = fileDownload
     ? 'slack.file.download'
-    : commandFor(group, verb, sessionNested ? rest[0] : undefined);
+    : commandFor(group, verb, sessionNested ? runtimeArgs[0] : undefined);
   if (!command) throw new Error(`Unsupported command.\n${help}`);
   const response = await request(
     command,
-    paramsFor(command, fileDownload ? rest.slice(1) : sessionNested ? rest.slice(1) : rest),
+    paramsFor(
+      command,
+      fileDownload ? runtimeArgs.slice(1) : sessionNested ? runtimeArgs.slice(1) : runtimeArgs,
+    ),
   );
   if (response.error)
     throw Object.assign(new Error(response.error.message), { code: response.error.code });
-  console.log(JSON.stringify(response.result));
+  console.log(presentSuccess(command, response.result, json));
   return 0;
 }
 
@@ -717,16 +725,11 @@ export function request(
 
 if (process.argv[1]?.endsWith('/cli/index.js') || process.argv[1]?.endsWith('/cli/index.ts')) {
   void main().catch((error: unknown) => {
-    const failure = error as { code?: unknown; message?: unknown };
-    const code = typeof failure.code === 'string' ? failure.code : 'INTERNAL';
-    const message = typeof failure.message === 'string' ? failure.message : 'Command failed.';
-    if (process.argv.slice(2).includes('--json')) {
-      // A failed JSON invocation writes one machine-readable value, and nothing
-      // else, so an agent never needs to parse diagnostics from stderr.
-      console.log(JSON.stringify({ error: { code, message } }));
-    } else {
-      console.error(`Error${code === 'INTERNAL' ? '' : ` [${code}]`}: ${message}`);
-    }
+    const output = presentFailure(error, process.argv.slice(2).includes('--json'));
+    // A failed JSON invocation writes one machine-readable value, and nothing
+    // else, so an agent never needs to parse diagnostics from stderr.
+    if (process.argv.slice(2).includes('--json')) console.log(output);
+    else console.error(output);
     process.exitCode = 1;
   });
 }
