@@ -6,6 +6,10 @@ import { assertPrivateSocket, gatewayPaths, structuralPathExists } from './paths
 import {
   addTrustedUser,
   createManualTask,
+  listScheduleRows,
+  removeScheduleRow,
+  scheduleRow,
+  setScheduleEnabled,
   markTaskAccepted,
   parsePublicId,
   publicId,
@@ -19,6 +23,7 @@ import {
   type MutableConfigKey,
 } from './db.js';
 import type { PiNotifier, GatewayCoordinator } from './slack.js';
+import { addSchedule, enableSchedule } from './scheduler.js';
 import {
   replyToInbox,
   scheduleReactionReconciliation,
@@ -186,6 +191,9 @@ export type ControlServices = {
 export function dispatch(request: Request, services?: ControlServices): unknown {
   const db = requireConfiguredDb();
   const params = request.params;
+  // Schedule definitions and scheduler ticks share the daemon serialization lane.
+  const scheduleMutation = <T>(operation: () => T): T | Promise<T> =>
+    services ? services.coordinator.run(operation) : operation();
   switch (request.command) {
     case 'health':
       return { database: 'ok', control: 'ok' };
@@ -288,6 +296,55 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     }
     case 'task.resolve':
       return resolveRows(db, 'tasks', ids(params.ids), text(params.reason ?? 'resolved', 'reason'));
+    case 'schedule.add':
+      return scheduleMutation(() => {
+        const title = text(params.title, 'title');
+        const instructions = text(params.instructions, 'instructions');
+        const at = params.at === undefined ? undefined : text(params.at, 'at');
+        const cron = params.cron === undefined ? undefined : text(params.cron, 'cron');
+        const timezone = params.timezone === undefined ? undefined : text(params.timezone, 'timezone');
+        if ((at ? 1 : 0) + (cron ? 1 : 0) !== 1 || (cron && !timezone) || (at && timezone))
+          fail('INVALID_PARAMS', 'Specify exactly --at, or --cron with --timezone.');
+        const row = at ? addSchedule({ title, instructions, at }) : addSchedule({ title, instructions, cron: cron!, timezone: timezone! });
+        return { ...row, id: publicId('schedule', row.id) };
+      });
+    case 'schedule.list': {
+      const requestedLimit = limit(params.limit);
+      const cursor = decodeCursor(params.cursor);
+      const result = listScheduleRows(requestedLimit + 1, cursor);
+      const hasNext = result.length > requestedLimit;
+      const page = hasNext ? result.slice(0, requestedLimit) : result;
+      return { items: page.map((row) => ({ ...row, id: publicId('schedule', row.id) })), nextCursor: hasNext ? encodeCursor(page[page.length - 1]) : null };
+    }
+    case 'schedule.show': {
+      const value = text(params.id, 'id');
+      const row = scheduleRow(parsePublicId('schedule', value));
+      if (!row) fail('NOT_FOUND', `${value} was not found.`);
+      return { ...row, id: value };
+    }
+    case 'schedule.disable':
+      return scheduleMutation(() => {
+        const id = parsePublicId('schedule', text(params.id, 'id'));
+        const row = scheduleRow(id);
+        if (!row) fail('NOT_FOUND', `schedule-${id} was not found.`);
+        // A disabled schedule has no pending occurrence; enable recomputes it.
+        const updated = setScheduleEnabled(id, false, null);
+        return { ...updated, id: publicId('schedule', id) };
+      });
+    case 'schedule.enable':
+      return scheduleMutation(() => {
+        const id = parsePublicId('schedule', text(params.id, 'id'));
+        const row = scheduleRow(id);
+        if (!row) fail('NOT_FOUND', `schedule-${id} was not found.`);
+        const updated = enableSchedule(row);
+        return { ...updated, id: publicId('schedule', id) };
+      });
+    case 'schedule.remove':
+      return scheduleMutation(() => {
+        const id = parsePublicId('schedule', text(params.id, 'id'));
+        if (!removeScheduleRow(id)) fail('NOT_FOUND', `schedule-${id} was not found.`);
+        return { removed: true };
+      });
     case 'trust.list':
       return {
         items: db
@@ -328,7 +385,7 @@ function errorReply(id: string, error: unknown): Reply {
   // Persistence deliberately throws ordinary Errors; map expected caller input
   // failures here and never expose SQLite implementation details.
   if (
-    /^(Invalid (inbox|task|schedule) ID:|Slack user ID must be|Configured Slack conversation|Gateway configuration contains|Invalid (default )?thinking level:|Invalid log level:|Configuration value|Unsupported configuration key:|Configuration key cannot be reset:)/.test(
+    /^(Invalid (inbox|task|schedule) ID:|Slack user ID must be|Configured Slack conversation|Gateway configuration contains|Invalid (default )?thinking level:|Invalid log level:|Configuration value|Unsupported configuration key:|Configuration key cannot be reset:|--at must be|Cron expression must be|Invalid cron expression|Invalid IANA timezone:|title and instructions must be|Specify exactly|Cannot enable a one-time schedule)/.test(
       message,
     )
   ) {

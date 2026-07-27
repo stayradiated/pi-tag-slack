@@ -11,11 +11,13 @@ import {
   ingestSlackEvent,
   initDb,
   recordInboxReaction,
+  scheduleRow,
 } from '../src/db.js';
 import { dispatch, startControlServer } from '../src/control.js';
 import { main } from '../src/cli/index.js';
 import { startGateway, startupRecoveryPrompt } from '../src/index.js';
 import { GatewayCoordinator, processSlackEvent } from '../src/slack.js';
+import { addSchedule, materializeDueSchedules, SchedulerService } from '../src/scheduler.js';
 import { validateConfiguredConversation } from '../src/slack-validation.js';
 import {
   clearSlackClient,
@@ -51,6 +53,44 @@ afterEach(() => {
   closeDb();
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
+});
+
+describe('schedules', () => {
+  it('materializes one-time and recurring work exactly once', () => {
+    configuredDb();
+    const once = addSchedule({ title: 'once', instructions: 'do it', at: '2030-01-01T00:00:00+00:00' });
+    const recurring = addSchedule(
+      { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    const due = new Date('2030-01-01T00:01:00Z');
+    const created = materializeDueSchedules(() => due);
+    expect(created).toHaveLength(1);
+    expect(materializeDueSchedules(() => due)).toHaveLength(1);
+    expect(materializeDueSchedules(() => due)).toHaveLength(0);
+    expect(scheduleRow(once.id)?.enabled).toBe(0);
+    expect(scheduleRow(recurring.id)?.next_run_at).toBe('2030-01-01T00:02:00.000Z');
+  });
+
+  it('rejects offset-less times, invalid cron, and invalid timezones', () => {
+    configuredDb();
+    expect(() => addSchedule({ title: 'x', instructions: 'x', at: '2030-01-01T00:00:00' })).toThrow(/explicit UTC offset/);
+    expect(() => addSchedule({ title: 'x', instructions: 'x', cron: '* * * * * *', timezone: 'UTC' })).toThrow(/five fields/);
+    expect(() => addSchedule({ title: 'x', instructions: 'x', cron: '* * * * *', timezone: 'Mars/Olympus' })).toThrow(/IANA timezone/);
+  });
+
+  it('notifies runtime-created schedule tasks and keeps failed notifications open', async () => {
+    configuredDb();
+    addSchedule({ title: 'once', instructions: 'do it', at: '2030-01-01T00:00:00Z' });
+    const notified: string[] = [];
+    const service = new SchedulerService(
+      { notify: async (prompt) => { notified.push(prompt); return { acceptedAt: '2030-01-01T00:00:01.000Z' }; } },
+      new GatewayCoordinator(),
+      () => new Date('2030-01-01T00:00:01Z'),
+    );
+    await service.tick();
+    expect(notified).toHaveLength(1);
+  });
 });
 
 describe('startup and setup', () => {

@@ -29,6 +29,7 @@ Usage:
   pi-tag-slack inbox list|show|working|respond|resolve ...
   pi-tag-slack slack history|message|thread|send ...
   pi-tag-slack task add|list|show|resolve ...
+  pi-tag-slack schedule add|list|show|enable|disable|remove ...
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
   pi-tag-slack doctor
@@ -231,6 +232,12 @@ function commandFor(group: string, verb?: string): string | undefined {
     'task.show',
     'task.add',
     'task.resolve',
+    'schedule.add',
+    'schedule.list',
+    'schedule.show',
+    'schedule.enable',
+    'schedule.disable',
+    'schedule.remove',
     'trust.list',
     'trust.add',
     'trust.remove',
@@ -283,6 +290,11 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
     const flags = parseFlags(args, new Set(['title', 'instructions']));
     return { title: flags.title, instructions: flags.instructions };
   }
+  if (command === 'schedule.add') {
+    const flags = parseFlags(args, new Set(['title', 'instructions', 'at', 'cron', 'timezone']));
+    return compact({ title: flags.title, instructions: flags.instructions, at: flags.at, cron: flags.cron, timezone: flags.timezone });
+  }
+  if (command === 'schedule.enable' || command === 'schedule.disable' || command === 'schedule.remove') return { id: args[0] };
   if (command === 'trust.add') return { userId: args[0] };
   if (command === 'trust.remove') return { userId: args[0] };
   if (command === 'config.set') return { key: args[0], value: args[1] };

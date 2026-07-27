@@ -7,6 +7,7 @@ import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import { clearSlackClient, configureSlackClient, reconcileInboxReactions } from './slack-client.js';
 import { startControlServer } from './control.js';
+import { materializeDueSchedules, SchedulerService } from './scheduler.js';
 import {
   acquireGatewayLock,
   ensurePrivateFile,
@@ -48,6 +49,7 @@ export async function startGateway(): Promise<void> {
   let slack: Awaited<ReturnType<typeof startSlackGateway>> | undefined;
   let pi: PiRpcSession | undefined;
   let reactionTimer: NodeJS.Timeout | undefined;
+  let scheduler: SchedulerService | undefined;
   const coordinator = new GatewayCoordinator();
   try {
     if (!structuralPathExists(paths.db))
@@ -55,6 +57,9 @@ export async function startGateway(): Promise<void> {
     initDb(paths.db);
     ensurePrivateFile(paths.db);
     requireConfiguredDb();
+    // Schedule work is durable before pi starts, and joins the one aggregate
+    // recovery message rather than causing individual startup notifications.
+    await coordinator.run(() => materializeDueSchedules());
     const bootstrap = loadBootstrapConfig();
     const tokenErrors = validateSlackTokens(bootstrap);
     if (tokenErrors.length)
@@ -89,12 +94,15 @@ export async function startGateway(): Promise<void> {
       () => void reconcileInboxReactions().catch(() => undefined),
       15_000,
     );
+    scheduler = new SchedulerService(pi, coordinator);
+    scheduler.start();
     await new Promise<void>((resolve) => {
       process.once('SIGINT', resolve);
       process.once('SIGTERM', resolve);
     });
   } finally {
     if (reactionTimer) clearInterval(reactionTimer);
+    scheduler?.stop();
     clearSlackClient();
     await slack?.stop();
     await pi?.stop();
