@@ -9,17 +9,18 @@ Trusted Slack users remain a separate, multi-user access list.
 
 ## Product decisions
 
-- Setup records one required `SLACK_CHANNEL_ID` (`C...`, `G...`, or `D...`)
-  and its display label. The gateway ignores every other Slack conversation.
+- Setup records one required `SLACK_CHANNEL_ID` (`C...` or `G...`) and its
+  display label. The gateway ignores every other Slack conversation; DMs are
+  unsupported.
 - A channel is no longer registered, discovered, or selected at runtime. DMs,
-  allowlists, open-channel policies, trigger policy, excluded-channel lists,
-  per-channel folders, and per-channel cwd/model/thinking overrides are
-  removed.
+  allowlists, open-channel policies, excluded-channel lists, per-channel
+  folders, and per-channel cwd/model/thinking overrides are removed.
 - The one conversation has one persistent session, queue, working directory,
   model override, and thinking override. Existing global defaults remain the
   fallback settings.
 - The gateway continues to require trusted-user IDs. A trusted user can use
-  the configured conversation; untrusted messages are ignored.
+  the configured conversation by explicitly `@pi`-mentioning it; untrusted
+  messages and unmentioned channel traffic are ignored.
 - The CLI and agent prompt target the configured conversation implicitly:
   `session status`, `session models`, `session model <ref>`,
   `session reset-model`, `session thinking <level>`, `session new`, and
@@ -32,34 +33,32 @@ Trusted Slack users remain a separate, multi-user access list.
 
 ### 1. Replace channel configuration and persistence
 
-1. Add `SLACK_CHANNEL_ID` validation and setup-wizard collection, including a
-   label lookup after the Slack tokens are available.
+1. Add `SLACK_CHANNEL_ID` (`C...`/`G...` only) validation and setup-wizard
+   collection, including a label lookup after the Slack tokens are available.
 2. Replace the `channels` table and channel-policy configuration with a
    singleton gateway/session settings record. Retain the trusted-user,
    message-queue, scheduler, and archive data needed by the single session.
-3. Ship a schema migration that selects a safe existing channel only when the
-   database has exactly one registration; otherwise leave the new channel ID
-   unset and make startup explain that setup must be rerun. Do not silently
-   choose a main channel or first row.
-4. Migrate the selected channel's folder and overrides into singleton settings
-   without moving its session directory. Preserve queued messages that belong
-   to that selected channel and mark queues for discarded channels failed with
-   an audit log.
+3. Ship a schema migration that never selects a legacy channel automatically.
+   Require every operator to rerun setup and explicitly select the configured
+   channel; do not infer it from a main flag, a sole registration, or row order.
+4. After explicit setup selection, migrate that channel's folder and overrides
+   into singleton settings without moving its session directory. Preserve its
+   queued messages and mark queues for discarded channels failed with an audit
+   log.
 5. Simplify `RegisteredChannel`, channel-settings computation, session paths,
    queue claiming, scheduler task ownership, and all call sites to remove
    `jid` routing and per-channel state.
 
 ### 2. Limit Slack ingestion to the configured conversation
 
-1. In `src/slack/client.ts`, reject events whose channel ID differs from
-   `SLACK_CHANNEL_ID` before attachment processing or queue insertion.
+1. In `src/slack/client.ts`, reject events from DMs and events whose channel
+   ID differs from `SLACK_CHANNEL_ID` before attachment processing or queue
+   insertion.
 2. Keep current bot-loop prevention, trusted-user checks, message/thread
    handling, busy reactions, attachment limits, and thread replies.
-3. Remove automatic DM/channel registration, channel-name discovery,
-   unregistered-channel notices, policies, and trigger configuration. Decide
-   during implementation whether every message or only explicit bot mentions
-   should invoke pi; document the chosen single-channel trigger behavior and
-   make it a single setting if a trigger remains necessary.
+3. Require an explicit `@pi` mention for every inbound request. Remove
+   automatic DM/channel registration, channel-name discovery,
+   unregistered-channel notices, policies, and trigger-name configuration.
 4. Make outbound responses and file sends derive the destination from the
    configured conversation. Thread timestamps remain explicit so replies land
    in the originating thread.
