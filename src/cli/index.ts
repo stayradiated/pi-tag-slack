@@ -5,6 +5,8 @@ import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
+import { createResetBackupBundle } from '../reset-backup.js';
+import { installFreshReset } from '../reset-install.js';
 import {
   addTrustedUser,
   closeDb,
@@ -27,7 +29,7 @@ import {
 const help = `pi-tag-slack
 
 Usage:
-  pi-tag-slack setup --channel <C...|G...> --cwd <path> --model <ref> --trusted-user <U...|W...>
+  pi-tag-slack setup [--reset --yes] --channel <C...|G...> --cwd <path> --model <ref> --trusted-user <U...|W...>
   pi-tag-slack inbox list|show|working|respond|resolve ...
   pi-tag-slack slack history|message|thread|file download|send ...
   pi-tag-slack task add|list|show|resolve ...
@@ -139,9 +141,14 @@ export async function setup(
       'bot-token',
       'app-token',
       'trusted-user',
+      'reset',
+      'yes',
     ]),
   );
   const value = (name: string) => (typeof options[name] === 'string' ? options[name] : undefined);
+  const reset = options.reset === true;
+  const yes = options.yes === true;
+  if (yes && !reset) throw new Error('--yes is valid only with setup --reset.');
   const channel = value('channel');
   const cwd = value('cwd');
   const model = value('model');
@@ -166,17 +173,21 @@ export async function setup(
   const suffix = `.setup-${randomUUID()}`;
   const stagedDb = `${paths.db}${suffix}`;
   const stagedConfig = `${configPath}${suffix}`;
+  const stagedSession = `${paths.session}${suffix}`;
   let installedConfig = false;
   let installedDb = false;
   try {
     validateBootstrapConfigPath(configPath);
     ensurePrivateFile(paths.db);
     ensurePrivateFile(configPath);
-    if (structuralPathExists(paths.db) || structuralPathExists(configPath)) {
+    if ((structuralPathExists(paths.db) || structuralPathExists(configPath)) && !reset) {
       throw new Error(
         'Gateway state already exists; plain setup never replaces it. Use setup --reset.',
       );
     }
+    // Interactive confirmation belongs to the surrounding setup flow. This
+    // non-interactive API deliberately requires explicit --yes for reset.
+    if (reset && !yes) throw new Error('setup --reset requires --yes in non-interactive mode.');
     // All local, RPC, and Slack validation runs before SQLite/config staging.
     const validated = await validateFirstTimeSetup(
       {
@@ -237,15 +248,35 @@ export async function setup(
       `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\nSLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`
     )
       throw new Error('Staged bootstrap config validation failed.');
-    renameSync(stagedConfig, configPath);
-    installedConfig = true;
-    renameSync(stagedDb, paths.db);
-    installedDb = true;
+    if (reset) {
+      mkdirSync(stagedSession, { mode: 0o700 });
+      chmodSync(stagedSession, 0o700);
+      const backup = await createResetBackupBundle({ paths, configPath, lockHeld: true });
+      installFreshReset({
+        paths,
+        configPath,
+        backup,
+        staged: { config: stagedConfig, database: stagedDb, session: stagedSession },
+      });
+      installedConfig = true;
+      installedDb = true;
+    } else {
+      renameSync(stagedConfig, configPath);
+      installedConfig = true;
+      renameSync(stagedDb, paths.db);
+      installedDb = true;
+    }
     console.log(`Initialized schema v2 at ${paths.db}.`);
     return 0;
   } finally {
     closeDb();
-    for (const path of [stagedConfig, stagedDb, `${stagedDb}-wal`, `${stagedDb}-shm`]) {
+    for (const path of [
+      stagedConfig,
+      stagedDb,
+      `${stagedDb}-wal`,
+      `${stagedDb}-shm`,
+      stagedSession,
+    ]) {
       rmSync(path, { force: true });
     }
     if (!installedDb && installedConfig) rmSync(configPath, { force: true });
@@ -419,7 +450,7 @@ function parseFlags(args: string[], names: Set<string>, repeatable = new Set<str
     if (!argument.startsWith('--')) continue;
     const name = argument.slice(2);
     if (!names.has(name)) throw new Error(`Unknown option: ${argument}`);
-    if (name === 'json') {
+    if (name === 'json' || name === 'reset' || name === 'yes') {
       result[name] = true;
       continue;
     }

@@ -161,13 +161,15 @@ export async function createResetBackupBundle(
     paths?: GatewayPaths;
     configPath?: string;
     now?: () => Date;
+    /** Caller already holds the gateway lock. */
+    lockHeld?: boolean;
   } = {},
 ): Promise<ResetBackupBundle> {
   const paths = options.paths ?? gatewayPaths();
   const configPath = options.configPath ?? resolveConfigPath();
   // A reset caller must share this lock with the daemon; acquiring it here
   // keeps this primitive safe and makes it independently reusable.
-  const lock = acquireGatewayLock(paths, { createLayout: false });
+  const lock = options.lockHeld ? undefined : acquireGatewayLock(paths, { createLayout: false });
   let staging: string | undefined;
   try {
     privateMkdir(paths.backups);
@@ -247,6 +249,6 @@ export async function createResetBackupBundle(
     return { path: finalPath, manifest };
   } finally {
     if (staging) rmSync(staging, { recursive: true, force: true });
-    lock.release();
+    lock?.release();
   }
 }

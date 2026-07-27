@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { startControlServer } from './control.js';
 import { materializeDueSchedules, SchedulerService } from './scheduler.js';
+import { readResetJournal } from './reset-install.js';
 import {
   acquireGatewayLock,
   ensurePrivateFile,
@@ -52,6 +53,11 @@ export async function startGateway(): Promise<void> {
   let scheduler: SchedulerService | undefined;
   const coordinator = new GatewayCoordinator();
   try {
+    const journal = readResetJournal(paths.journal);
+    if (journal && journal.phase !== 'complete')
+      throw new Error(
+        'An incomplete reset journal exists; stop here and run plain pi-tag-slack setup to recover it.',
+      );
     if (!structuralPathExists(paths.db))
       throw new Error('Gateway is not configured; run pi-tag-slack setup.');
     initDb(paths.db);
