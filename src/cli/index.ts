@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync }
 import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
+import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
 import {
   addTrustedUser,
   closeDb,
@@ -26,7 +27,7 @@ import {
 const help = `pi-tag-slack
 
 Usage:
-  pi-tag-slack setup --channel <C...|G...> --label <name> --cwd <path> --model <ref>
+  pi-tag-slack setup --channel <C...|G...> --cwd <path> --model <ref> --trusted-user <U...|W...>
   pi-tag-slack inbox list|show|working|respond|resolve ...
   pi-tag-slack slack history|message|thread|file download|send ...
   pi-tag-slack task add|list|show|resolve ...
@@ -123,12 +124,14 @@ async function doctor(): Promise<number> {
   }
 }
 
-function setup(args: string[]): number {
+export async function setup(
+  args: string[],
+  validationDependencies?: SetupValidationDependencies,
+): Promise<number> {
   const options = parseFlags(
     args,
     new Set([
       'channel',
-      'label',
       'cwd',
       'pi-bin',
       'model',
@@ -140,33 +143,33 @@ function setup(args: string[]): number {
   );
   const value = (name: string) => (typeof options[name] === 'string' ? options[name] : undefined);
   const channel = value('channel');
-  const label = value('label');
   const cwd = value('cwd');
   const model = value('model');
   const botToken = value('bot-token') ?? process.env.SLACK_BOT_TOKEN?.trim();
   const appToken = value('app-token') ?? process.env.SLACK_APP_TOKEN?.trim();
-  if (!channel || !label || !cwd || !model || !botToken || !appToken) {
+  const trusted = value('trusted-user');
+  if (!channel || !cwd || !model || !botToken || !appToken || !trusted) {
     throw new Error(
-      'Usage: pi-tag-slack setup --channel <C...|G...> --label <name> --cwd <path> --model <ref> (--bot-token <xoxb-...> --app-token <xapp-...> | environment tokens)',
+      'Usage: pi-tag-slack setup --channel <C...|G...> --cwd <path> --model <ref> --trusted-user <U...|W...> (--bot-token <xoxb-...> --app-token <xapp-...> | environment tokens)',
     );
   }
-  if (!botToken.startsWith('xoxb-') || !appToken.startsWith('xapp-'))
-    throw new Error('Setup requires xoxb- bot and xapp- app tokens.');
+  const piBinary = value('pi-bin') ?? 'pi';
+  const thinking = value('thinking') ?? 'medium';
+  if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinking))
+    throw new Error('Invalid default thinking level.');
 
-  const trusted = value('trusted-user');
-  if (trusted && !/^[UW][A-Z0-9]+$/.test(trusted))
-    throw new Error('Setup requires a raw uppercase U... or W... trusted user ID.');
-
+  // Lock/layout checks are the only structural work before validation. They
+  // create no application config/database state and serialize setup attempts.
   const paths = ensurePrivateLayout();
   const lock = acquireGatewayLock(paths);
   const configPath = resolveConfigPath();
-  validateBootstrapConfigPath(configPath);
   const suffix = `.setup-${randomUUID()}`;
   const stagedDb = `${paths.db}${suffix}`;
   const stagedConfig = `${configPath}${suffix}`;
   let installedConfig = false;
   let installedDb = false;
   try {
+    validateBootstrapConfigPath(configPath);
     ensurePrivateFile(paths.db);
     ensurePrivateFile(configPath);
     if (structuralPathExists(paths.db) || structuralPathExists(configPath)) {
@@ -174,6 +177,23 @@ function setup(args: string[]): number {
         'Gateway state already exists; plain setup never replaces it. Use setup --reset.',
       );
     }
+    // All local, RPC, and Slack validation runs before SQLite/config staging.
+    const validated = await validateFirstTimeSetup(
+      {
+        channelId: channel,
+        workingDirectory: cwd,
+        piBinary,
+        model,
+        thinking,
+        botToken,
+        appToken,
+        trustedUserId: trusted,
+      },
+      validationDependencies,
+    );
+    console.warn(
+      "Warning: trusted Slack users can influence an agent with this daemon account's local capabilities.",
+    );
 
     // Build all durable state off to the side first. Nothing active is changed
     // until validation of the complete database singleton has succeeded.
@@ -181,13 +201,13 @@ function setup(args: string[]): number {
     try {
       createGatewayConfig({
         channelId: channel,
-        channelLabel: label,
+        channelLabel: validated.channelLabel,
         workingDirectory: cwd,
-        piBinary: value('pi-bin') ?? 'pi',
+        piBinary,
         defaultModel: model,
-        defaultThinking: value('thinking') ?? 'medium',
+        defaultThinking: thinking,
       });
-      if (trusted) addTrustedUser(trusted);
+      addTrustedUser(trusted, validated.trustedUserLabel);
     } finally {
       closeDb();
     }

@@ -147,8 +147,6 @@ describe('OS-held gateway lock', () => {
           'setup',
           '--channel',
           'C0123456789',
-          '--label',
-          'gateway',
           '--cwd',
           '/tmp',
           '--model',
@@ -157,6 +155,8 @@ describe('OS-held gateway lock', () => {
           'xoxb-token',
           '--app-token',
           'xapp-token',
+          '--trusted-user',
+          'U0123456789',
         ]),
       ).rejects.toThrow(GatewayLockContendedError);
       const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);

@@ -2,7 +2,7 @@
 export async function validateConfiguredConversation(
   client: { conversations: { info(args: { channel: string }): Promise<unknown> } },
   channelId: string,
-): Promise<void> {
+): Promise<string> {
   const response = (await client.conversations.info({ channel: channelId })) as {
     ok?: unknown;
     channel?: Record<string, unknown>;
@@ -25,4 +25,7 @@ export async function validateConfiguredConversation(
     throw new Error(
       'The Slack bot is not a member of the configured conversation; invite it first.',
     );
+  if (typeof channel.name !== 'string' || !channel.name.trim())
+    throw new Error('Configured Slack conversation did not provide a cosmetic label.');
+  return channel.name;
 }

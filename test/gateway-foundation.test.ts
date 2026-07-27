@@ -160,8 +160,6 @@ describe('startup and setup', () => {
           'setup',
           '--channel',
           'C0123456789',
-          '--label',
-          'gateway',
           '--cwd',
           '/tmp',
           '--model',
@@ -172,6 +170,8 @@ describe('startup and setup', () => {
           'xoxb-token',
           '--app-token',
           'xapp-token',
+          '--trusted-user',
+          'U0123456789',
         ]),
       ).rejects.toThrow(/Invalid default thinking level/);
       expect(existsSync(join(directory, 'gateway.db'))).toBe(false);
@@ -585,8 +585,8 @@ describe('Slack startup validation', () => {
       validateConfiguredConversation(client({ is_channel: true, is_member: false }), 'C123'),
     ).rejects.toThrow(/not a member/);
     await expect(
-      validateConfiguredConversation(client({ is_group: true, is_member: true }), 'G123'),
-    ).resolves.toBeUndefined();
+      validateConfiguredConversation(client({ is_group: true, is_member: true, name: 'private-team' }), 'G123'),
+    ).resolves.toBe('private-team');
   });
 });
 
