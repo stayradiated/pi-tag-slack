@@ -25,7 +25,13 @@ import {
   recordInboxReaction,
   scheduleRow,
 } from '../src/db.js';
-import { dispatch, startControlServer } from '../src/control.js';
+import {
+  CONTROL_COMMAND_DEADLINE_MS,
+  SLACK_NETWORK_DEADLINE_MS,
+  deadlineForCommand,
+  dispatch,
+  startControlServer,
+} from '../src/control.js';
 import { main } from '../src/cli/index.js';
 import { startGateway, startupRecoveryPrompt } from '../src/index.js';
 import { GatewayCoordinator, processSlackEvent } from '../src/slack.js';
@@ -249,6 +255,13 @@ describe('schema v2', () => {
 });
 
 describe('control socket', () => {
+  it('uses a longer fixed deadline for Slack network commands', () => {
+    expect(deadlineForCommand('task.list')).toBe(CONTROL_COMMAND_DEADLINE_MS);
+    expect(deadlineForCommand('slack.send')).toBe(SLACK_NETWORK_DEADLINE_MS);
+    expect(deadlineForCommand('inbox.respond')).toBe(SLACK_NETWORK_DEADLINE_MS);
+    expect(SLACK_NETWORK_DEADLINE_MS).toBeGreaterThan(CONTROL_COMMAND_DEADLINE_MS);
+  });
+
   it('rejects trailing data and preserves a parsed request ID on command errors', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-control-'));
     directories.push(directory);

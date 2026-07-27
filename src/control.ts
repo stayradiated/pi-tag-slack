@@ -37,6 +37,28 @@ import {
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const IDLE_TIMEOUT_MS = 5_000;
+/** Bound ordinary daemon commands without applying a short network deadline to Slack. */
+export const CONTROL_COMMAND_DEADLINE_MS = 10_000;
+export const SLACK_NETWORK_DEADLINE_MS = 60_000;
+const SLACK_NETWORK_COMMANDS = new Set([
+  'slack.history',
+  'slack.message',
+  'slack.thread',
+  'slack.file.download',
+  'slack.send',
+  'inbox.respond',
+  'trust.add',
+]);
+
+export function deadlineForCommand(command: string): number {
+  return SLACK_NETWORK_COMMANDS.has(command)
+    ? SLACK_NETWORK_DEADLINE_MS
+    : CONTROL_COMMAND_DEADLINE_MS;
+}
+
+function outcomeUnknownMessage(requestId: string): string {
+  return `The Slack operation may have completed. Request ID: ${requestId}. Inspect Slack/inbox state before retrying.`;
+}
 type Request = { version: 1; id: string; command: string; params: Record<string, unknown> };
 type Reply = { id: string; result?: unknown; error?: { code: string; message: string } };
 
@@ -530,7 +552,9 @@ function decodeFrame(frame: Buffer): Request {
 function serve(socket: Socket, services?: ControlServices): void {
   let buffer = Buffer.alloc(0);
   let answered = false;
-  const timer = setTimeout(() => {
+  // This timer only covers framing. The command deadline starts after a complete
+  // request has been validated, so a slow Slack call receives its longer budget.
+  let timer: NodeJS.Timeout | undefined = setTimeout(() => {
     finish(
       errorReply(
         '',
@@ -541,8 +565,22 @@ function serve(socket: Socket, services?: ControlServices): void {
   const finish = (reply: Reply) => {
     if (answered) return;
     answered = true;
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
+    timer = undefined;
     writeReply(socket, reply);
+  };
+  const commandDeadline = (request: Request): void => {
+    if (timer) clearTimeout(timer);
+    const isSlackMutation = request.command === 'slack.send' || request.command === 'inbox.respond';
+    const deadline = deadlineForCommand(request.command);
+    timer = setTimeout(() => {
+      const error = isSlackMutation
+        ? Object.assign(new Error(outcomeUnknownMessage(request.id)), { code: 'OUTCOME_UNKNOWN' })
+        : Object.assign(new Error('Control command deadline exceeded.'), {
+            code: 'DEADLINE_EXCEEDED',
+          });
+      finish(errorReply(request.id, error));
+    }, deadline);
   };
   socket.on('data', (chunk: Buffer) => {
     if (answered) return;
@@ -584,7 +622,10 @@ function serve(socket: Socket, services?: ControlServices): void {
     }
     try {
       const request = decodeFrame(buffer.subarray(0, newline));
+      commandDeadline(request);
       try {
+        // Do not wire client socket close/error into this promise. In particular,
+        // a timed-out mutation must continue to its Slack/SQLite conclusion.
         Promise.resolve(dispatch(request, services))
           .then((result) => finish({ id: request.id, result }))
           .catch((error) => finish(errorReply(request.id, error)));
@@ -595,7 +636,9 @@ function serve(socket: Socket, services?: ControlServices): void {
       finish(errorReply('', error));
     }
   });
-  socket.on('error', () => clearTimeout(timer));
+  socket.on('error', () => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 async function staleSocket(path: string): Promise<boolean> {

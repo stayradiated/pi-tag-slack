@@ -12,6 +12,7 @@ import {
   requireConfiguredDb,
 } from '../db.js';
 import { resolveConfigPath, validateBootstrapConfigPath } from '../config.js';
+import { CONTROL_COMMAND_DEADLINE_MS, SLACK_NETWORK_DEADLINE_MS } from '../control.js';
 import {
   acquireGatewayLock,
   ensurePrivateFile,
@@ -275,7 +276,7 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
     return { fileId: positional(args, new Set(['json']))[0] };
   }
   if (command === 'slack.send') {
-    const flags = parseFlags(args, new Set(['thread', 'text', 'file']), new Set(['file']));
+    const flags = parseFlags(args, new Set(['thread', 'text', 'file', 'json']), new Set(['file']));
     return compact({
       threadTs: flags.thread,
       text: flags.text,
@@ -288,7 +289,7 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   }
   if (command.endsWith('.show') || command === 'inbox.working') return { id: args[0] };
   if (command === 'inbox.respond') {
-    const flags = parseFlags(args, new Set(['text', 'file']), new Set(['file']));
+    const flags = parseFlags(args, new Set(['text', 'file', 'json']), new Set(['file']));
     return {
       id: positional(args, new Set(['text', 'file']))[0],
       text: flags.text,
@@ -391,7 +392,33 @@ function protocolError(message: string): Error {
   return Object.assign(new Error(message), { code: 'INVALID_RESPONSE' });
 }
 
-function request(command: string, params: Record<string, unknown>): Promise<ControlResponse> {
+const SLACK_NETWORK_COMMANDS = new Set([
+  'slack.history',
+  'slack.message',
+  'slack.thread',
+  'slack.file.download',
+  'slack.send',
+  'inbox.respond',
+  'trust.add',
+]);
+const SLACK_MUTATIONS = new Set(['slack.send', 'inbox.respond']);
+
+function timeoutError(command: string, id: string): Error & { code: string; requestId: string } {
+  const mutation = SLACK_MUTATIONS.has(command);
+  return Object.assign(
+    new Error(
+      mutation
+        ? `The Slack operation may have completed. Request ID: ${id}. Inspect Slack/inbox state before retrying.`
+        : `Control command deadline exceeded. Request ID: ${id}.`,
+    ),
+    { code: mutation ? 'OUTCOME_UNKNOWN' : 'DEADLINE_EXCEEDED', requestId: id },
+  );
+}
+
+export function request(
+  command: string,
+  params: Record<string, unknown>,
+): Promise<ControlResponse> {
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const socket = connect(gatewayPaths().socket);
@@ -402,7 +429,9 @@ function request(command: string, params: Record<string, unknown>): Promise<Cont
       settled = true;
       reject(error);
     };
-    socket.setTimeout(10_000);
+    socket.setTimeout(
+      SLACK_NETWORK_COMMANDS.has(command) ? SLACK_NETWORK_DEADLINE_MS : CONTROL_COMMAND_DEADLINE_MS,
+    );
     socket.once('error', () =>
       rejectOnce(
         Object.assign(new Error('pi-tag-slack daemon is unavailable.'), {
@@ -412,9 +441,9 @@ function request(command: string, params: Record<string, unknown>): Promise<Cont
     );
     socket.once('timeout', () => {
       socket.destroy();
-      rejectOnce(
-        Object.assign(new Error('Control request timed out.'), { code: 'DEADLINE_EXCEEDED' }),
-      );
+      // Keep the generated ID available to callers: a mutation may have reached
+      // Slack even though this client did not receive the daemon's response.
+      rejectOnce(timeoutError(command, id));
     });
     socket.on('data', (chunk: Buffer) => {
       output = Buffer.concat([output, chunk]);
@@ -470,8 +499,17 @@ function request(command: string, params: Record<string, unknown>): Promise<Cont
 }
 
 if (process.argv[1]?.endsWith('/cli/index.js') || process.argv[1]?.endsWith('/cli/index.ts')) {
-  void main().catch((error) => {
-    console.error(`Error${error.code ? ` [${error.code}]` : ''}: ${error.message}`);
+  void main().catch((error: unknown) => {
+    const failure = error as { code?: unknown; message?: unknown };
+    const code = typeof failure.code === 'string' ? failure.code : 'INTERNAL';
+    const message = typeof failure.message === 'string' ? failure.message : 'Command failed.';
+    if (process.argv.slice(2).includes('--json')) {
+      // A failed JSON invocation writes one machine-readable value, and nothing
+      // else, so an agent never needs to parse diagnostics from stderr.
+      console.log(JSON.stringify({ error: { code, message } }));
+    } else {
+      console.error(`Error${code === 'INTERNAL' ? '' : ` [${code}]`}: ${message}`);
+    }
     process.exitCode = 1;
   });
 }
