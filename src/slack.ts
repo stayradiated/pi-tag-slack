@@ -8,6 +8,7 @@ import {
   recordInboxReaction,
 } from './db.js';
 import type { PiAcceptance } from './pi-rpc.js';
+import type { DaemonLogger } from './logging.js';
 
 export interface PiNotifier {
   notify(message: string): Promise<PiAcceptance>;
@@ -20,13 +21,22 @@ export type SlackEventBody = { event_id?: unknown; event?: Record<string, unknow
 /** Serializes all admission/post-commit pi notifications in delivery order. */
 export class GatewayCoordinator {
   private tail = Promise.resolve();
+  private accepting = true;
   run<T>(operation: () => Promise<T> | T): Promise<T> {
+    if (!this.accepting) return Promise.reject(new Error('Gateway is shutting down.'));
     const next = this.tail.then(operation, operation);
     this.tail = next.then(
       () => undefined,
       () => undefined,
     );
     return next;
+  }
+  /** Reject future work, while allowing already accepted work to finish. */
+  close(): void {
+    this.accepting = false;
+  }
+  drain(): Promise<void> {
+    return this.tail;
   }
 }
 
@@ -56,6 +66,7 @@ export async function processSlackEvent(
   notifier: PiNotifier,
   acknowledge: () => Promise<void> | void,
   receipts?: ReceiptReconciler,
+  logger?: DaemonLogger,
 ): Promise<'ignored' | 'duplicate' | 'accepted'> {
   const event = body.event;
   if (!event || event.type !== 'message' || event.bot_id || event.subtype === 'bot_message') {
@@ -101,7 +112,7 @@ export async function processSlackEvent(
   const eventId = string(body.event_id);
   if (!eventId || !/^[A-Za-z0-9_-]+$/.test(eventId)) {
     // Do not manufacture a delivery identity: this is identifier-only logging.
-    console.warn('Ignoring Slack event without a valid top-level event_id');
+    logger?.warn({ event: 'slack_event_refused', reason: 'missing_event_id' });
     await acknowledge();
     return 'ignored';
   }
@@ -154,6 +165,7 @@ export async function startSlackGateway(options: {
   botId: string;
   notifier: PiNotifier;
   coordinator?: GatewayCoordinator;
+  logger?: DaemonLogger;
 }): Promise<{ stop(): Promise<void> }> {
   const app = new App({ token: options.botToken, appToken: options.appToken, socketMode: true });
   const coordinator = options.coordinator ?? new GatewayCoordinator();
@@ -180,6 +192,7 @@ export async function startSlackGateway(options: {
         options.notifier,
         async () => undefined,
         receipts,
+        options.logger,
       ),
     );
   });

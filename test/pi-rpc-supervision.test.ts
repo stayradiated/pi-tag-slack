@@ -3,6 +3,8 @@ import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { PiRpcSession } from '../src/pi-rpc.js';
+import { GatewayLifecycle } from '../src/lifecycle.js';
+import type { DaemonLogger } from '../src/logging.js';
 
 function child(respondPrompt = true) {
   const stdout = new PassThrough();
@@ -115,6 +117,59 @@ describe('PiRpcSession restart supervision', () => {
     first.emit('exit', 1, null);
     await Promise.all([session.notify('first new work'), session.notify('second new work')]);
     expect(spawns).toBe(2);
+  });
+
+  it('escalates a hung child from stdin close through terminate and kill', async () => {
+    vi.useFakeTimers();
+    const hung = child();
+    const signals: string[] = [];
+    (hung as unknown as { kill: (signal: string) => void }).kill = (signal) => signals.push(signal);
+    const session = new PiRpcSession({
+      binary: 'pi',
+      sessionDir: '/tmp/s',
+      cwd: '/tmp',
+      version: async () => '0.82.0',
+      spawn: (() => hung) as typeof spawn,
+      stopGraceMs: 10,
+      stopTerminateMs: 10,
+    });
+    await session.start();
+    const stopping = session.stop();
+    await vi.advanceTimersByTimeAsync(30);
+    await stopping;
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('keeps database and lock cleanup behind complete hung-pi escalation', async () => {
+    vi.useFakeTimers();
+    const hung = child();
+    const signals: string[] = [];
+    (hung as unknown as { kill: (signal: string) => void }).kill = (signal) => signals.push(signal);
+    const session = new PiRpcSession({
+      binary: 'pi',
+      sessionDir: '/tmp/s',
+      cwd: '/tmp',
+      version: async () => '0.82.0',
+      spawn: (() => hung) as typeof spawn,
+      stopGraceMs: 10,
+      stopTerminateMs: 10,
+    });
+    await session.start();
+    const finalizers: string[] = [];
+    const lifecycle = new GatewayLifecycle({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as DaemonLogger,
+      stopPi: () => session.stop(),
+      piTimeoutMs: 31,
+      closeDatabase: () => finalizers.push('database'),
+      releaseLock: () => finalizers.push('lock'),
+    });
+    const shutdown = lifecycle.shutdown();
+    await vi.advanceTimersByTimeAsync(29);
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(finalizers).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await shutdown;
+    expect(finalizers).toEqual(['database', 'lock']);
   });
 
   it('lets new work reopen an exhausted window, rejects pending RPC, and never restarts after stop', async () => {

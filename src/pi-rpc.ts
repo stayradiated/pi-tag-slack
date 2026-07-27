@@ -22,6 +22,12 @@ export type PiModel = { provider: string; id: string; ref: string };
 export type PiApplyResult = { application: 'applied' | 'pending' | 'failed' };
 const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const minimumPiVersion = [0, 82, 0] as const;
+/** Shared with daemon lifecycle so gateway finalizers cannot outrun escalation. */
+export const PI_STOP_GRACE_MS = 5_000;
+export const PI_STOP_TERMINATE_MS = 2_000;
+export const PI_STOP_MAX_MS = PI_STOP_GRACE_MS + PI_STOP_TERMINATE_MS * 2;
+/** Includes scheduler/event-loop margin beyond PiRpcSession's internal bound. */
+export const PI_STOP_LIFECYCLE_TIMEOUT_MS = PI_STOP_MAX_MS + 1_000;
 
 /** Run the configured executable's version command before opening an RPC session. */
 export async function piVersion(binary: string): Promise<string> {
@@ -82,6 +88,10 @@ export class PiRpcSession {
       restartFailureThreshold?: number;
       setTimeout?: typeof setTimeout;
       clearTimeout?: typeof clearTimeout;
+      /** Bounded graceful shutdown seams for daemon lifecycle tests. */
+      stopGraceMs?: number;
+      stopTerminateMs?: number;
+      onRuntimeFailure?: () => void;
     },
   ) {}
 
@@ -90,6 +100,7 @@ export class PiRpcSession {
   private consecutiveFailures = 0;
   private stopping = false;
   private restartAfterStart = false;
+  private stopPromise: Promise<void> | undefined;
 
   async start(): Promise<void> {
     if (this.child) return;
@@ -281,14 +292,44 @@ export class PiRpcSession {
   }
 
   async stop(): Promise<void> {
+    return (this.stopPromise ??= this.stopBounded());
+  }
+
+  private async stopBounded(): Promise<void> {
     // This is terminal daemon shutdown. It must win races with exit handlers
     // and with a timer that was already queued.
     this.stopping = true;
     this.cancelRestart();
     const child = this.child;
     if (!child) return;
-    child.stdin.end();
-    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    try {
+      child.stdin.end();
+    } catch {
+      // A broken stdin still receives bounded process escalation below.
+    }
+    if (await this.waitForExit(child, this.options.stopGraceMs ?? PI_STOP_GRACE_MS)) return;
+    child.kill('SIGTERM');
+    if (await this.waitForExit(child, this.options.stopTerminateMs ?? PI_STOP_TERMINATE_MS)) return;
+    child.kill('SIGKILL');
+    // SIGKILL should be final; never let a broken child event source hang daemon cleanup.
+    await this.waitForExit(child, this.options.stopTerminateMs ?? PI_STOP_TERMINATE_MS);
+  }
+
+  private waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+    if (this.child !== child) return Promise.resolve(true);
+    const schedule = this.options.setTimeout ?? setTimeout;
+    const cancel = this.options.clearTimeout ?? clearTimeout;
+    return new Promise((resolve) => {
+      const timer = schedule(() => {
+        child.off('exit', exited);
+        resolve(false);
+      }, timeoutMs);
+      const exited = () => {
+        cancel(timer);
+        resolve(true);
+      };
+      child.once('exit', exited);
+    });
   }
 
   /** Returns a read-only, runtime-validated view of the child session. */
@@ -463,6 +504,7 @@ export class PiRpcSession {
 
   private recordFailure(error: Error): void {
     this.lastError = error.message;
+    this.options.onRuntimeFailure?.();
     this.rejectPending(error);
   }
 

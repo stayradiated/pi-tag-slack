@@ -6,6 +6,8 @@ import { PiRpcSession } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import { clearSlackClient, configureSlackClient, reconcileInboxReactions } from './slack-client.js';
+import { createDaemonLogger, logFailure } from './logging.js';
+import { GatewayLifecycle } from './lifecycle.js';
 import { mkdirSync } from 'node:fs';
 import { startControlServer } from './control.js';
 import { materializeDueSchedules, SchedulerService } from './scheduler.js';
@@ -44,6 +46,18 @@ export function startupRecoveryPrompt(): string | undefined {
 
 /** Starts the single configured gateway owner. */
 export async function startGateway(): Promise<void> {
+  const logger = createDaemonLogger();
+  logger.info({ event: 'startup_started' });
+  try {
+    await startGatewayOwned(logger);
+  } catch (error) {
+    logFailure(logger, 'startup_failed', 'gateway');
+    throw error;
+  }
+}
+
+async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>): Promise<void> {
+  // SQLite configuration is unavailable until after the private layout and lock exist.
   const paths = ensurePrivateLayout();
   const lock = acquireGatewayLock(paths);
   let server: Awaited<ReturnType<typeof startControlServer>> | undefined;
@@ -52,12 +66,40 @@ export async function startGateway(): Promise<void> {
   let reactionTimer: NodeJS.Timeout | undefined;
   let scheduler: SchedulerService | undefined;
   const coordinator = new GatewayCoordinator();
+  const lifecycle = new GatewayLifecycle({
+    logger,
+    stopAccepting: {
+      stop: async () => {
+        coordinator.close();
+        try {
+          await slack?.stop();
+        } finally {
+          clearSlackClient();
+        }
+      },
+    },
+    stopControl: { close: async () => server?.close() },
+    stopTimers: {
+      stop: () => {
+        if (reactionTimer) clearInterval(reactionTimer);
+        reactionTimer = undefined;
+        scheduler?.stop();
+      },
+    },
+    drainCoordinator: () => coordinator.drain(),
+    stopPi: async () => pi?.stop(),
+    closeDatabase: closeDb,
+    releaseLock: () => lock.release(),
+  });
+  let signalHandler: (() => void) | undefined;
   try {
     const journal = readResetJournal(paths.journal);
-    if (journal && journal.phase !== 'complete')
+    if (journal && journal.phase !== 'complete') {
+      logger.warn({ event: 'reset_journal_refusal' });
       throw new Error(
         'An incomplete reset journal exists; stop here and run plain pi-tag-slack setup to recover it.',
       );
+    }
     if (!structuralPathExists(paths.db))
       throw new Error('Gateway is not configured; run pi-tag-slack setup.');
     initDb(paths.db);
@@ -71,11 +113,14 @@ export async function startGateway(): Promise<void> {
     if (tokenErrors.length)
       throw new Error(`Invalid bootstrap configuration: ${tokenErrors.join(' ')}`);
     const config = readGatewayConfig();
+    logger.level = String(config.log_level);
+    logger.info({ event: 'configuration_loaded' });
     const createPi = () => {
       const rpc = new PiRpcSession({
         binary: String(config.pi_binary),
         sessionDir: paths.session,
         cwd: String(config.working_directory),
+        onRuntimeFailure: () => logFailure(logger, 'pi_runtime_failure', 'pi'),
         desired: () => {
           const current = readGatewayConfig();
           return {
@@ -84,7 +129,9 @@ export async function startGateway(): Promise<void> {
           };
         },
       });
-      rpc.setSafeBoundaryHandler(() => void coordinator.run(() => pi!.applyDesired()));
+      rpc.setSafeBoundaryHandler(
+        () => void coordinator.run(() => pi!.applyDesired()).catch(() => undefined),
+      );
       return rpc;
     };
     pi = createPi();
@@ -165,14 +212,20 @@ export async function startGateway(): Promise<void> {
       botId: identity.user_id,
       notifier: session,
       coordinator,
+      logger,
     });
-    server = await startControlServer({
-      notifier: session,
-      coordinator,
-      sessionStatus: () => session.status(),
-      sessionControls: session,
-      archivePath: paths.archive,
-    });
+    server = await startControlServer(
+      {
+        notifier: session,
+        coordinator,
+        sessionStatus: () => session.status(),
+        sessionControls: session,
+        archivePath: paths.archive,
+      },
+      {
+        onRuntimeError: () => logFailure(logger, 'control_runtime_failure', 'control'),
+      },
+    );
     // Reconciliation is bounded and best-effort; it never affects Slack admission.
     void reconcileInboxReactions().catch(() => undefined);
     reactionTimer = setInterval(
@@ -181,24 +234,17 @@ export async function startGateway(): Promise<void> {
     );
     scheduler = new SchedulerService(session, coordinator);
     scheduler.start();
+    logger.info({ event: 'gateway_ready' });
     await new Promise<void>((resolve) => {
-      process.once('SIGINT', resolve);
-      process.once('SIGTERM', resolve);
+      signalHandler = () => void lifecycle.shutdown('signal').then(resolve);
+      process.on('SIGINT', signalHandler);
+      process.on('SIGTERM', signalHandler);
     });
   } finally {
-    if (reactionTimer) clearInterval(reactionTimer);
-    scheduler?.stop();
-    clearSlackClient();
-    await slack?.stop();
-    await pi?.stop();
-    if (server) {
-      try {
-        await server.close();
-      } catch {
-        // Preserve an earlier startup/shutdown failure over best-effort cleanup.
-      }
+    if (signalHandler) {
+      process.off('SIGINT', signalHandler);
+      process.off('SIGTERM', signalHandler);
     }
-    closeDb();
-    lock.release();
+    await lifecycle.shutdown('cleanup');
   }
 }
