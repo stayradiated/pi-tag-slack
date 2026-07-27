@@ -34,7 +34,7 @@ Usage:
   pi-tag-slack trust add|list|remove ...
   pi-tag-slack config show|set|reset ...
   pi-tag-slack session status [--json]
-  pi-tag-slack session reset
+  pi-tag-slack session reset [--confirm <session-id>:<run-sequence>]
   pi-tag-slack session model list [--json]|set <provider/model>|reset
   pi-tag-slack session thinking set <level>|reset
   pi-tag-slack doctor
@@ -346,13 +346,13 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   if (command === 'trust.remove') return { userId: args[0] };
   if (command === 'config.set') return { key: args[0], value: args[1] };
   if (command === 'config.reset') return { key: args[0] };
-  if (
-    command === 'session.status' ||
-    command === 'session.reset' ||
-    command === 'session.model.list'
-  ) {
+  if (command === 'session.status' || command === 'session.model.list') {
     parseFlags(args, new Set(['json']));
     return {};
+  }
+  if (command === 'session.reset') {
+    const flags = parseFlags(args, new Set(['confirm', 'json']));
+    return compact({ confirm: flags.confirm });
   }
   if (command === 'session.model.set') {
     parseFlags(args, new Set());

@@ -82,8 +82,32 @@ export async function startGateway(): Promise<void> {
       return rpc;
     };
     pi = createPi();
+    let resetReserved = false;
+    const performReset = async () => {
+      const old = pi!;
+      await old.stop();
+      let counter = 0;
+      let archivePath: string;
+      do {
+        archivePath = join(
+          paths.archive,
+          `session-${new Date().toISOString().replace(/[:.]/g, '-')}-${counter++}`,
+        );
+      } while (existsSync(archivePath));
+      renameSync(paths.session, archivePath);
+      mkdirSync(paths.session, { mode: 0o700 });
+      pi = createPi();
+      await pi.start();
+      await pi.applyDesired();
+      const recovery = startupRecoveryPrompt();
+      if (recovery) await pi.notify(recovery);
+      return { archivedTo: archivePath, recoverySent: Boolean(recovery) };
+    };
     const session = {
-      notify: (message: string) => pi!.notify(message),
+      notify: (message: string) => {
+        if (resetReserved) return Promise.reject(new Error('Session reset is reserved.'));
+        return pi!.notify(message);
+      },
       status: () => pi!.status(),
       availableModels: () => pi!.availableModels(),
       availableThinkingLevels: () => pi!.availableThinkingLevels(),
@@ -99,24 +123,29 @@ export async function startGateway(): Promise<void> {
             { code: 'CONFIRMATION_REQUIRED' },
           );
         }
-        const old = pi!;
-        await old.stop();
-        let counter = 0;
-        let archivePath: string;
-        do {
-          archivePath = join(
-            paths.archive,
-            `session-${new Date().toISOString().replace(/[:.]/g, '-')}-${counter++}`,
-          );
-        } while (existsSync(archivePath));
-        renameSync(paths.session, archivePath);
-        mkdirSync(paths.session, { mode: 0o700 });
-        pi = createPi();
-        await pi.start();
-        await pi.applyDesired();
-        const recovery = startupRecoveryPrompt();
-        if (recovery) await pi.notify(recovery);
-        return { archivedTo: archivePath, recoverySent: Boolean(recovery) };
+        return performReset();
+      },
+      confirmReset: async (challenge: string) => {
+        const status = await pi!.status();
+        const exact = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
+        if (status.activity !== 'active' || challenge !== exact)
+          throw Object.assign(new Error('The session reset confirmation is stale.'), {
+            code: 'STALE_CONFIRMATION',
+          });
+        resetReserved = true;
+        return {
+          result: { confirmed: true },
+          cancelPostFlush: () => {
+            resetReserved = false;
+          },
+          postFlush: async () => {
+            try {
+              await performReset();
+            } finally {
+              resetReserved = false;
+            }
+          },
+        };
       },
     };
     await pi.start();

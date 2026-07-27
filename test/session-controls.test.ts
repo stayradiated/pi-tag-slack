@@ -80,6 +80,16 @@ const request = (command: string, params: Record<string, unknown>, value: Return
   dispatch({ version: 1, id: 'request', command, params }, value);
 
 describe('session reset control routing', () => {
+  it('rejects malformed confirmation challenges before touching the session', () => {
+    configured();
+    const services = {
+      notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+      coordinator: new GatewayCoordinator(),
+      sessionControls: { reset: async () => ({ archivedTo: '', recoverySent: false }) },
+    };
+    expect(() => dispatch({ version: 1, id: 'reset', command: 'session.reset', params: { confirm: 'bad' } }, services)).toThrow(/confirm must be/);
+  });
+
   it('returns the active-session confirmation error unchanged', async () => {
     configured();
     const confirmation = Object.assign(new Error('Pi is active. Confirm with: pi-tag-slack session reset --confirm s:7'), { code: 'CONFIRMATION_REQUIRED' });

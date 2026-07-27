@@ -64,6 +64,16 @@ function outcomeUnknownMessage(requestId: string): string {
 }
 type Request = { version: 1; id: string; command: string; params: Record<string, unknown> };
 type Reply = { id: string; result?: unknown; error?: { code: string; message: string } };
+type PostFlushResult = {
+  result: unknown;
+  postFlush: () => Promise<void>;
+  cancelPostFlush: () => void;
+};
+function isPostFlushResult(value: unknown): value is PostFlushResult {
+  return Boolean(
+    value && typeof value === 'object' && 'postFlush' in value && 'cancelPostFlush' in value,
+  );
+}
 
 function fail(code: string, message: string): never {
   const error = new Error(message) as Error & { code: string };
@@ -262,6 +272,7 @@ export type ControlServices = {
     availableThinkingLevels(): Promise<string[]>;
     applyDesired(): Promise<PiApplyResult>;
     reset?(): Promise<{ archivedTo: string; recoverySent: boolean }>;
+    confirmReset?(challenge: string): Promise<PostFlushResult>;
   };
 };
 
@@ -281,10 +292,19 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       if (!services?.sessionStatus)
         fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
       return services.coordinator.run(() => services.sessionStatus!());
-    case 'session.reset':
+    case 'session.reset': {
       if (!services?.sessionControls?.reset)
         fail('SESSION_UNAVAILABLE', 'Pi session reset is unavailable.');
-      return services.coordinator.run(() => services.sessionControls!.reset!());
+      if (params.confirm === undefined)
+        return services.coordinator.run(() => services.sessionControls!.reset!());
+      if (typeof params.confirm !== 'string' || !/^.+:[1-9]\d*$/.test(params.confirm))
+        fail('INVALID_PARAMS', 'confirm must be a <session-id>:<run-sequence> challenge.');
+      if (!services.sessionControls.confirmReset)
+        fail('SESSION_UNAVAILABLE', 'Pi session confirmation is unavailable.');
+      return services.coordinator.run(() =>
+        services.sessionControls!.confirmReset!(params.confirm as string),
+      );
+    }
     case 'session.model.list':
       if (!services?.sessionControls)
         fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
@@ -574,7 +594,7 @@ function errorReply(id: string, error: unknown): Reply {
   return { id, error: { code: 'INTERNAL', message: 'Internal gateway error.' } };
 }
 
-function writeReply(socket: Socket, reply: Reply): void {
+function writeReply(socket: Socket, reply: Reply, flushed?: () => void): void {
   const frame = `${JSON.stringify(reply)}\n`;
   if (Buffer.byteLength(frame) > MAX_FRAME_BYTES) {
     socket.end(
@@ -587,7 +607,7 @@ function writeReply(socket: Socket, reply: Reply): void {
     );
     return;
   }
-  socket.end(frame);
+  socket.end(frame, flushed);
 }
 
 function decodeFrame(frame: Buffer): Request {
@@ -699,7 +719,31 @@ function serve(socket: Socket, services?: ControlServices): void {
         // Do not wire client socket close/error into this promise. In particular,
         // a timed-out mutation must continue to its Slack/SQLite conclusion.
         Promise.resolve(dispatch(request, services))
-          .then((result) => finish({ id: request.id, result }))
+          .then((result) => {
+            if (!isPostFlushResult(result)) {
+              finish({ id: request.id, result });
+              return;
+            }
+            if (answered || socket.destroyed) {
+              result.cancelPostFlush();
+              return;
+            }
+            answered = true;
+            if (timer) clearTimeout(timer);
+            timer = undefined;
+            let flushed = false;
+            const cancel = () => {
+              if (!flushed) result.cancelPostFlush();
+            };
+            socket.once('error', cancel);
+            socket.once('close', cancel);
+            writeReply(socket, { id: request.id, result: result.result }, () => {
+              flushed = true;
+              socket.off('error', cancel);
+              socket.off('close', cancel);
+              void result.postFlush();
+            });
+          })
           .catch((error) => finish(errorReply(request.id, error)));
       } catch (error) {
         finish(errorReply(request.id, error));
