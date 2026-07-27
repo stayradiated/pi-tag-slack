@@ -1,5 +1,98 @@
 # Single-conversation, agent-directed gateway refactor plan
 
+## Engineering handoff and implementation status
+
+**Status: not shippable — foundation only.** The active runtime has been hard-cut away from the legacy queue implementation, but it does not currently connect to Slack or start pi. Treat every unchecked item in this section and every unimplemented requirement in the normative sections below as release-blocking unless it is explicitly moved out of scope.
+
+This status was verified against the working tree containing `src/config.ts`, `src/paths.ts`, `src/db.ts`, `src/control.ts`, `src/index.ts`, `src/cli/index.ts`, and `test/gateway-foundation.test.ts`. At that point formatting, lint, the 10 foundation tests, and the TypeScript build passed. Passing that small suite is not evidence that the product contract is complete.
+
+Legend:
+
+- `[x]` implemented at foundation level and covered by at least one test
+- `[~]` partially implemented or implemented with correctness gaps
+- `[ ]` not implemented
+
+### What exists now
+
+- `[x]` Canonical data-path derivation through `PI_TAG_SLACK_CONFIG` and `PI_TAG_SLACK_DATA_DIR`, plus derivation of the planned operational paths.
+- `[~]` Private structural directory/file handling and an atomic lock file. Existing database symlinks, structural-path ancestor symlinks, foreign-owned data-layout paths, unsafe bootstrap files, and dangling control-socket paths are rejected during covered flows; staged setup reopens/quick-checks its database and validates its bootstrap candidate. Comprehensive parent-layout, durability, and rollback handling remain incomplete. The lock is not an OS-held lock.
+- `[~]` Schema version 2 creates exactly the six planned `STRICT` tables, basic inbox/task indexes, no-reopen triggers, the configuration singleton, public IDs, and a synchronous transactional event-ledger/inbox mutation helper. Schema validation compares complete canonical table/index/trigger SQL definitions as well as structural names, but complete non-config row validators and the remaining lifecycle/timestamp/JSON constraints are incomplete.
+- `[~]` WAL, `synchronous=FULL`, foreign keys, busy timeout, and `trusted_schema=OFF` are applied. They are not comprehensively read back and verified, and setup does not run the required `quick_check`/reopen validation.
+- `[~]` Typed persistence exists for non-structural configuration. Pi catalog validation, desired/effective state, safe-boundary application, and degraded-state reporting do not.
+- `[~]` The daemon owns SQLite and a Unix control server. Server-side one-request LF framing, UTF-8/JSON validation, frame bounds, timeout/EOF handling, trailing-data rejection, and request-ID echoing exist. The CLI client validates bounded fatal-UTF-8 single-frame responses, response schema, and correlation ID, but command deadlines and broader protocol tests remain incomplete.
+- `[~]` Minimal JSON-only commands exist for inbox list/show/resolve, task add/list/show/resolve, trust add/list/remove, and config show/set/reset. This is not the complete CLI contract; stable error mapping, human output, JSON error envelopes, trust validation/pagination, and response-size bounds are incomplete.
+- `[~]` A simple non-interactive first-time setup stages a database and bootstrap token file. It does not perform the required pi/Slack validation, durable staging validation, reset, backup, journal, rollback, or recovery flows.
+- `[x]` The manifest removes slash commands, interactivity, App Home, DM/MPIM events/scopes, and `app_mention`, and retains `message.channels` and `message.groups`.
+- `[~]` Ten foundation tests cover selected schema rejection, database-symlink rejection, sequential event deduplication, no-reopen behavior, limited server framing/ID echoing, task pagination, and typed configuration. Most tests specified later in this document do not exist.
+
+### Correctness work required before building on the foundation
+
+Complete these first so later Slack and RPC work does not depend on unsafe or misleading primitives:
+
+- [~] Validate the bootstrap config path before reading it. Runtime loading now rejects unsafe existing files and immediate parents and avoids import-time reads, but setup staging/reopen validation and comprehensive parent-layout checks remain incomplete.
+- [~] Make `doctor` read-only apart from the unavoidable held lock. It now queries daemon control health when online and does not create the layout offline, but online health lacks database/session detail and offline SQLite read-only inspection.
+- [ ] Replace the atomic PID file with the specified portable OS-held exclusive lock. Until then, at minimum ensure every failure after lock creation closes the descriptor and removes the partial lock without deleting a replacement path.
+- [ ] Harden control-socket startup and shutdown: detect dangling symlinks with `lstat`, close/unlink the server after every post-bind failure, retain a runtime server error handler, and avoid unlinking a path that is no longer the socket instance created by this process.
+- [x] Implement client-side response byte limits, fatal UTF-8 decoding, exactly-one-LF-frame validation, response schema validation, and request-ID correlation.
+- [ ] Introduce and test a stable error-code mapping. Invalid IDs/config/users must not become `INTERNAL`, and internal SQLite details must not leak as public errors.
+- [ ] Make CLI failures honor the required JSON error envelope and exit behavior, while preserving clear human-mode errors.
+- [~] Validate complete schema definitions or otherwise make malformed same-name constraints, indexes, triggers, and foreign keys fail startup. Canonical SQL definitions are now checked; add complete row validators and the missing lifecycle/timestamp/JSON constraints.
+- [ ] Make `trust add` call Slack to validate and label the user before commit. Until Slack exists, do not represent the current syntactic-only command as contract-complete.
+- [~] Reopen and validate staged setup artifacts, run `quick_check`, verify exact bootstrap values/modes, and validate parent ownership before installation. The staged DB/config checks now exist; complete parent ownership and durability validation.
+- [x] Return `tsconfig.json` to a directory-level source include, or enforce another mechanism that cannot silently omit newly added production modules.
+- [ ] Remove dependencies that are truly obsolete after the implementation settles; keep exact-pinned Pi packages as development-only type dependencies.
+
+### Remaining product implementation
+
+#### Slack gateway
+
+- [ ] Start one Socket Mode Slack client and parse real top-level Events API bodies.
+- [ ] Validate `event_id`, event shape, configured conversation, conversation type, bot membership, sender attribution/trust, bot authorship, and raw mention requirements in the required pre-ack order.
+- [ ] Atomically implement new-message, edit, and deletion admission with duplicate/no-op behavior and restart/concurrency tests.
+- [ ] Store attachment metadata without downloading, strip only the real bot mention from agent-visible content, and support mentioned attachment-only messages.
+- [ ] Add post-commit acknowledgements, notifications, and best-effort reaction reconciliation without putting Slack network calls on the pre-ack path.
+- [ ] Implement live history/message/thread navigation, configured-conversation enforcement, pagination, response bounds, send/reply behavior, and outcome-unknown handling.
+- [ ] Implement validated on-demand download and upload with file ownership, type, symlink, size, sanitization, and re-stat checks.
+
+#### Persistent pi RPC session
+
+- [ ] Launch the configured pi binary in persistent RPC mode with the canonical session directory and working directory.
+- [ ] Enforce the minimum version and perform a runtime-validated capability/model/state handshake.
+- [ ] Implement strict LF-delimited JSONL parsing, command correlation, lifecycle state, graceful shutdown/escalation, and process-exit handling.
+- [ ] Configure one-at-a-time follow-ups and serialize Slack mutation, trust changes, prompt/follow-up dispatch, scheduler work, and reset through one coordinator.
+- [ ] Send `prompt` while idle and `follow_up` while active; record RPC acceptance metadata only after successful acceptance.
+- [ ] Implement neutral startup/session-reset recovery summaries and the specified no-replay behavior for automatic child restarts.
+- [ ] Implement bounded restart backoff, failure thresholds, new-work retry behavior, and degraded session health.
+- [ ] Ensure ordinary assistant stdout is never automatically posted to Slack.
+
+#### Inbox, tasks, schedules, reactions, and trust
+
+- [ ] Implement `inbox respond` and `inbox working`, including `SOURCE_DELETED`, additional replies to resolved items, Slack/SQLite partial success, and managed-reaction cleanup.
+- [ ] Finish atomic multi-ID inbox/task resolution, immutable resolved source snapshots, conventional default reasons, and stable errors.
+- [ ] Implement the complete task repository and direct notification metadata.
+- [ ] Implement one-time and Croner-backed recurring schedules, timezone/offset validation, occurrence keys, atomic task creation/advancement, enable/disable/remove behavior, and coalesced downtime catch-up.
+- [ ] Implement `👀 -> ⏳`, silent-resolution `✅`, response cleanup, crash/reset reversion, desired/actual/error state, bounded reconciliation, and preservation of user reactions.
+- [ ] Complete Slack-validated trust list pagination and preserve event-time-only trust semantics, including an empty list.
+
+#### Configuration and session controls
+
+- [ ] Implement `session status`, nested model/thinking commands, desired/effective reporting, catalog validation, and immediate-or-safe-boundary application.
+- [ ] Implement idle and actively confirmed session reset using the stale-safe `<session-id>:<run-sequence>` challenge and flush the response before aborting.
+- [ ] Archive the old session, preserve overrides/open work/tasks/schedules, start a fresh RPC session, and send one recovery summary.
+- [ ] Implement archive list/cleanup while exempting reset bundles and legacy backups.
+
+#### Setup, reset, operations, and release
+
+- [ ] Rebuild setup as the specified interactive/non-interactive flow with pi authentication/version checks, Slack token validation, `auth.test`, conversation metadata/membership validation, cosmetic labels, trusted-user validation, and explicit trust warning.
+- [ ] Implement `setup --reset`, `--yes`, typed confirmation, collision-free backup bundles, SQLite backup API/WAL handling, manifests/hashes, staging, fsync boundaries, atomic installation, rollback, and sidecar cleanup.
+- [ ] Implement reset journaling, startup refusal on an incomplete journal, plain-setup recovery, deterministic restoration, and failure injection after every destructive durability boundary.
+- [ ] Implement daemon install/uninstall/start/stop/status/logs for systemd and launchd, plus structured logging and graceful bounded shutdown.
+- [ ] Make `doctor` report all resolved paths/owners/modes and obtain database/session/lock/socket health according to the online/offline rules.
+- [ ] Update README, `.env.example`, changelog, security guidance, daemon definitions, prompt examples, manifest reapplication/reinstall instructions, and breaking-release migration steps.
+- [ ] Add every test group listed in this document, then perform the complete automated and manual validation/rollout checklist before release.
+
+The remaining sections are the normative target contract. Do not mark an item complete merely because a table, command name, or stub exists; its required validation, lifecycle, failure behavior, output contract, and tests must also exist.
+
 ## Goal
 
 Make `pi-tag-slack` a daemon-backed gateway for exactly one explicitly configured Slack conversation and one persistent pi session.
@@ -428,7 +521,7 @@ Future privilege separation requires a distinct OS identity or a real sandbox.
 Listen at `<data-dir>/control.sock` using one request per connection:
 
 1. Connect.
-2. Send exactly one LF-terminated JSON object.
+2. Send exactly one LF-terminated JSON object, then write-half-close the connection.
 3. Receive exactly one LF-terminated JSON object.
 4. Server closes the connection.
 
@@ -719,21 +812,23 @@ Public IDs are prefixed SQLite integer IDs (`inbox-42`, `task-17`, `schedule-3`)
 
 ## Implementation sequence
 
-1. Introduce canonical path resolution, ownership checks, and gateway locking.
-2. Write and review the complete schema-v2 SQL, repository transition rules, public ID/timestamp formats, JSON fixtures, and stable error-code list before service implementation.
-3. Implement strict schema initialization/validation, the event ledger, singleton, inbox/task/schedule/trust repositories, required PRAGMAs, and hard schema rejection.
-4. Build strict control-socket framing, filesystem authorization, errors, pagination, and client plumbing.
-5. Replace one-shot pi execution with the version-checked persistent RPC lifecycle/coordinator.
-6. Implement event-idempotent new/edit/delete Slack ingestion and prompt/follow-up notification.
-7. Implement inbox/task/schedule/trust and live Slack CLI services.
-8. Implement reaction reconciliation and on-demand attachment download/upload validation.
-9. Implement desired/effective session model/thinking controls and confirmed reset.
-10. Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation.
-11. Remove multi-channel, DM, slash command, panel, legacy queue, Pi runtime imports/peers, and obsolete config code.
-12. Update manifest, documentation, changelog, diagnostics, and daemon definitions.
-13. Add failure-injection, restart, Socket Mode mutation, systemd, and launchd validation.
+The status markers here are a summary; the detailed handoff checklist above and the normative requirements remain authoritative.
 
-Keep each checkpoint buildable/testable where practical; do not switch the active schema while old runtime consumers still require legacy tables.
+1. `[~]` Introduce canonical path resolution, ownership checks, and gateway locking. Path derivation exists; finish the safety corrections and OS-held lock before proceeding.
+2. `[~]` Write and review the complete schema-v2 SQL, repository transition rules, public ID/timestamp formats, JSON fixtures, and stable error-code list before service implementation. Initial SQL/public IDs exist; definitions, fixtures, validation, transitions, and error catalog are incomplete.
+3. `[~]` Implement strict schema initialization/validation, the event ledger, singleton, inbox/task/schedule/trust repositories, required PRAGMAs, and hard schema rejection. Only the singleton, basic event/inbox mutation, manual tasks, and basic trust storage exist.
+4. `[~]` Build strict control-socket framing, filesystem authorization, errors, pagination, and client plumbing. Server framing and inbox/task pagination exist; complete authorization, errors, bounds, and client validation do not.
+5. `[ ]` Replace one-shot pi execution with the version-checked persistent RPC lifecycle/coordinator.
+6. `[ ]` Implement event-idempotent new/edit/delete Slack ingestion and prompt/follow-up notification.
+7. `[~]` Implement inbox/task/schedule/trust and live Slack CLI services. Only the minimal local repository-backed subset listed above exists.
+8. `[ ]` Implement reaction reconciliation and on-demand attachment download/upload validation.
+9. `[ ]` Implement desired/effective session model/thinking controls and confirmed reset.
+10. `[ ]` Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation.
+11. `[~]` Remove multi-channel, DM, slash command, panel, legacy queue, Pi runtime imports/peers, and obsolete config code. Legacy source was removed and Pi packages are development-only; dependency/config cleanup remains.
+12. `[~]` Update manifest, documentation, changelog, diagnostics, and daemon definitions. The manifest and this plan are updated; the rest remains.
+13. `[ ]` Add failure-injection, restart, Socket Mode mutation, systemd, and launchd validation.
+
+Keep each checkpoint buildable and tested. Do not advance a marker to `[x]` until the associated normative behavior and tests are complete.
 
 ## Validation and rollout
 

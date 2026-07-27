@@ -54,10 +54,6 @@
     "start": "node dist/cli/index.js start",
     "dev": "tsx src/cli/index.ts start"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.80.0",
-    "@earendil-works/pi-coding-agent": "^0.80.0"
-  },
   "dependencies": {
     "@clack/prompts": "1.7.0",
     "@slack/bolt": "5.0.0",

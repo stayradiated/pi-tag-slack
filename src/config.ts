@@ -1,239 +1,109 @@
 import { parse } from 'dotenv';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, parse as parsePath, resolve } from 'node:path';
 
-const DEFAULT_CONFIG_PATH = defaultConfigPath();
-const DEFAULT_DATA_DIR = defaultDataDir();
-const CONFIG_SOURCE = buildConfigSource();
-
-function defaultConfigPath(): string {
-  switch (process.platform) {
-    case 'darwin':
-      return resolve(homedir(), 'Library/Application Support/pi-tag-slack/config.env');
-    default:
-      return resolve(homedir(), '.config', 'pi-tag-slack', 'config.env');
-  }
-}
-
-export function defaultDataDir(): string {
-  switch (process.platform) {
-    case 'darwin':
-      return resolve(homedir(), 'Library/Application Support/pi-tag-slack');
-    default:
-      return resolve(homedir(), '.local/share', 'pi-tag-slack');
-  }
-}
-
-export function resolveConfigPath(): string {
-  const configuredPath = process.env.PI_TAG_SLACK_CONFIG?.trim() ?? '';
-  if (configuredPath) {
-    return resolveUserPath(configuredPath);
-  }
-
-  return DEFAULT_CONFIG_PATH;
-}
-
-function resolveUserPath(inputPath: string): string {
-  const expanded = expandHome(inputPath.trim());
+function userPath(value: string): string {
+  const expanded = value === '~' ? homedir() : value.replace(/^~\//, `${homedir()}/`);
   return isAbsolute(expanded) ? expanded : resolve(expanded);
 }
 
-function expandHome(inputPath: string): string {
-  if (inputPath === '~') {
-    return homedir();
-  }
-
-  if (inputPath.startsWith('~/')) {
-    return resolve(homedir(), inputPath.slice(2));
-  }
-
-  return inputPath;
+function uid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 
-function readEnvValue(key: string): string | undefined {
-  return CONFIG_SOURCE[key];
+export function defaultDataDir(): string {
+  return process.platform === 'darwin'
+    ? resolve(homedir(), 'Library/Application Support/pi-tag-slack')
+    : resolve(homedir(), '.local/share/pi-tag-slack');
 }
 
-function buildConfigSource(): Record<string, string> {
+export function resolveDataDir(): string {
+  return userPath(process.env.PI_TAG_SLACK_DATA_DIR?.trim() || defaultDataDir());
+}
+
+export function resolveConfigPath(): string {
+  const fallback =
+    process.platform === 'darwin'
+      ? resolve(homedir(), 'Library/Application Support/pi-tag-slack/config.env')
+      : resolve(homedir(), '.config/pi-tag-slack/config.env');
+  return userPath(process.env.PI_TAG_SLACK_CONFIG?.trim() || fallback);
+}
+
+/**
+ * Checks the bootstrap file and all existing ancestors before it is read. The
+ * file may be absent during setup, but an existing file must be a private,
+ * daemon-owned regular file. Ancestors may not be symlinks, foreign-owned, or
+ * writable by group/other, preventing parent substitution after deployment.
+ */
+export function validateBootstrapConfigPath(path = resolveConfigPath()): void {
+  const target = resolve(path);
+  const owner = uid();
+  const configParent = dirname(target);
+  let current = target;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink bootstrap path: ${current}`);
+      if (
+        (current === target || current === configParent) &&
+        owner !== undefined &&
+        stat.uid !== owner
+      )
+        throw new Error(`Foreign-owned bootstrap path: ${current}`);
+      // Read-only ancestors may be system-owned. Writable ancestors are only
+      // acceptable when sticky (for example /tmp); the daemon-owned immediate
+      // config directory is still created private by setup.
+      const writable = stat.mode & 0o022;
+      if (writable !== 0 && !(stat.mode & 0o1000))
+        throw new Error(`Bootstrap path is writable by group or other: ${current}`);
+      if (current === target) {
+        if (!stat.isFile()) throw new Error(`Bootstrap config is not a regular file: ${target}`);
+        if ((stat.mode & 0o777) !== 0o600)
+          throw new Error(`Bootstrap config must have mode 0600: ${target}`);
+      } else if (!stat.isDirectory()) {
+        throw new Error(`Bootstrap config parent is not a directory: ${current}`);
+      }
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const parent = dirname(current);
+    if (parent === current || current === parsePath(current).root) break;
+    current = parent;
+  }
+}
+
+export interface BootstrapConfig {
+  slackBotToken: string;
+  slackAppToken: string;
+  dataDir: string;
+  configPath: string;
+}
+
+/** Loads bootstrap values at runtime, never as an import side effect. */
+export function loadBootstrapConfig(): BootstrapConfig {
+  const configPath = resolveConfigPath();
+  let fileValues: Record<string, string> = {};
+  try {
+    validateBootstrapConfigPath(configPath);
+    fileValues = parse(readFileSync(configPath, 'utf8'));
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const values = { ...fileValues, ...process.env };
   return {
-    ...loadEnvFile(resolveConfigPath()),
-    ...readProcessEnv(),
+    slackBotToken: values.SLACK_BOT_TOKEN?.trim() ?? '',
+    slackAppToken: values.SLACK_APP_TOKEN?.trim() ?? '',
+    dataDir: resolveDataDir(),
+    configPath,
   };
 }
 
-function loadEnvFile(filePath: string): Record<string, string> {
-  try {
-    return parse(readFileSync(filePath, 'utf8'));
-  } catch (error) {
-    if (isMissingFileError(error)) {
-      return {};
-    }
-
-    throw error;
-  }
-}
-
-function readProcessEnv(): Record<string, string> {
-  const values: Record<string, string> = {};
-
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      values[key] = value;
-    }
-  }
-
-  return values;
-}
-
-function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
-  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
-}
-
-function env(key: string, fallback = ''): string {
-  return (readEnvValue(key) ?? '').trim() || fallback;
-}
-
-function envInt(key: string, fallback: number, opts: { min?: number } = {}): number {
-  const raw = env(key);
-  if (!raw) return fallback;
-
-  const v = Number.parseInt(raw, 10);
-  if (Number.isNaN(v)) return fallback;
-  if (opts.min !== undefined && v < opts.min) return fallback;
-  return v;
-}
-
-const VALID_CHANNEL_POLICIES = ['open', 'open-trigger', 'allowlist'] as const;
-type ChannelPolicy = (typeof VALID_CHANNEL_POLICIES)[number];
-
-function parseChannelPolicy(value: string): ChannelPolicy {
-  if ((VALID_CHANNEL_POLICIES as readonly string[]).includes(value)) {
-    return value as ChannelPolicy;
-  }
-  return 'allowlist';
-}
-
-const VALID_DM_POLICIES = ['open', 'allowlist', 'disabled'] as const;
-export type DmPolicy = (typeof VALID_DM_POLICIES)[number];
-
-function parseDmPolicy(value: string): DmPolicy {
-  if ((VALID_DM_POLICIES as readonly string[]).includes(value)) {
-    return value as DmPolicy;
-  }
-  return 'open';
-}
-
-function parsePathPrepend(value: string): string[] {
-  return [
-    ...new Set(
-      value
-        .split(delimiter)
-        .map((entry) => entry.trim())
-        .filter(Boolean)
-        .map(resolveUserPath),
-    ),
-  ];
-}
-
-export const config = {
-  /** Slack bot token, xoxb- prefix (required) */
-  slackBotToken: env('SLACK_BOT_TOKEN'),
-
-  /** Slack app-level token for Socket Mode, xapp- prefix (required) */
-  slackAppToken: env('SLACK_APP_TOKEN'),
-
-  /** Pi binary path */
-  piBin: env('PI_BIN', 'pi'),
-
-  /** Directories prepended to PATH for commands launched by the gateway */
-  pathPrepend: parsePathPrepend(env('PATH_PREPEND')),
-
-  /** Default model for pi */
-  piModel: env('PI_MODEL'),
-
-  /** Thinking level for pi */
-  piThinking: env('PI_THINKING'),
-
-  /** Base directory for per-channel session folders */
-  sessionsDir: env('SESSIONS_DIR', resolve(DEFAULT_DATA_DIR, 'sessions')),
-
-  /** Days to retain archived sessions (0 = never clean) */
-  archiveRetentionDays: envInt('ARCHIVE_RETENTION_DAYS', 30, { min: 0 }),
-
-  /** Hours to retain downloaded attachment media for path-based agent access */
-  mediaRetentionHours: envInt('MEDIA_RETENTION_HOURS', 24 * 7, { min: 1 }),
-
-  /** SQLite database path */
-  dbPath: env('DB_PATH', resolve(DEFAULT_DATA_DIR, 'gateway.db')),
-
-  /** Bot trigger name (default: bot's own display name) */
-  triggerName: env('TRIGGER_NAME', 'pi-tag-slack'),
-
-  /** Max concurrent agent invocations */
-  maxConcurrency: envInt('MAX_CONCURRENCY', 3, { min: 1 }),
-
-  /** Max scheduled tasks enqueued per scheduler tick */
-  maxScheduledConcurrency: envInt('MAX_SCHEDULED_CONCURRENCY', 1, { min: 1 }),
-
-  /** Poll interval for message queue (ms) */
-  pollInterval: envInt('POLL_INTERVAL_MS', 1000, { min: 1 }),
-
-  /** Graceful shutdown timeout before aborting in-flight tasks (ms) */
-  shutdownTimeoutMs: envInt('SHUTDOWN_TIMEOUT_MS', 15_000, { min: 0 }),
-
-  /** Log level */
-  logLevel: env('LOG_LEVEL', 'info'),
-
-  /** Working directory for pi agent */
-  piCwd: env('PI_CWD', homedir()),
-
-  /** Extra pi flags (space-separated) */
-  piExtraFlags: env('PI_EXTRA_FLAGS'),
-
-  /** DM access policy: open (auto-register), allowlist, or disabled */
-  dmPolicy: parseDmPolicy(env('DM_POLICY', 'open')),
-
-  /** Channel access policy: open, open-trigger, or allowlist */
-  channelPolicy: parseChannelPolicy(env('CHANNEL_POLICY', 'allowlist')),
-
-  /** Comma-separated channel IDs to exclude from auto-registration */
-  excludedChannels: new Set(
-    env('EXCLUDED_CHANNELS')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
-  ),
-
-  /** Max size for a single Slack attachment in bytes (0 disables the limit) */
-  maxAttachmentBytes: envInt('MAX_ATTACHMENT_BYTES', 25 * 1024 * 1024, { min: 0 }),
-
-  /** Max combined attachment size per Slack message in bytes (0 disables the limit) */
-  maxTotalAttachmentBytes: envInt('MAX_TOTAL_ATTACHMENT_BYTES', 50 * 1024 * 1024, { min: 0 }),
-} as const;
-
-export type Config = typeof config;
-
-/**
- * Validate the Slack token pair. Returns human-readable problems (empty when
- * valid); callers decide whether to throw (gateway startup) or report (status).
- */
-export function validateSlackTokens(
-  cfg: Pick<Config, 'slackBotToken' | 'slackAppToken'>,
-): string[] {
-  const problems: string[] = [];
-
-  if (!cfg.slackBotToken) {
-    problems.push('SLACK_BOT_TOKEN is required. Set it in config.env, .env, or the environment.');
-  } else if (!cfg.slackBotToken.startsWith('xoxb-')) {
-    problems.push('SLACK_BOT_TOKEN must start with "xoxb-" (bot token).');
-  }
-
-  if (!cfg.slackAppToken) {
-    problems.push('SLACK_APP_TOKEN is required. Set it in config.env, .env, or the environment.');
-  } else if (!cfg.slackAppToken.startsWith('xapp-')) {
-    problems.push('SLACK_APP_TOKEN must start with "xapp-" (app-level token).');
-  }
-
-  return problems;
+export function validateSlackTokens(cfg = loadBootstrapConfig()): string[] {
+  const errors: string[] = [];
+  if (!cfg.slackBotToken.startsWith('xoxb-'))
+    errors.push('SLACK_BOT_TOKEN must be an xoxb- bot token.');
+  if (!cfg.slackAppToken.startsWith('xapp-'))
+    errors.push('SLACK_APP_TOKEN must be an xapp- app token.');
+  return errors;
 }
