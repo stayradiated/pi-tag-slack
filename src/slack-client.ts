@@ -10,7 +10,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { inboxReactionsDue, readGatewayConfig, recordInboxReaction } from './db.js';
 import { ensurePrivateLayout, gatewayPaths } from './paths.js';
 
@@ -197,23 +197,126 @@ export async function slackThread(
   return { items: response.messages ?? [], nextCursor: cursor(response) };
 }
 
-/** Sends a message (or thread reply) without modifying any inbox/task state. */
-export async function sendSlackMessage(text: string, threadTs?: string): Promise<{ ts: string }> {
-  const runtime = requireClient();
-  const result = await slackCall(() =>
-    runtime.client.chat.postMessage({
-      channel: runtime.channelId,
-      text,
-      ...(threadTs ? { thread_ts: threadTs } : {}),
-    }),
-  );
-  if (!result.ok || !result.ts)
-    throw slackError(Object.assign(new Error('Slack send failed.'), result));
-  return { ts: result.ts };
+type UploadFile = { path: string; dev: number; ino: number; size: number; mtimeMs: number };
+
+function uploadError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code });
 }
 
-export async function replyToInbox(threadTs: string, text: string): Promise<string> {
-  return (await sendSlackMessage(text, threadTs)).ts;
+function inspectUploadFile(path: string): UploadFile {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    throw uploadError('INVALID_FILE', `Upload file does not exist: ${path}`);
+  }
+  if (stat.isSymbolicLink() || !stat.isFile())
+    throw uploadError('INVALID_FILE', `Upload path must be a regular non-symlink file: ${path}`);
+  return { path, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+/** Validates local upload paths before any Slack operation is started. */
+export function validateUploadFiles(paths: string[]): UploadFile[] {
+  const config = readGatewayConfig();
+  const perFileLimit = Number(config.max_attachment_bytes);
+  const totalLimit = Number(config.max_total_attachment_bytes);
+  let total = 0;
+  const files = paths.map((path) => {
+    if (typeof path !== 'string' || !path)
+      throw uploadError('INVALID_FILE', 'Upload path must be non-empty.');
+    const file = inspectUploadFile(path);
+    if (exceeds(perFileLimit, file.size))
+      throw uploadError(
+        'FILE_TOO_LARGE',
+        `Upload file exceeds the configured per-file media limit: ${path}`,
+      );
+    total += file.size;
+    return file;
+  });
+  if (exceeds(totalLimit, total))
+    throw uploadError(
+      'MEDIA_LIMIT_EXCEEDED',
+      'Upload files exceed the configured total media limit.',
+    );
+  return files;
+}
+
+/** Re-checks identity and size at the last point before Slack opens the paths. */
+function revalidateUploadFiles(files: UploadFile[]): void {
+  for (const file of files) {
+    const current = inspectUploadFile(file.path);
+    if (
+      current.dev !== file.dev ||
+      current.ino !== file.ino ||
+      current.size !== file.size ||
+      current.mtimeMs !== file.mtimeMs
+    )
+      throw uploadError('FILE_CHANGED', `Upload file changed before upload: ${file.path}`);
+  }
+}
+
+function uploadTimestamp(result: Record<string, unknown>, channel: string): string | undefined {
+  if (typeof result.ts === 'string') return result.ts;
+  const files = Array.isArray(result.files) ? result.files : [];
+  for (const file of files) {
+    if (!file || typeof file !== 'object') continue;
+    const value = file as Record<string, unknown>;
+    if (typeof value.timestamp === 'string') return value.timestamp;
+    const shares = value.shares;
+    if (!shares || typeof shares !== 'object') continue;
+    for (const visibility of Object.values(shares as Record<string, unknown>)) {
+      const entries =
+        visibility && typeof visibility === 'object'
+          ? (visibility as Record<string, unknown>)[channel]
+          : undefined;
+      if (Array.isArray(entries) && typeof entries[0]?.ts === 'string') return entries[0].ts;
+    }
+  }
+  return undefined;
+}
+
+/** Sends text and, when supplied, one Slack V2 multi-file message. */
+export async function sendSlackMessage(
+  text: string,
+  threadTs?: string,
+  paths: string[] = [],
+): Promise<{ ts: string }> {
+  const runtime = requireClient();
+  const files = validateUploadFiles(paths);
+  if (files.length === 0) {
+    const result = await slackCall(() =>
+      runtime.client.chat.postMessage({
+        channel: runtime.channelId,
+        text,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+      }),
+    );
+    if (!result.ok || !result.ts)
+      throw slackError(Object.assign(new Error('Slack send failed.'), result));
+    return { ts: result.ts };
+  }
+  revalidateUploadFiles(files);
+  const result = await slackCall(() =>
+    runtime.client.files.uploadV2({
+      channel_id: runtime.channelId,
+      initial_comment: text,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      file_uploads: files.map((file) => ({ file: file.path, filename: basename(file.path) })),
+    }),
+  );
+  const ts = result.ok
+    ? uploadTimestamp(result as unknown as Record<string, unknown>, runtime.channelId)
+    : undefined;
+  if (!ts) throw slackError(Object.assign(new Error('Slack file upload failed.'), result));
+  return { ts };
+}
+
+export async function replyToInbox(
+  threadTs: string,
+  text: string,
+  paths: string[] = [],
+): Promise<string> {
+  return (await sendSlackMessage(text, threadTs, paths)).ts;
 }
 
 type SlackFile = {

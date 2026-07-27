@@ -38,7 +38,7 @@ Usage:
 
 Runtime commands use the daemon control socket. Run setup before starting the daemon.`;
 
-type Flags = Record<string, string | boolean>;
+type Flags = Record<string, string | boolean | string[]>;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const [group, verb, ...rest] = argv;
@@ -275,8 +275,12 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
     return { fileId: positional(args, new Set(['json']))[0] };
   }
   if (command === 'slack.send') {
-    const flags = parseFlags(args, new Set(['thread', 'text']));
-    return compact({ threadTs: flags.thread, text: flags.text });
+    const flags = parseFlags(args, new Set(['thread', 'text', 'file']), new Set(['file']));
+    return compact({
+      threadTs: flags.thread,
+      text: flags.text,
+      files: typeof flags.file === 'string' ? [flags.file] : flags.file,
+    });
   }
   if (command.endsWith('.list')) {
     const flags = parseFlags(args, new Set(['state', 'limit', 'cursor', 'json']));
@@ -284,8 +288,14 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
   }
   if (command.endsWith('.show') || command === 'inbox.working') return { id: args[0] };
   if (command === 'inbox.respond') {
-    const flags = parseFlags(args, new Set(['text']));
-    return { id: positional(args, new Set(['text']))[0], text: flags.text };
+    const flags = parseFlags(args, new Set(['text', 'file']), new Set(['file']));
+    return {
+      id: positional(args, new Set(['text', 'file']))[0],
+      text: flags.text,
+      ...(flags.file === undefined
+        ? {}
+        : { files: typeof flags.file === 'string' ? [flags.file] : flags.file }),
+    };
   }
   if (command.endsWith('.resolve')) {
     const flags = parseFlags(args, new Set(['reason']));
@@ -329,7 +339,7 @@ function compact(values: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
 }
 
-function numberFlag(value: string | boolean | undefined): number | undefined {
+function numberFlag(value: unknown): number | undefined {
   if (typeof value !== 'string') return undefined;
   return Number(value);
 }
@@ -346,7 +356,7 @@ function positional(args: string[], flagNames: Set<string>): string[] {
   return result;
 }
 
-function parseFlags(args: string[], names: Set<string>): Flags {
+function parseFlags(args: string[], names: Set<string>, repeatable = new Set<string>()): Flags {
   const result: Flags = {};
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -359,7 +369,12 @@ function parseFlags(args: string[], names: Set<string>): Flags {
     }
     const value = args[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Option ${argument} requires a value.`);
-    result[name] = value;
+    if (repeatable.has(name)) {
+      const current = result[name];
+      result[name] = current === undefined ? [value] : [...(current as string[]), value];
+    } else {
+      result[name] = value;
+    }
     index += 1;
   }
   return result;

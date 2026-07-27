@@ -66,6 +66,13 @@ function text(value: unknown, name: string): string {
   return value.trim();
 }
 
+function filePaths(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || !item))
+    fail('INVALID_PARAMS', 'files must be an array of non-empty paths.');
+  return value as string[];
+}
+
 function ids(value: unknown): string[] {
   if (
     !Array.isArray(value) ||
@@ -268,7 +275,11 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       const id = parsePublicId('inbox', idText);
       const row = one(db, 'inbox', idText) as Record<string, unknown>;
       if (row.source_deleted_at) fail('SOURCE_DELETED', 'The Slack source message was deleted.');
-      return replyToInbox(String(row.thread_ts), text(params.text, 'text')).then((replyTs) => {
+      return replyToInbox(
+        String(row.thread_ts),
+        text(params.text, 'text'),
+        filePaths(params.files),
+      ).then((replyTs) => {
         try {
           recordInboxReply(id, replyTs);
         } catch {
@@ -299,6 +310,7 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       return sendSlackMessage(
         text(params.text, 'text'),
         params.threadTs === undefined ? undefined : text(params.threadTs, 'threadTs'),
+        filePaths(params.files),
       );
     case 'task.list':
       return rows(db, 'tasks', state(params.state), limit(params.limit), params.cursor);

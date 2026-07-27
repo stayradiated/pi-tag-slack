@@ -15,7 +15,7 @@ import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   addTrustedUser,
   closeDb,
@@ -942,6 +942,108 @@ describe('on-demand Slack file download', () => {
       }
     });
   });
+});
+
+describe('outbound Slack file uploads', () => {
+  it('uploads one or many files only to the configured conversation and derived inbox thread', async () => {
+    configuredDb();
+    const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-upload-'));
+    directories.push(directory);
+    const first = join(directory, 'one.txt');
+    const second = join(directory, 'two.txt');
+    writeFileSync(first, 'one');
+    writeFileSync(second, 'two');
+    const calls: Array<Record<string, unknown>> = [];
+    configureSlackClient(
+      {
+        files: {
+          uploadV2: async (params: Record<string, unknown>) => {
+            calls.push(params);
+            return { ok: true, ts: '9.0' };
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    ingestSlackEvent({
+      eventId: 'Ev_upload_reply',
+      kind: 'new-message',
+      messageId: 'C0123456789:upload',
+      senderId: 'U0123456789',
+      senderLabel: 'Ada',
+      content: 'please send',
+      messageTs: '4.0',
+      threadTs: '4.0',
+    });
+    try {
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'send-files',
+          command: 'slack.send',
+          params: { text: 'files', threadTs: '3.0', files: [first, second] },
+        }),
+      ).resolves.toEqual({ ts: '9.0' });
+      await expect(
+        dispatch({
+          version: 1,
+          id: 'reply-files',
+          command: 'inbox.respond',
+          params: { id: 'inbox-1', text: 'reply', files: [first] },
+        }),
+      ).resolves.toMatchObject({ id: 'inbox-1', replyTs: '9.0', resolved: true });
+      expect(calls).toMatchObject([
+        { channel_id: 'C0123456789', thread_ts: '3.0', initial_comment: 'files' },
+        { channel_id: 'C0123456789', thread_ts: '4.0', initial_comment: 'reply' },
+      ]);
+      expect(calls[0].file_uploads).toHaveLength(2);
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  it('rejects symlinks and size-limit failures before Slack is called', async () => {
+    const dbPath = configuredDb();
+    const directory = dirname(dbPath);
+    const regular = join(directory, 'regular.txt');
+    const link = join(directory, 'link.txt');
+    writeFileSync(regular, 'four');
+    symlinkSync(regular, link);
+    let uploads = 0;
+    configureSlackClient(
+      {
+        files: {
+          uploadV2: async () => {
+            uploads++;
+            return { ok: true, ts: '1.0' };
+          },
+        },
+      } as any,
+      'C0123456789',
+    );
+    try {
+      await expect(sendWithFiles([link])).rejects.toMatchObject({ code: 'INVALID_FILE' });
+      dispatch({
+        version: 1,
+        id: 'upload-limit',
+        command: 'config.set',
+        params: { key: 'maxAttachmentBytes', value: '3' },
+      });
+      await expect(sendWithFiles([regular])).rejects.toMatchObject({ code: 'FILE_TOO_LARGE' });
+      expect(uploads).toBe(0);
+    } finally {
+      clearSlackClient();
+    }
+  });
+
+  async function sendWithFiles(files: string[]): Promise<unknown> {
+    return dispatch({
+      version: 1,
+      id: 'upload',
+      command: 'slack.send',
+      params: { text: 'files', files },
+    });
+  }
 });
 
 describe('Slack-validated trust management', () => {
