@@ -84,7 +84,7 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 #### Setup, reset, operations, and release
 
 - [~] Rebuild setup as the specified interactive/non-interactive flow. Non-destructive first-time validation now covers pi version/RPC catalogs, Slack token/auth/Socket Mode validation, conversation metadata/membership and cosmetic label, trusted-user validation/label, and the explicit trust warning; interactive flow and reset handling remain.
-- [ ] Implement `setup --reset`, `--yes`, typed confirmation, collision-free backup bundles, SQLite backup API/WAL handling, manifests/hashes, staging, fsync boundaries, atomic installation, rollback, and sidecar cleanup.
+- [~] Implement `setup --reset`, `--yes`, typed confirmation, collision-free backup bundles, SQLite backup API/WAL handling, manifests/hashes, staging, fsync boundaries, atomic installation, rollback, and sidecar cleanup. The reusable non-destructive reset-backup primitive now creates collision-free private bundles through SQLite backup after a checkpoint attempt, copies/validates config and session, records manifest hashes, validates/reopens the DB, fsyncs, and atomically publishes; setup wiring and every destructive/reset-recovery step remain.
 - [ ] Implement reset journaling, startup refusal on an incomplete journal, plain-setup recovery, deterministic restoration, and failure injection after every destructive durability boundary.
 - [ ] Implement daemon install/uninstall/start/stop/status/logs for systemd and launchd, plus structured logging and graceful bounded shutdown.
 - [ ] Make `doctor` report all resolved paths/owners/modes and obtain database/session/lock/socket health according to the online/offline rules.
@@ -824,7 +824,7 @@ The status markers here are a summary; the detailed handoff checklist above and 
 7. `[~]` Implement inbox/task/schedule/trust and live Slack CLI services. Only the minimal local repository-backed subset listed above exists.
 8. `[~]` Implement reaction reconciliation and on-demand attachment download/upload validation. Download validation is implemented; upload remains.
 9. `[~]` Implement desired/effective session model/thinking controls and confirmed reset. Model/thinking controls are complete; confirmed reset remains.
-10. `[~]` Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation. Non-destructive first-time validation is complete; destructive reset/recovery work remains.
+10. `[~]` Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation. Non-destructive first-time validation and the standalone validated backup-bundle primitive are complete; setup wiring and destructive reset/recovery work remain.
 11. `[~]` Remove multi-channel, DM, slash command, panel, legacy queue, Pi runtime imports/peers, and obsolete config code. Legacy source was removed and Pi packages are development-only; dependency/config cleanup remains.
 12. `[~]` Update manifest, documentation, changelog, diagnostics, and daemon definitions. The manifest and this plan are updated; the rest remains.
 13. `[ ]` Add failure-injection, restart, Socket Mode mutation, systemd, and launchd validation.
