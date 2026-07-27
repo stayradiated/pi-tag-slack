@@ -1,110 +1,759 @@
-# Single-channel and CLI-control refactor plan
+# Single-conversation, agent-directed gateway refactor plan
 
 ## Goal
 
-Make `pi-tag-slack` a gateway for one configured Slack conversation rather
-than a multi-channel router. Remove Slack slash commands and expose the same
-session controls through `pi-tag-slack` so the agent can execute them locally.
-Trusted Slack users remain a separate, multi-user access list.
+Make `pi-tag-slack` a daemon-backed gateway for exactly one explicitly configured Slack conversation and one persistent pi session.
 
-## Product decisions
+Trusted Slack message events feed a durable inbox of Slack messages. A separate durable event ledger deduplicates new-message, edit, and deletion deliveries. Scheduled automation creates durable tasks. The daemon reliably receives, stores, filters, and presents work, while pi decides what requires action. Pi interacts with the gateway through an ordinary `pi-tag-slack` CLI rather than custom pi tools.
 
-- Setup records one required `SLACK_CHANNEL_ID` (`C...` or `G...`) and its
-  display label. The gateway ignores every other Slack conversation; DMs are
-  unsupported.
-- A channel is no longer registered, discovered, or selected at runtime. DMs,
-  allowlists, open-channel policies, excluded-channel lists, per-channel
-  folders, and per-channel cwd/model/thinking overrides are removed.
-- The one conversation has one persistent session, queue, working directory,
-  model override, and thinking override. Existing global defaults remain the
-  fallback settings.
-- The gateway continues to require trusted-user IDs. A trusted user can use
-  the configured conversation by explicitly `@pi`-mentioning it; untrusted
-  messages and unmentioned channel traffic are ignored.
-- The CLI and agent prompt target the configured conversation implicitly:
-  `session status`, `session models`, `session model <ref>`,
-  `session reset-model`, `session thinking <level>`, `session new`, and
-  `session stop`. `send` retains `--thread` but no longer requires
-  `--channel`; scheduled tasks likewise stop accepting a channel argument.
-- Removing `/pi` also removes its Block Kit panel. Session controls are
-  intentionally agent-operated CLI actions, not Slack UI actions.
+This is an alpha-stage hard cut. Do not migrate the legacy schema or silently adopt legacy channels, queues, tasks, or sessions.
 
-## Implementation phases
+## Product contract
 
-### 1. Replace channel configuration and persistence
+- Setup explicitly selects one public (`C...`) or private (`G...`) Slack conversation. DMs and MPIMs are unsupported.
+- The bot must already be a member of that conversation.
+- Every new inbound Slack message must contain a real raw `<@BOT_ID>` mention. Every new thread reply must mention pi again. Edits and deletions of an existing open inbox message need not repeat the mention.
+- Trusted Slack users remain a multi-user access list. Trust is checked only when a Slack event enters the system. Untrusted events are acknowledged and ignored without persistence or Slack side effects; later trust changes do not invalidate accepted events or existing inbox items. An empty trust list is valid.
+- The gateway has one persistent pi RPC session, one working directory, one effective model, and one effective thinking level.
+- Slack deliveries are durably deduplicated in an event ledger. The inbox stores one mutable row per open Slack message; once resolved, upstream Slack edits and deletions are ignored and the source snapshot remains immutable.
+- Schedules create durable task records. Tasks are separate from the Slack inbox but are presented to the same pi session.
+- Pi explicitly communicates and resolves work through the CLI. Its ordinary final stdout is never automatically posted to Slack.
+- The daemon decides when pi runs; pi decides what work needs action, verification, deferral, communication, or resolution.
+- Runtime commands go through the daemon. They never open SQLite independently or create a second Slack client.
 
-1. Add `SLACK_CHANNEL_ID` (`C...`/`G...` only) validation and setup-wizard
-   collection, including a label lookup after the Slack tokens are available.
-2. Replace the `channels` table and channel-policy configuration with a
-   singleton gateway/session settings record. Retain the trusted-user,
-   message-queue, scheduler, and archive data needed by the single session.
-3. Ship a schema migration that never selects a legacy channel automatically.
-   Require every operator to rerun setup and explicitly select the configured
-   channel; do not infer it from a main flag, a sole registration, or row order.
-4. After explicit setup selection, migrate that channel's folder and overrides
-   into singleton settings without moving its session directory. Preserve its
-   queued messages and mark queues for discarded channels failed with an audit
-   log.
-5. Simplify `RegisteredChannel`, channel-settings computation, session paths,
-   queue claiming, scheduler task ownership, and all call sites to remove
-   `jid` routing and per-channel state.
+## Delivery and recovery guarantees
 
-### 2. Limit Slack ingestion to the configured conversation
+### Slack ingestion
 
-1. In `src/slack/client.ts`, reject events from DMs and events whose channel
-   ID differs from `SLACK_CHANNEL_ID` before attachment processing or queue
-   insertion.
-2. Keep current bot-loop prevention, trusted-user checks, message/thread
-   handling, busy reactions, attachment limits, and thread replies.
-3. Require an explicit `@pi` mention for every inbound request. Remove
-   automatic DM/channel registration, channel-name discovery,
-   unregistered-channel notices, policies, and trigger-name configuration.
-4. Make outbound responses and file sends derive the destination from the
-   configured conversation. Thread timestamps remain explicit so replies land
-   in the originating thread.
+Slack ingestion is idempotent:
 
-### 3. Replace slash controls with CLI controls
+- Use Slack's top-level Events API `event_id` as the canonical delivery identity.
+- Namespace the stored identity, for example `slack:event:<event_id>`.
+- Do not use Socket Mode `envelope_id`, a Slack message timestamp, a thread timestamp, or a SQLite row ID as delivery identity.
+- Store accepted event identities in `slack_events` under a unique constraint. Store inbox messages separately under a unique Slack message identity.
+- New-message events create an inbox row. Edit events update an existing open inbox row and increment its revision. Deletion events redact an existing open inbox row and resolve it as `source-deleted`.
+- Insert the event ledger row and create/update/resolve the inbox row in one transaction.
+- A duplicate event performs no enrichment, reaction, notification, attachment work, inbox mutation, or second pi turn. A distinct new-message event for an already represented Slack message is recorded as a no-op and does not notify pi.
+- An edit or deletion with no matching inbox row, or whose matching row is already resolved, is acknowledged and ignored without persistence. This deliberately relies on Slack's normal mutation ordering and must never crash the daemon.
+- Reject and identifier-only log a relevant event that lacks a valid top-level `event_id`; do not invent a fallback identity.
 
-1. Extract reusable session-control services from `src/slack/commands.ts`:
-   effective status formatting, model catalog/listing, fuzzy model selection,
-   thinking validation/clamping, session rotation, and queue cancellation.
-2. Add the `session` CLI command group described above, with strict argument
-   validation and stable human-readable output. Remove `channels`, `register`,
-   and `unregister`; remove `--channel` from `send` and scheduled-task creation.
-3. Use a SQLite-backed control-request record for `session stop` and
-   `session new`. A CLI process cannot reach the running gateway's in-memory
-   abort controller, so the queue loop must consume requests, abort safely,
-   clear pending work, and persist the result for CLI feedback.
-4. Include the exact configured-session commands and current thread send
-   command in the prompt injected by `src/agent/queue.ts`, so pi can perform
-   every former `/pi` action when asked.
+One accepted Slack delivery therefore mutates inbox state at most once across concurrent delivery, Slack retries, and daemon restarts.
 
-### 4. Remove Slack command/UI integration
+### Agent execution
 
-1. Delete `src/slack/commands.ts`, `src/slack/panel.ts`, and their tests.
-2. Stop registering commands/actions in the Slack client and remove unused
-   Slack Block Kit type dependencies.
-3. Remove the `/pi` slash-command declaration, `commands` OAuth scope, and
-   interactivity setting from `manifest.yaml`. Document that existing Slack
-   apps need their manifest updated and reinstalled if Slack requests it.
+Exactly-once agent side effects are not promised. SQLite cannot atomically commit with pi session writes, filesystem changes, arbitrary external APIs, and Slack.
 
-### 5. Update docs, tests, and release notes
+Do not blindly replay interrupted Slack prompts. After daemon startup or explicit `session reset`, send a neutral recovery summary of durable open work. Automatic RPC child restarts remain idle. Pi inspects its persisted session, the inbox/task lists, and live Slack, then decides what remains necessary.
 
-1. Rewrite setup, configuration, CLI reference, security, session, scheduler,
-   and file-transfer documentation around one configured conversation.
-2. Replace `/pi` examples with agent requests and CLI examples. State that
-   session control is performed by pi through the local CLI.
-3. Add migration tests for zero, one, and multiple legacy registrations;
-   config/setup validation; configured-channel filtering; ignored DMs and
-   other channels; singleton session behavior; CLI parsing; control-request
-   completion; and prompt instructions.
-4. Remove channel-policy, registration, panel, and slash-command tests.
-5. Run formatting, linting, unit tests, build, and a manual Socket Mode smoke
-   test against the configured channel before release.
+### Retention
 
-## Compatibility and rollout
+Retain accepted `slack_events`, inbox, and task records indefinitely for the initial implementation, including resolved rows. Post-resolution or unmatched Slack mutations are ignored before acceptance and are not retained. This preserves accepted-event deduplication, history, and diagnostics without a second tombstone system. Downloaded media follows its separate retention policy.
 
-This is a breaking configuration and CLI change. Release it as a major
-version, retain a migration note in the changelog, and require operators with
-multiple existing channels to choose the one conversation to keep before
-upgrading. Do not remove old session archives during migration.
+## Canonical deployment layout
+
+Resolve one canonical data directory. Allow only these deployment-level overrides:
+
+```text
+PI_TAG_SLACK_CONFIG
+PI_TAG_SLACK_DATA_DIR
+```
+
+Derive every operational path from the data directory:
+
+```text
+<data-dir>/gateway.db
+<data-dir>/gateway.lock
+<data-dir>/control.sock
+<data-dir>/sessions/session/
+<data-dir>/sessions/archive/
+<data-dir>/media/
+<data-dir>/backups/
+<data-dir>/reset-journal.json
+<data-dir>/daemon.stdout.log
+<data-dir>/daemon.stderr.log
+```
+
+The bootstrap config file may live outside the data directory and contains only:
+
+```env
+SLACK_BOT_TOKEN="xoxb-..."
+SLACK_APP_TOKEN="xapp-..."
+```
+
+Remove independent operational overrides such as `DB_PATH`, `SESSIONS_DIR`, `PI_MODEL`, and `PI_CWD`. SQLite is the sole authority for operational settings.
+
+Required permissions and ownership:
+
+- Data directory: daemon UID, mode `0700`
+- Bootstrap config, SQLite database, gateway lock, and reset journal: daemon UID, mode `0600`
+- Control socket: daemon UID, mode `0600`
+- Session, archive, media, backup, and staging directories: private to daemon UID
+
+`doctor` and status output include every resolved path, owner, and mode. Refuse unsafe ownership, symlink substitution at structural paths, or a data layout that cannot be made private.
+
+## Bootstrap and persisted configuration
+
+### Typed singleton
+
+Use a typed `gateway_config` table with exactly one row:
+
+```sql
+id integer primary key check (id = 1)
+```
+
+Setup is the only operation that creates the row. There is no deletion API. A missing row, second row, malformed value, or incomplete configuration is fatal at startup and instructs the operator to run `setup --reset` (or plain `setup` only when no application state exists).
+
+Use `NULL`, not empty strings, for unset optional values. Apply `CHECK` constraints and validate the complete resulting row before every update.
+
+Persist at least:
+
+- Configured Slack channel ID and cosmetic label
+- Working directory
+- Pi binary
+- Default model and thinking level
+- Session model and thinking overrides
+- Archive and media retention
+- Per-file and total attachment limits
+- Scheduler batch limit
+- Log level
+- Created/updated timestamps
+
+Do not store a workspace/team ID. Validate identity, channel access, and membership through Slack.
+
+Fixed implementation constants, not settings:
+
+- Pi concurrency: one RPC session
+- Scheduler tick interval
+- Shutdown timeout
+- Control-protocol framing and timeout limits
+
+### Live updates
+
+Expose strictly typed commands:
+
+```text
+pi-tag-slack config show [--json]
+pi-tag-slack config set <key> <value>
+pi-tag-slack config reset <key>
+```
+
+Accept only an explicit key allowlist. Channel identity, working directory, and storage paths are structural and can change only through `setup --reset`. Arbitrary extra pi flags are unsupported; the daemon constructs the complete invariant-preserving RPC argument list.
+
+The effective model/thinking value is `session override ?? configured default`. `session ... reset` clears the override and applies the configured default; `session reset` preserves overrides. Validate requested values against pi's current RPC catalog before persistence. Persist the desired value, apply it immediately while idle or at the next safe boundary, and report `applied` or `pending`. If later application unexpectedly fails, retain the desired value, mark session health degraded, and expose desired and effective values separately. Never mutate an in-flight model turn unexpectedly.
+
+## Database schema and lifecycle
+
+Create hard-cut schema version **2**. Startup rejects every legacy, version-zero application, malformed, or newer unsupported schema with an instruction to run `setup --reset`. Do not implement data migration.
+
+The new application tables are:
+
+1. `gateway_config`
+2. `slack_events`
+3. `inbox`
+4. `tasks`
+5. `schedules`
+6. `trusted_users`
+
+Do not retain `channels`, `message_queue`, `message_log`, or routing columns.
+
+Define the complete schema SQL and review it before service implementation. Every application table uses SQLite `STRICT` mode. Use strict SQLite types, `INTEGER CHECK (... IN (0, 1))` booleans, `TEXT CHECK (json_valid(...))` JSON, explicit lifecycle/singleton checks, foreign keys, uniqueness constraints, and indexes. Validate complete rows in application code as well as with available SQLite checks.
+
+Every connection enables and verifies `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, a bounded `busy_timeout`, and `trusted_schema=OFF`. Use explicit transactions for multi-row transitions. Setup/reset and offline doctor run `quick_check`; ordinary startup does not run it.
+
+### Slack events and inbox
+
+Each accepted `slack_events` row contains at least:
+
+- Unique source identity (`slack:event:<event_id>`)
+- Event kind (`new-message`, `edit`, or `deletion`)
+- Related inbox ID and resulting inbox revision
+- Outcome
+- Nullable RPC acceptance timestamp, pi session ID, and run sequence
+- Created timestamp
+
+RPC acceptance metadata is diagnostic and supports recovery/reset sequencing; it is not an authorization boundary. Serialize Slack mutation, RPC dispatch, trust changes, and session reset through one daemon coordinator. Write acceptance metadata only after a successful RPC response. Accept the unavoidable crash ambiguity between RPC acceptance and the SQLite update; recovery summaries handle it without replay.
+
+Each inbox row contains at least:
+
+- Stable public inbox ID
+- Unique Slack message identity
+- Sender ID and display label
+- Current message content and revision
+- Slack message and root-thread timestamps
+- Attachment metadata, including Slack file IDs
+- Source-deletion timestamp, if deletion resolved an open item
+- Lifecycle state
+- Arbitrary diagnostic resolution reason and timestamps; behavior never branches on reason text
+- Managed-reaction state
+- Latest successful reply metadata, if any
+- Created/updated timestamps
+
+Lifecycle is intentionally only:
+
+```text
+open -> resolved
+```
+
+There is no `processing`, `failed`, `cancelled`, or `reopen` state. Cancellation, invalidity, and no-response-needed are resolution reasons. A resolved item may receive additional gateway replies but never becomes open again. Upstream Slack edits/deletions never change a resolved row's source content, attachments, revision, lifecycle, or resolution. Gateway-owned latest-reply metadata may still advance after an additional successful `inbox respond`.
+
+`inbox resolve` accepts one or more IDs. Validate all requested transitions before committing. `--reason` is arbitrary non-empty diagnostic text with a documented default. Automatic operations use conventional text such as `replied` or `source-deleted`, but behavior never branches on these values.
+
+### Tasks and schedules
+
+A task is a durable unit of work with the same one-way lifecycle:
+
+```text
+open -> resolved
+```
+
+Tasks contain at least:
+
+- Stable task ID
+- Source (`manual` or `schedule`)
+- Optional unique schedule-occurrence key
+- Title and instructions
+- Arbitrary diagnostic resolution reason
+- Nullable direct-notification RPC acceptance timestamp, pi session ID, and run sequence
+- Created/resolved timestamps
+
+Schedules are definitions, not work items. When a schedule becomes due, atomically create a task with a unique occurrence identity and advance the schedule. A retried scheduler tick cannot create the same task twice.
+
+Support exactly two schedule forms:
+
+- One-time `--at <ISO-8601>` values, which must include `Z` or an explicit UTC offset.
+- Recurring five-field `--cron <expression> --timezone <IANA-timezone>` definitions. Never use the daemon machine's local timezone; use Croner's documented timezone/DST behavior.
+
+Schedules are not editable in this alpha. Remove and recreate one to change title, instructions, timing, or timezone. Disabling does not accumulate missed occurrences. Re-enabling a recurring schedule chooses the next future occurrence; re-enabling a one-time schedule in the past fails. When a one-time schedule creates its task, disable the schedule atomically while retaining its definition for history.
+
+If downtime while enabled spans several recurring occurrences, create one catch-up task per schedule. Record first missed time, last missed time, and count, then advance to the next future occurrence. Use occurrence identities `schedule:<schedule-id>:at:<scheduled-UTC-time>` for ordinary/one-time work and `schedule:<schedule-id>:through:<last-missed-UTC-time>` for catch-up work. Insert the task and advance the schedule atomically. Do not flood the task list with every missed tick.
+
+## Persistent pi RPC integration
+
+Replace one-shot `pi -p` invocation with one daemon-owned subprocess:
+
+```text
+pi --mode rpc --session-dir <data-dir>/sessions/session --continue --approve
+```
+
+Use pi's strict LF-delimited JSONL RPC protocol. Do not parse RPC stdout with generic line readers that split Unicode line separators. Correlate commands and responses and consume lifecycle events including `agent_start`, `agent_settled`, queue updates, errors, and process exit.
+
+RPC is preferred over embedding the SDK because it preserves process isolation, a configurable pi binary, and a clear upgrade boundary. Pi packages may remain exact-pinned development dependencies for `import type` RPC/model types only; remove them as peer/runtime dependencies and do not expose Pi types from public declarations. The configured executable is the sole runtime integration.
+
+Document and enforce a minimum pi version matching the pinned development dependency. Setup and startup check the binary version and perform a non-destructive RPC handshake (`get_state`, model catalog, and other required state). Reject older or incompatible executables rather than adding alpha compatibility shims. Runtime-validate every RPC frame despite compile-time types. Launch with `--approve`; setup warns that project resources in the configured working directory are trusted.
+
+Handling pi extension-UI dialog requests is explicitly out of scope for this refactor. Document that user/project extensions which request headless interaction may block; do not claim extension-UI support.
+
+### Presenting new work
+
+For a newly accepted Slack event:
+
+- If pi is idle, send a normal RPC `prompt`.
+- If pi is active, send the dedicated RPC `follow_up` command.
+- Call `set_follow_up_mode` with `one-at-a-time` at RPC startup so Slack/task arrival order remains serial.
+- Serialize prompt/follow-up writes through the daemon coordinator. Maintain active state from lifecycle events and reconcile it with `get_state.isStreaming` after startup.
+- Identify event kind and inbox revision. New/edit notifications include inbox ID, sender, thread context, full current content within clear delimiters, and attachment metadata. Deletion notifications identify the now-resolved/redacted inbox item and tell pi not to continue stale work.
+- Tell pi that other open work may exist and provide concise CLI guidance.
+
+For a newly created task, use the same prompt/follow-up mechanism but identify it as a task and advertise task commands rather than inbox resolution commands. Record task RPC acceptance metadata only for direct prompt/follow-up acceptance. An aggregate recovery summary does not mark individual tasks accepted.
+
+Durable Slack ingestion is the authorization boundary. Trust only controls which events enter the system; removing trust affects future events and never resolves, suppresses, or aborts already accepted work.
+
+### Startup and process recovery
+
+Start the RPC process with the daemon. Leave it idle when there is no open inbox item or task.
+
+During daemon startup, first validate state and atomically materialize due/catch-up schedule tasks, then start RPC and send at most one recovery prompt covering both existing and newly materialized work. Do not separately notify tasks created during startup. Runtime scheduler ticks notify newly created tasks normally.
+
+On daemon startup or explicit `session reset`, send one neutral recovery prompt rather than replaying original user prompts. An automatic RPC child-process restart after a crash never sends a recovery prompt. Show:
+
+- Total open inbox count and the three most recent open inbox items
+- Total open task count and the three most recent open tasks
+- Sender/source, IDs, thread context, and safely truncated content
+- Exact commands for listing and inspecting all remaining work
+
+If pi settles or exits without resolving presented work, do not automatically wake it again. Old open work is reconsidered only when new work arrives, the daemon restarts, or the operator performs `session reset`.
+
+If pi exits unexpectedly:
+
+- Keep Slack and the control socket available.
+- Mark session health degraded.
+- Restart pi with bounded exponential backoff.
+- Stop automatic attempts after a fixed consecutive-failure threshold.
+- A new event/task resets the consecutive-failure attempt window and may trigger one fresh start attempt. If startup succeeds, present only that new work while noting that other open work exists; do not send a recovery summary. `session reset` and daemon restart are the other explicit retry paths.
+- Preserve every inbox/task record.
+- Expose the failure through `doctor`, daemon status, and session status.
+
+Pi's ordinary assistant text remains session-local. It reaches Slack only through explicit CLI commands.
+
+## Agent-facing CLI
+
+All runtime commands use the daemon control socket. Read commands provide stable human output and a consistent `--json` mode.
+
+### Inbox
+
+```text
+pi-tag-slack inbox list [--state <open|resolved|all>] [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack inbox show <inbox-id> [--json]
+pi-tag-slack inbox respond <inbox-id> --text <text> [--file <path> ...]
+pi-tag-slack inbox resolve <inbox-id> [<inbox-id> ...] [--reason <text>]
+pi-tag-slack inbox working <inbox-id>
+```
+
+There is no `inbox reopen`. Inbox-aware operations remain in this command group because they may change durable inbox state or managed reactions.
+
+`inbox respond <inbox-id>`:
+
+1. Derives the source Slack thread.
+2. Calls Slack.
+3. On confirmed success, resolves an open item as `replied` and removes gateway-managed reactions.
+4. On an already resolved item, posts an additional reply without changing lifecycle, unless structured `source_deleted_at` is set.
+5. A source-deleted item rejects response with stable `SOURCE_DELETED`; behavior uses the structured field, never resolution-reason text.
+6. On Slack failure, returns a clear error and leaves lifecycle unchanged.
+7. If Slack succeeds but SQLite resolution fails, returns an explicit partial-success error with the Slack timestamp and tells pi to inspect before retrying.
+
+Do not add a durable outbox. Accept the unavoidable crash ambiguity around an external Slack call; pi can inspect live Slack before deciding whether to resend. Client timeout/disconnection does not cancel an already-started Slack operation. The daemon continues and records the outcome where applicable; the CLI reports stable `OUTCOME_UNKNOWN` with its request ID and instructs the caller to inspect Slack/inbox state before retrying.
+
+### Slack navigation and communication
+
+```text
+pi-tag-slack slack history [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack slack message <message-ts> [--json]
+pi-tag-slack slack thread <thread-ts> [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack slack file download <file-id> [--json]
+pi-tag-slack slack send [--thread <thread-ts>] --text <text> [--file <path> ...]
+```
+
+Every Slack command is structurally restricted to the configured conversation. There is no `--channel` option.
+
+`slack history`, `message`, and `thread` fetch live Slack data on demand. They do not ingest or persist ambient channel history. Add explicit pagination, item limits, response-size limits, and cursors.
+
+`slack file download` is exclusively agent/operator initiated. Ingestion stores metadata only. Before downloading, verify through Slack that the file belongs to the configured conversation, enforce configured size limits, sanitize names, and store it beneath the canonical media directory. A file deleted before download may be unavailable.
+
+Outbound `--file` accepts any daemon-readable regular file; same-UID path restrictions are not a security boundary. Reject missing paths, directories, devices, sockets, and symlinks; enforce per-file and aggregate limits; resolve/re-stat identity and size immediately before upload; and document unavoidable same-UID TOCTOU limits.
+
+`slack send` communicates only. With `--thread`, it replaces the former separate thread-reply command. It never changes inbox/task lifecycle or managed reactions.
+
+### Receipt and work reactions
+
+Reactions are visible receipt/work indicators, not queue ownership:
+
+- After durable insertion, add `👀` to acknowledge receipt.
+- `inbox working <inbox-id>` replaces `👀` with `⏳` for an open item.
+- Successful `inbox respond <inbox-id>` removes all gateway-managed reactions from that source message.
+- `inbox resolve` without a recorded reply replaces receipt/work reactions with `✅`.
+- If pi crashes or resets, revert open items marked `⏳` to `👀` best-effort.
+- Never remove user-managed reactions.
+- Reaction failures do not affect inbox correctness. Retain desired state, last successful state, last attempt/error, and backoff eligibility.
+- Reconcile immediately after relevant durable transitions, once at startup, and on a fixed bounded interval with backoff. A confirmed deleted source clears desired reaction state. Reconciliation never wakes pi or changes lifecycle.
+
+### Tasks and schedules
+
+```text
+pi-tag-slack task add --title <text> --instructions <text>
+pi-tag-slack task list [--state <open|resolved|all>] [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack task show <task-id> [--json]
+pi-tag-slack task resolve <task-id> [<task-id> ...] [--reason <text>]
+
+pi-tag-slack schedule add --title <text> --instructions <text> --at <ISO-8601>
+pi-tag-slack schedule add --title <text> --instructions <text> --cron <five-field-expression> --timezone <IANA-timezone>
+pi-tag-slack schedule list [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack schedule show <schedule-id> [--json]
+pi-tag-slack schedule remove <schedule-id>
+pi-tag-slack schedule enable <schedule-id>
+pi-tag-slack schedule disable <schedule-id>
+```
+
+Task communication and resolution are separate. Pi uses `slack send`, optionally with `--thread`, then `task resolve`. A silent housekeeping task may be resolved without Slack output. Manual and agent invocations are intentionally indistinguishable under the same-UID authorization model, so every `task add` source is `manual`; only scheduler-created tasks use `schedule`.
+
+### Trust
+
+```text
+pi-tag-slack trust list [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack trust add <U...|W...>
+pi-tag-slack trust remove <U...|W...>
+```
+
+`trust add` validates and cosmetically labels the user through Slack before committing. An empty trust list is valid and disables all future inbound Slack admission without affecting existing work. Trust changes never mutate existing inbox/event rows or abort pi.
+
+### Session
+
+Retain model/thinking inspection and selection, but replace `session stop` and `session new` with one command and use consistent nested verbs:
+
+```text
+pi-tag-slack session status [--json]
+pi-tag-slack session reset
+
+pi-tag-slack session model list [--json]
+pi-tag-slack session model set <ref>
+pi-tag-slack session model reset
+
+pi-tag-slack session thinking set <off|minimal|low|medium|high|xhigh|max>
+pi-tag-slack session thinking reset
+
+pi-tag-slack session archive list [--limit <n>] [--cursor <opaque>] [--json]
+pi-tag-slack session archive cleanup
+```
+
+`session reset`:
+
+1. Aborts active pi work if confirmed.
+2. Waits for process termination.
+3. Archives the active session.
+4. Starts a fresh persistent RPC session.
+5. Preserves model, thinking, cwd, inbox items, tasks, and schedules.
+6. Sends the normal recovery summary if open work exists.
+
+If pi is active, the first reset attempt fails safely and prints risks plus an exact confirmation command. Confirmation is deterministic and stale-safe:
+
+```text
+pi-tag-slack session reset --confirm <session-id>:<active-run-sequence>
+```
+
+The run sequence increments for each accepted prompt/follow-up. Confirmation succeeds only while that exact session/run remains active. The socket response must be flushed before aborting pi. Local operators and pi receive the same challenge. Do not use special agent-origin behavior or automatically resolve a triggering inbox item.
+
+## Local authorization model
+
+Pi and the local operator have equal CLI authority. Pi already has shell access as the daemon OS account, so environment markers are not a meaningful privilege boundary.
+
+- Authorization relies on the daemon-owned `0700` data directory and daemon-owned `0600` socket. Exact peer-credential verification is deliberately not implemented because Node lacks a portable API and native dependencies are out of scope. Root is outside the threat model.
+- Do not treat inbox IDs, task IDs, thread timestamps, session IDs, or environment claims as authorization.
+- Do not add a per-invocation provenance capability for special control behavior; there is no special agent-origin path.
+- Advertise only workflow-relevant commands in the prompt, but do not claim unadvertised commands are inaccessible.
+- Document that trusted Slack users can influence an agent running with the daemon account's local capabilities.
+
+Future privilege separation requires a distinct OS identity or a real sandbox.
+
+## Control socket protocol
+
+Listen at `<data-dir>/control.sock` using one request per connection:
+
+1. Connect.
+2. Send exactly one LF-terminated JSON object.
+3. Receive exactly one LF-terminated JSON object.
+4. Server closes the connection.
+
+Request shape:
+
+```json
+{
+  "version": 1,
+  "id": "client-correlation-id",
+  "command": "inbox.list",
+  "params": {}
+}
+```
+
+Responses echo `id` and contain exactly one of `result` or `error`. Errors contain stable machine codes and human messages. Unsupported versions fail; do not negotiate.
+
+Fixed, tested protocol safeguards:
+
+- Maximum request and response frame sizes
+- Strict LF framing and UTF-8/JSON/schema validation
+- Rejection of second/trailing frames
+- Defined EOF-before-LF behavior
+- Partial-frame and idle timeouts
+- Default command deadlines and explicit longer Slack-network deadlines
+- No file bytes in the protocol; file commands pass validated paths/IDs
+
+### Socket security and lifecycle
+
+- Rely on private parent-directory and socket ownership/modes for local access control; do not claim peer-UID or root exclusion.
+- Create the private parent directory before binding.
+- Refuse a non-socket path, foreign-owned socket, symlink, or unsafe parent.
+- Probe before removing an owned stale socket.
+- Remove the socket during graceful shutdown.
+- Runtime CLI commands fail immediately and clearly when unavailable; they are never persisted as control requests.
+
+Use an OS-held exclusive lock on `<data-dir>/gateway.lock` as the actual daemon/setup concurrency guarantee. The daemon holds it before opening SQLite or binding the socket. Setup/reset must acquire the same lock. Socket absence alone never proves the daemon is stopped.
+
+## Hard-cut setup and crash-safe reset
+
+### Setup flow
+
+1. Resolve canonical paths and validate private ownership/modes.
+2. Acquire the exclusive gateway lock.
+3. Check pi installation/authentication.
+4. Collect and validate both Slack tokens.
+5. Run `auth.test`.
+6. Require a raw `C...` or `G...` channel ID.
+7. Call `conversations.info`, reject DMs/MPIMs by metadata, verify access and bot membership, and fetch the label.
+8. Collect the initial trusted `U...`/`W...` user and typed operational defaults.
+9. Validate every input and perform every non-destructive network check before reset work.
+10. Stage and validate fresh config/database/layout.
+11. Install them through the journaled reset algorithm below.
+12. In interactive setup, install/start the user service. In non-interactive setup, print the explicit daemon install/start steps.
+
+On daemon startup, refresh the channel label best-effort. A confirmed membership loss is fatal with `/invite @pi` remediation; a cosmetic label lookup failure alone is not fatal.
+
+### Backup bundle
+
+Every legacy replacement or current-schema reset requires confirmation and creates one non-overwritten bundle:
+
+```text
+<data-dir>/backups/reset-<UTC-timestamp>-<collision-counter>/
+  manifest.json
+  gateway.db
+  config.env
+  session/
+```
+
+- Create the bundle first under a private staging name.
+- Generate `gateway.db` through SQLite's backup API after an explicit checkpoint attempt, while holding the gateway lock. This captures committed WAL data into one database image; do not copy only the main DB file.
+- Validate the backup with `quick_check`, expected schema metadata where readable, and a reopen test.
+- Copy the bootstrap config and active session with restrictive permissions.
+- Record source paths, schema version, hashes/size metadata, and bundle phase in `manifest.json`.
+- Fsync files and containing directories at durability boundaries.
+- Atomically rename the validated staged bundle to its collision-free final name.
+- Never overwrite an existing bundle.
+- Treat the bundled session as the archived pre-reset session.
+- Exempt reset bundles and legacy backups from ordinary archive/media cleanup.
+
+Do not proceed destructively if checkpoint, backup, copy, validation, or durability steps fail. Explicitly handle and test `gateway.db-wal` and `gateway.db-shm`; never leave old sidecars beside a newly installed database.
+
+### Staging and installation
+
+Before changing active state:
+
+- Create fresh config and database candidates in private temporary paths adjacent to their final targets.
+- Create the fresh session/layout candidate.
+- Reopen and validate the new database, singleton row, trust list, schema version, and `quick_check`.
+- Parse the generated bootstrap config and validate exact values and mode `0600`.
+- Validate all resulting paths and permissions.
+
+Then write and fsync a reset journal containing the backup bundle, staged paths, active paths, rollback paths, and current phase.
+
+Install through portable atomic renames. Generate collision-free rollback/bundle names, verify destinations are absent, hold the gateway lock, and operate only in daemon-owned private directories. Ordinary POSIX rename is acceptable under those conditions; do not require Linux-only `RENAME_NOREPLACE` or native bindings:
+
+1. Move active config, database, WAL/SHM sidecars, and session to unique rollback paths.
+2. Rename staged fresh paths into place.
+3. Fsync each containing directory.
+4. Reopen and validate the installed database/config/layout.
+5. Mark the journal complete and fsync it.
+6. Remove temporary rollback state only after installed-state validation.
+7. Remove the completed journal last.
+
+A process error attempts rollback from the untouched rollback paths or validated backup bundle. Never print setup success, install/start a daemon, or update completion messaging after a partial failure.
+
+### Interrupted reset recovery
+
+Daemon startup refuses to run when an incomplete reset journal exists and instructs the operator to run plain `pi-tag-slack setup`. Setup automatically enters deterministic recovery mode whenever it detects an incomplete journal. Interactive recovery clearly announces the operation and requires confirmation; non-interactive recovery requires `--yes`.
+
+Recovery acquires the gateway lock, validates the bundle/journal, removes partial fresh state, restores config/database/session through staged atomic replacement, removes stale WAL/SHM sidecars, revalidates permissions and SQLite, and clears the journal only after durable success. It does not guess or silently roll forward.
+
+Add failure injection after every destructive rename/write/fsync and a test whose latest committed row exists only in WAL when reset starts.
+
+## Slack ingestion and manifest
+
+Subscribe to `message.channels` and `message.groups`, not `app_mention`, so edits and deletions can be tracked without duplicate event streams. Before user lookup, attachment work, persistence, reaction, or response:
+
+1. Reject bot-authored and unsupported events.
+2. Reject DMs and MPIMs, using conversation metadata rather than the ambiguous `G...` prefix alone.
+3. Reject a channel mismatch.
+4. Attribute the event to a trusted sender. If a deletion has no attributable trusted user, acknowledge and ignore it even if an open inbox item remains.
+5. Validate the top-level `event_id`.
+6. For a new message, require a real raw `<@BOT_ID>` mention. For an edit/deletion, require an existing open inbox item but no repeated mention.
+
+A new thread reply is a new message and must mention pi again. Strip the bot mention from agent-visible new-message content. A mentioned attachment-only event remains valid. Store file metadata but do not download it. An open-item edit replaces current text/attachment metadata, increments revision, and triggers a notification. An open-item deletion redacts source text/attachments, resolves as `source-deleted`, and triggers one best-effort deletion notification. Deletion notifications are not durably replayed after a crash; stale `inbox respond` is instead prevented by structured `source_deleted_at`. Mutations of resolved or unknown items are safely ignored.
+
+Acknowledge ignored events immediately after local validation. Acknowledge relevant trusted events only after SQLite reports a committed insert/update/no-op or duplicate. Keep the pre-ack path free of Slack network calls; enrichment, reactions, and RPC notification happen afterward. Use the trusted-user record's cosmetic label or initially store the sender ID rather than delaying durability for lookup.
+
+Verify new-message, edit, deletion, attribution, file, and thread payloads through Socket Mode public/private smoke tests. Live Slack CLI reads may fetch missing context.
+
+Remove multi-channel registration/discovery, DMs, slash commands, Block Kit controls, trigger names, channel policy, excluded-channel policy, and App Home controls.
+
+Update `manifest.yaml` to remove `/pi`, interactivity, `app_mention`, DM/MPIM events/scopes, and writable App Home. Retain only `message.channels`/`message.groups` subscriptions and scopes required for configured public/private conversation lookup/history, users, replies, files, and reactions. Document manifest reapplication and app reinstall/approval.
+
+## Public CLI organization
+
+Route through the socket:
+
+- `inbox ...`
+- `slack ...`
+- `task ...`
+- `schedule ...`
+- `session ...`
+- `config ...`
+- `trust ...`
+
+Keep local/offline:
+
+- `setup [--reset] [--yes]`
+- `daemon install|uninstall|start|stop|status|logs`
+- `doctor`
+
+When the daemon is available, `doctor` obtains database/session health through the control socket. Otherwise it may acquire the gateway lock and inspect SQLite read-only. It never opens SQLite while the lock is held by another process, performs no repair, and reports lock failure rather than bypassing it.
+
+- `help`
+
+The service continues to execute the public `start` entrypoint. Foreground start is not the normal documented workflow.
+
+Plain `setup` creates state only when no application state exists, except that an incomplete reset journal makes it enter recovery mode. `setup --reset` is the sole destructive/structural reconfiguration path. Interactive reset displays backup/replacement paths and requires typing `RESET`; non-interactive reset requires `--reset --yes`. No environment condition or missing stdin implies consent.
+
+Public IDs are prefixed SQLite integer IDs (`inbox-42`, `task-17`, `schedule-3`) and are never authorization secrets or Slack delivery identities. Gateway timestamps use UTC ISO 8601 strings with millisecond precision; Slack `ts`/`thread_ts` remain original decimal strings. Successful `--json` commands emit their direct payload with exactly one JSON value on stdout. Failures emit `{ "error": { "code": "...", "message": "..." } }` and exit nonzero; logs go to stderr. List payloads are objects with `items` and nullable `nextCursor`. Every unbounded list uses opaque cursor pagination with default limit 50 and hard maximum 200 plus a response-byte bound. Inbox/task lists default to open items and sort newest-first with ID tie-breaking.
+
+## Tests
+
+### Inbox and Slack idempotency
+
+- Stable top-level `event_id` extraction from full Bolt event bodies.
+- Unique event identity plus unique Slack message identity.
+- Atomic event-ledger and inbox create/update/delete transactions.
+- Concurrent duplicate delivery and distinct new-message events for one Slack message.
+- Redelivery before and after daemon restart.
+- Mentioned text, file-share, and thread-reply duplicates.
+- Open-message edits replace content/attachments, increment revision, and notify once without requiring another mention.
+- Trusted open-message deletion redacts/resolves and notifies once.
+- Resolved/unknown mutations and unattributable/untrusted events are acknowledged, ignored, not persisted, and never crash.
+- Invalid/missing event ID rejection without fallback.
+- No enrichment, reactions, inbox mutation, or RPC notification on duplicate.
+- Indefinite accepted-event and terminal-row deduplication.
+
+### Agent notification and recovery
+
+- Idle prompt versus active one-at-a-time follow-up.
+- Full new-event prompt formatting and delimiting.
+- Task prompt formatting.
+- Final assistant output is never auto-posted.
+- No automatic re-wake after a clean unresolved turn.
+- New events/tasks still trigger later inspection.
+- Daemon startup/session reset sends one recovery summary, not original prompt replay.
+- Automatic RPC child restart sends no recovery prompt.
+- Startup scheduler catch-up is included in the one recovery summary without separate notifications.
+- New work after exhausted restart attempts triggers one fresh start and presents only the new work.
+- Recovery summary totals and most recent three items of each kind.
+- Crash between RPC acceptance and daemon bookkeeping.
+- Direct task notifications record acceptance metadata; aggregate recovery does not mark individual tasks accepted.
+- Deletion notification is best-effort and is not replayed; stale response is prevented by `SOURCE_DELETED`.
+- Pi crash/restart backoff and degraded health.
+- Trust is checked only at event ingestion; later revocation changes only future admission.
+- The final trusted user may be removed; an empty trust list is valid and existing work is unchanged.
+
+### Inbox, task, and schedule lifecycle
+
+- Only `open -> resolved`; no reopening.
+- Additional `inbox respond` to a resolved inbox item, and `SOURCE_DELETED` rejection when `source_deleted_at` is set.
+- Multi-ID resolution validation.
+- Arbitrary diagnostic resolution reasons never drive behavior.
+- Resolved source snapshots ignore upstream Slack mutations while gateway reply metadata may advance.
+- Schedule occurrence uniqueness and exact occurrence-key formats.
+- One-time task creation atomically disables and retains its schedule; past re-enable fails.
+- Required IANA timezone/offset validation and DST behavior.
+- Disabled intervals do not catch up; recurring re-enable advances to a future occurrence; past one-time re-enable fails.
+- Coalesced downtime catch-up task with first/last/count.
+- Unresolved tasks are not repeatedly notified.
+
+### Slack CLI and reactions
+
+- Every Slack command is constrained to the configured conversation.
+- Live history/message/thread pagination and size bounds.
+- `slack send --thread` behavior and absence of a separate thread-reply command.
+- On-demand file download ownership, size, path, deletion, and authorization cases.
+- Outbound regular-file/symlink/device checks, re-stat behavior, per-file/aggregate limits, and outcome-unknown timeout behavior.
+- `👀 -> ⏳`, `inbox respond` cleanup, silent-resolution `✅`, and crash/reset reversion.
+- Never remove user reactions.
+- Slack failure leaves inbox open.
+- Slack-success/SQLite-failure partial-success reporting.
+- Human and `--json` output contracts.
+
+### Persistent RPC and session controls
+
+- Strict RPC JSONL parsing and correlation.
+- Follow-up ordering.
+- RPC process shutdown/escalation and restart.
+- Minimum pi version and startup capability handshake.
+- RPC uses compile-time dev-dependency types but runtime-validates every frame and has no runtime Pi package dependency.
+- Dedicated `follow_up`, one-at-a-time configuration, and coordinator serialization.
+- Nested model/thinking command parsing, `max`, desired/effective status, and application at safe boundaries.
+- Reset while idle.
+- Active reset challenge using `<session-id>:<run-sequence>`.
+- Stale/wrong confirmation rejection.
+- Socket response flush before active process termination.
+- Reset preserves open inbox/tasks and operational settings.
+
+### Socket and local security
+
+- One request/response per connection.
+- Partial, oversized, malformed, invalid-version, second-frame, and timeout cases.
+- Stable error codes and request correlation.
+- Filesystem authorization through private directory/socket ownership and modes; no peer-credential or root-exclusion claim.
+- Directory/socket ownership and modes.
+- Unsafe/non-private custom roots.
+- Non-socket, foreign-owned, symlink, and stale-socket races.
+- Gateway lock exclusion between setup and daemon.
+
+### Singleton, paths, and configuration
+
+- Schema version is exactly 2 and every application table is SQLite `STRICT`.
+- Required WAL/FULL/foreign-key/busy-timeout/trusted-schema PRAGMAs are applied and verified.
+- Second singleton insert rejection.
+- Missing-row and malformed-row startup failures.
+- Malformed JSON/timestamps fail database checks where possible and complete application validation.
+- `NULL` optional values and strict checks.
+- Complete-row validation before update.
+- Defaults and overrides across RPC/session restart.
+- Canonical path derivation and conflicting legacy override removal.
+- Resolved-path diagnostics and permissions.
+
+### Reset and backup
+
+- Legacy and current-schema confirmation paths.
+- Consistent SQLite backup with uncheckpointed WAL data.
+- Existing WAL/SHM handling.
+- Bundle naming collisions never overwrite.
+- Bundle manifest/config/session/database validation.
+- Reset backup cleanup exemption.
+- Fresh staging validation before destructive work.
+- Failure injection at every destructive step.
+- Startup refusal on incomplete journal.
+- Plain `setup` detects the incomplete journal and performs confirmed restoration durably; non-interactive recovery requires `--yes`.
+- No partial success output, daemon install, or stale token/config pointer.
+
+### Product surface
+
+- Single channel, real mention on new messages, event-time trusted sender, and DM/MPIM rejection.
+- Setup channel membership/type and label validation.
+- `message.channels`/`message.groups` new/edit/delete smoke tests and absence of `app_mention`, slash, interactivity, and DM features.
+- Stable prefixed IDs, ISO/Slack timestamp formats, direct success JSON, error envelopes, opaque pagination, defaults, sorting, and bounds.
+- Removal of channels, policies, slash handlers, panels, queue routing, and multi-channel concurrency tests.
+- Documentation and prompt examples use only the new CLI.
+
+## Implementation sequence
+
+1. Introduce canonical path resolution, ownership checks, and gateway locking.
+2. Write and review the complete schema-v2 SQL, repository transition rules, public ID/timestamp formats, JSON fixtures, and stable error-code list before service implementation.
+3. Implement strict schema initialization/validation, the event ledger, singleton, inbox/task/schedule/trust repositories, required PRAGMAs, and hard schema rejection.
+4. Build strict control-socket framing, filesystem authorization, errors, pagination, and client plumbing.
+5. Replace one-shot pi execution with the version-checked persistent RPC lifecycle/coordinator.
+6. Implement event-idempotent new/edit/delete Slack ingestion and prompt/follow-up notification.
+7. Implement inbox/task/schedule/trust and live Slack CLI services.
+8. Implement reaction reconciliation and on-demand attachment download/upload validation.
+9. Implement desired/effective session model/thinking controls and confirmed reset.
+10. Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation.
+11. Remove multi-channel, DM, slash command, panel, legacy queue, Pi runtime imports/peers, and obsolete config code.
+12. Update manifest, documentation, changelog, diagnostics, and daemon definitions.
+13. Add failure-injection, restart, Socket Mode mutation, systemd, and launchd validation.
+
+Keep each checkpoint buildable/testable where practical; do not switch the active schema while old runtime consumers still require legacy tables.
+
+## Validation and rollout
+
+Run:
+
+1. Formatting
+2. Lint
+3. Unit/integration tests
+4. TypeScript build
+5. Frozen-lockfile install and production audit
+6. Manual Linux systemd smoke test
+7. Manual macOS launchd smoke test where available
+8. Socket Mode public/private configured-conversation smoke test
+9. Mentioned text, attachment metadata/download, and thread tests
+10. Active follow-up, pi crash, and recovery-summary tests
+11. Session reset confirmation tests
+12. WAL reset and interrupted-reset recovery through plain `setup` tests
+
+Release as explicitly breaking under the pre-1.0 policy. The changelog must tell operators to stop the old daemon, preserve existing data, run setup, apply the new Slack manifest, and reinstall/start the service. Never delete legacy sessions or reset backup bundles.
+
+## Definition of done
+
+The refactor is complete when one canonical daemon owns one configured Slack conversation and one persistent pi RPC session; Slack retries cannot duplicate inbox creation, mutation, or notification effects; pi can navigate live Slack and manage durable inbox/tasks through the CLI; restart recovery delegates semantic decisions without blindly replaying prompts; operational state has one storage root and one typed configuration authority; session reset is explicit and stale-safe; the control socket has a complete framing/authorization contract; setup/reset is WAL-safe, journaled, recoverable, and failure-injection tested; and all obsolete multi-channel and Slack UI behavior is removed.
