@@ -379,6 +379,7 @@ export function buildConfigFile(options: {
     '',
     '# Pi agent configuration',
     assignment('PI_BIN', 'pi'),
+    assignment('PATH_PREPEND', ''),
     assignment('PI_MODEL', ''),
     assignment('PI_THINKING', ''),
     assignment('PI_CWD', options.workingDir),

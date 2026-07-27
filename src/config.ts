@@ -1,7 +1,7 @@
 import { parse } from 'dotenv';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, resolve } from 'node:path';
+import { delimiter, isAbsolute, resolve } from 'node:path';
 
 const DEFAULT_CONFIG_PATH = defaultConfigPath();
 const DEFAULT_DATA_DIR = defaultDataDir();
@@ -124,6 +124,18 @@ function parseDmPolicy(value: string): DmPolicy {
   return 'open';
 }
 
+function parsePathPrepend(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(delimiter)
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map(resolveUserPath),
+    ),
+  ];
+}
+
 export const config = {
   /** Slack bot token, xoxb- prefix (required) */
   slackBotToken: env('SLACK_BOT_TOKEN'),
@@ -133,6 +145,9 @@ export const config = {
 
   /** Pi binary path */
   piBin: env('PI_BIN', 'pi'),
+
+  /** Directories prepended to PATH for commands launched by the gateway */
+  pathPrepend: parsePathPrepend(env('PATH_PREPEND')),
 
   /** Default model for pi */
   piModel: env('PI_MODEL'),

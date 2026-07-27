@@ -21,6 +21,7 @@ const CONFIG_ENV_KEYS = [
   'PI_EXTRA_FLAGS',
   'PI_MODEL',
   'PI_THINKING',
+  'PATH_PREPEND',
   'POLL_INTERVAL_MS',
   'SESSIONS_DIR',
   'SHUTDOWN_TIMEOUT_MS',
@@ -71,6 +72,21 @@ describe('resolveConfigPath', () => {
 });
 
 describe('config loading', () => {
+  it('expands, normalizes, and deduplicates PATH_PREPEND directories', async () => {
+    const homeDir = createTempDir();
+    const configPath = resolve(homeDir, 'config.env');
+    writeEnvFile(configPath, {
+      PATH_PREPEND: '~/tools:/opt/tools:~/tools',
+    });
+
+    stubHomeDir(homeDir);
+    process.env.PI_TAG_SLACK_CONFIG = configPath;
+
+    const { config } = await loadConfigModule();
+
+    expect(config.pathPrepend).toEqual([resolve(homeDir, 'tools'), '/opt/tools']);
+  });
+
   it('merges process env over config file over cwd .env fallback', async () => {
     const homeDir = createTempDir();
     const workDir = createTempDir();

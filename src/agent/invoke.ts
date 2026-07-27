@@ -11,6 +11,7 @@ import {
 } from '../session/path.js';
 import type { AgentResult } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
+import { commandEnv } from '../command-env.js';
 
 export interface SessionTokenUsage {
   input: number;
@@ -116,7 +117,7 @@ export async function invokeAgent(
   return new Promise<AgentResult>((resolve, reject) => {
     const proc = spawn(effectiveBin, effectiveArgs, {
       cwd: effectiveCwd,
-      env: process.env,
+      env: commandEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -328,7 +329,7 @@ async function getSessionStatsViaRpc(
   return new Promise((resolve, reject) => {
     const proc = spawn(rpcBin, rpcArgs, {
       cwd,
-      env: process.env,
+      env: commandEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
