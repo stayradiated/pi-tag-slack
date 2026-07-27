@@ -12,10 +12,8 @@ import {
   acquireGatewayLock,
   ensurePrivateFile,
   ensurePrivateLayout,
-  gatewayPaths,
   structuralPathExists,
 } from './paths.js';
-import { unlinkSync } from 'node:fs';
 
 export function startupRecoveryPrompt(): string | undefined {
   const work = openWorkSummary();
@@ -126,13 +124,11 @@ export async function startGateway(): Promise<void> {
     clearSlackClient();
     await slack?.stop();
     await pi?.stop();
-    await new Promise<void>((resolve) => server?.close(() => resolve()) ?? resolve());
     if (server) {
       try {
-        unlinkSync(gatewayPaths().socket);
+        await server.close();
       } catch {
-        // Socket cleanup is best effort; preserving an earlier startup/shutdown
-        // error is more important than reporting a stale socket cleanup failure.
+        // Preserve an earlier startup/shutdown failure over best-effort cleanup.
       }
     }
     closeDb();

@@ -7,7 +7,6 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -311,12 +310,7 @@ describe('control socket', () => {
         error: { code: 'TRAILING_DATA' },
       });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      try {
-        unlinkSync(socketPath);
-      } catch {
-        // The operating system may have already removed the Unix socket.
-      }
+      await server.close();
       closeDb();
       if (previous === undefined) delete process.env.PI_TAG_SLACK_DATA_DIR;
       else process.env.PI_TAG_SLACK_DATA_DIR = previous;

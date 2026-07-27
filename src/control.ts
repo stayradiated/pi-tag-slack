@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
-import { lstatSync, unlinkSync } from 'node:fs';
+import { lstatSync, renameSync, unlinkSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { TextDecoder } from 'node:util';
 import type Database from 'better-sqlite3';
 import { assertPrivateSocket, gatewayPaths, structuralPathExists } from './paths.js';
@@ -281,7 +283,9 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     case 'session.model.list':
       if (!services?.sessionControls)
         fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
-      return services.coordinator.run(async () => ({ models: await services.sessionControls!.availableModels() }));
+      return services.coordinator.run(async () => ({
+        models: await services.sessionControls!.availableModels(),
+      }));
     case 'session.model.set': {
       if (!services?.sessionControls)
         fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
@@ -718,19 +722,100 @@ async function staleSocket(path: string): Promise<boolean> {
   });
 }
 
-export async function startControlServer(services?: ControlServices): Promise<Server> {
-  const path = gatewayPaths().socket;
-  // existsSync deliberately returns false for dangling symlinks; lstat-based
-  // structuralPathExists makes those unsafe paths a startup failure instead.
+type SocketIdentity = { dev: number; ino: number };
+
+function socketIdentity(path: string): SocketIdentity {
+  const stat = lstatSync(path);
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function isOwnedSocket(path: string, identity: SocketIdentity): boolean {
+  try {
+    const current = socketIdentity(path);
+    return current.dev === identity.dev && current.ino === identity.ino;
+  } catch {
+    return false;
+  }
+}
+
+function unlinkOwnedSocket(path: string, identity: SocketIdentity): void {
+  if (isOwnedSocket(path, identity)) unlinkSync(path);
+}
+
+export interface ControlServer {
+  /** Closes the listener and removes only the socket inode this server bound. */
+  close(): Promise<void>;
+  lastError(): Error | null;
+}
+
+export type ControlServerOptions = {
+  path?: string;
+  /** Test/embedding hook for reporting an asynchronous listener failure. */
+  onRuntimeError?: (error: Error) => void;
+  /** Internal validation seam used to exercise post-bind cleanup. */
+  validateBoundSocket?: (path: string) => void;
+  /** Internal seam for observing a listener's runtime error handling. */
+  onServerCreated?: (server: Server) => void;
+};
+
+/**
+ * Move a replacement aside while Node closes its Unix listener: Node's own
+ * close implementation unlinks by pathname, so identity checking only after
+ * close would be too late to protect a replacement.
+ */
+function protectReplacement(path: string, identity: SocketIdentity): string | undefined {
+  if (!structuralPathExists(path) || isOwnedSocket(path, identity)) return undefined;
+  const parked = join(dirname(path), `.${basename(path)}.closing-${randomUUID()}`);
+  renameSync(path, parked);
+  return parked;
+}
+
+async function closeOwnedServer(
+  server: Server,
+  path: string,
+  identity: SocketIdentity,
+): Promise<void> {
+  const parked = protectReplacement(path, identity);
+  let closeError: Error | undefined;
+  await new Promise<void>((resolve) => {
+    server.close((error) => {
+      closeError = error ?? undefined;
+      resolve();
+    });
+  });
+  try {
+    unlinkOwnedSocket(path, identity);
+  } finally {
+    if (parked && !structuralPathExists(path)) renameSync(parked, path);
+  }
+  if (closeError) throw closeError;
+}
+
+export async function startControlServer(
+  services?: ControlServices,
+  options: ControlServerOptions = {},
+): Promise<ControlServer> {
+  const path = options.path ?? gatewayPaths().socket;
+  // lstat-based structuralPathExists deliberately treats dangling symlinks as
+  // existing so neither bind nor stale-socket cleanup can follow one.
   if (structuralPathExists(path)) {
     assertPrivateSocket(path);
+    const staleIdentity = socketIdentity(path);
     if (!(await staleSocket(path))) throw new Error(`Control socket is already live: ${path}`);
-    unlinkSync(path);
+    unlinkOwnedSocket(path, staleIdentity);
   }
   const server = createServer((socket) => serve(socket, services));
-  // Keep a runtime handler after bind. Without one, a later server error is an
-  // unhandled EventEmitter error that can terminate the daemon unexpectedly.
-  server.on('error', () => undefined);
+  let listening = false;
+  let runtimeError: Error | null = null;
+  server.on('error', (error) => {
+    if (!listening) return;
+    runtimeError = error;
+    if (options.onRuntimeError) options.onRuntimeError(error);
+    else console.error(`Control server runtime error: ${error.message}`);
+  });
+  options.onServerCreated?.(server);
+  let identity: SocketIdentity | undefined;
+  let closePromise: Promise<void> | undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {
@@ -745,16 +830,26 @@ export async function startControlServer(services?: ControlServices): Promise<Se
       server.once('listening', onListening);
       server.listen(path);
     });
+    listening = true;
+    // Capture immediately after listen, before any validation can fail.
+    identity = socketIdentity(path);
     assertPrivateSocket(path);
-    return server;
+    options.validateBoundSocket?.(path);
+    return {
+      close: () => (closePromise ??= closeOwnedServer(server, path, identity!)),
+      lastError: () => runtimeError,
+    };
   } catch (error) {
-    // A post-bind validation failure must not leave a listening server/socket.
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    try {
-      const stat = lstatSync(path);
-      if (stat.isSocket()) unlinkSync(path);
-    } catch {
-      // Preserve the bind/validation failure; cleanup is best effort.
+    // Post-bind validation failures use precisely the same identity-safe close
+    // path as ordinary shutdown, including protection for replacement paths.
+    if (identity) {
+      try {
+        await closeOwnedServer(server, path, identity);
+      } catch {
+        // Preserve the startup failure as the useful operator diagnostic.
+      }
+    } else {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
     throw error;
   }
