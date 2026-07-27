@@ -15,7 +15,7 @@ Legend:
 ### What exists now
 
 - `[x]` Canonical data-path derivation through `PI_TAG_SLACK_CONFIG` and `PI_TAG_SLACK_DATA_DIR`, plus derivation of the planned operational paths.
-- `[~]` Private structural directory/file handling and an atomic lock file. Existing database symlinks, structural-path ancestor symlinks, foreign-owned data-layout paths, unsafe bootstrap files, and dangling control-socket paths are rejected during covered flows; staged setup reopens/quick-checks its database and validates its bootstrap candidate. Comprehensive parent-layout, durability, and rollback handling remain incomplete. The lock is not an OS-held lock.
+- `[~]` Private structural directory/file handling and an OS-held gateway lock. The persistent regular `gateway.lock` is opened with no-follow semantics, validated as same-UID mode `0600` regular file, lstat/fstat identity-checked, and held with non-blocking `flock` on its retained descriptor; release only unlocks/closes and never unlinks. Existing database symlinks, structural-path ancestor symlinks, foreign-owned data-layout paths, unsafe bootstrap files, and dangling control-socket paths are rejected during covered flows; staged setup reopens/quick-checks its database and validates its bootstrap candidate. Comprehensive parent-layout, durability, and rollback handling remain incomplete.
 - `[~]` Schema version 2 creates exactly the six planned `STRICT` tables, basic inbox/task indexes, no-reopen triggers, the configuration singleton, public IDs, and a synchronous transactional event-ledger/inbox mutation helper. Schema validation compares complete canonical table/index/trigger SQL definitions as well as structural names, but complete non-config row validators and the remaining lifecycle/timestamp/JSON constraints are incomplete.
 - `[~]` WAL, `synchronous=FULL`, foreign keys, busy timeout, and `trusted_schema=OFF` are applied. They are not comprehensively read back and verified, and setup does not run the required `quick_check`/reopen validation.
 - `[~]` Typed persistence exists for non-structural configuration. Session model/thinking catalog validation, persisted desired versus RPC-effective state, idle/safe-boundary application, degraded application reporting, and startup catalog validation now exist. The daemon now launches one basic persistent pi RPC child and validates the configured Slack conversation before starting its Socket Mode client, but neither integration is contract-complete.
@@ -31,7 +31,7 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 
 - [~] Validate the bootstrap config path before reading it. Runtime loading now rejects unsafe existing files and immediate parents and avoids import-time reads, but setup staging/reopen validation and comprehensive parent-layout checks remain incomplete.
 - [~] Make `doctor` read-only apart from the unavoidable held lock. It now queries daemon control health, including the live session snapshot, when online and does not create the layout offline, but offline SQLite read-only inspection remains incomplete.
-- [ ] Replace the atomic PID file with the specified portable OS-held exclusive lock. Until then, at minimum ensure every failure after lock creation closes the descriptor and removes the partial lock without deleting a replacement path.
+- [x] Replace the atomic PID file with a portable OS-held exclusive lock. Exact-pinned `fs-ext` provides non-blocking `flock` on Linux/macOS; acquisition validates the persistent lock file and identity before locking, writes PID diagnostics only after locking, and every failure unlocks/closes its descriptor. Contention is the stable `GATEWAY_LOCKED` error and never triggers stale-PID recovery. Daemon, setup, and offline doctor use this primitive; session reset remains covered by the daemon's lifetime lock, and future standalone reset flows must acquire it before structural work.
 - [x] Harden control-socket startup and shutdown: `lstat` rejects dangling symlinks, non-socket paths, and foreign-owned sockets; the bound socket dev/ino identity is captured after listen; an idempotent owned-server `close()` closes the listener and unlinks only that identity while preserving replacements. Post-bind failures use the same cleanup path, and runtime server errors are retained/reported rather than becoming unhandled events.
 - [x] Implement client-side response byte limits, fatal UTF-8 decoding, exactly-one-LF-frame validation, response schema validation, and request-ID correlation.
 - [~] Introduce and test a stable error-code mapping. Live Slack navigation/send now maps unavailable clients, missing messages, and common Slack failures to `SLACK_UNAVAILABLE`, `NOT_FOUND`, and `SLACK_ERROR`; invalid live-Slack parameters use `INVALID_PARAMS`. Invalid IDs/config/users must not become `INTERNAL`, and internal SQLite details must not leak as public errors.
@@ -772,7 +772,8 @@ Public IDs are prefixed SQLite integer IDs (`inbox-42`, `task-17`, `schedule-3`)
 - Directory/socket ownership and modes.
 - Unsafe/non-private custom roots.
 - Non-socket, foreign-owned, symlink, and stale-socket races.
-- Gateway lock exclusion between setup and daemon.
+- OS-held gateway lock exclusion across processes, crash-release, stale-PID acquisition, immediate reacquisition, descriptor cleanup, persistent-path replacement, and setup/daemon/offline-doctor contention.
+- Lock-file symlink, directory, wrong-mode, and foreign-owner rejection.
 
 ### Singleton, paths, and configuration
 
@@ -814,7 +815,7 @@ Public IDs are prefixed SQLite integer IDs (`inbox-42`, `task-17`, `schedule-3`)
 
 The status markers here are a summary; the detailed handoff checklist above and the normative requirements remain authoritative.
 
-1. `[~]` Introduce canonical path resolution, ownership checks, and gateway locking. Path derivation exists; finish the safety corrections and OS-held lock before proceeding.
+1. `[~]` Introduce canonical path resolution, ownership checks, and gateway locking. Path derivation and the OS-held lock are complete; finish the remaining layout safety corrections before proceeding.
 2. `[~]` Write and review the complete schema-v2 SQL, repository transition rules, public ID/timestamp formats, JSON fixtures, and stable error-code list before service implementation. Initial SQL/public IDs exist; definitions, fixtures, validation, transitions, and error catalog are incomplete.
 3. `[~]` Implement strict schema initialization/validation, the event ledger, singleton, inbox/task/schedule/trust repositories, required PRAGMAs, and hard schema rejection. Only the singleton, basic event/inbox mutation, manual tasks, and basic trust storage exist.
 4. `[~]` Build strict control-socket framing, filesystem authorization, errors, pagination, and client plumbing. Server framing and inbox/task pagination exist; complete authorization, errors, bounds, and client validation do not.

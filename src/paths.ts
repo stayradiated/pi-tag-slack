@@ -1,14 +1,17 @@
 import {
   chmodSync,
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  ftruncateSync,
   lstatSync,
+  type Stats,
   mkdirSync,
   openSync,
-  readFileSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { flockSync } from 'fs-ext';
 import { dirname, join, parse as parsePath, resolve } from 'node:path';
 import { resolveDataDir } from './config.js';
 
@@ -117,12 +120,29 @@ export interface GatewayLock {
   release(): void;
 }
 
+/** Stable error for an actively held OS advisory lock. */
+export class GatewayLockContendedError extends Error {
+  readonly code = 'GATEWAY_LOCKED';
+
+  constructor(path: string, cause?: unknown) {
+    super(`Gateway lock is held: ${path}. Stop the active gateway and retry.`, { cause });
+    this.name = 'GatewayLockContendedError';
+  }
+}
+
+function verifyLockFile(path: string, stat: Stats): void {
+  if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink structural path: ${path}`);
+  if (!stat.isFile()) throw new Error(`Unexpected non-file path: ${path}`);
+  const owner = uid();
+  if (owner !== undefined && stat.uid !== owner) throw new Error(`Foreign-owned path: ${path}`);
+  if ((stat.mode & 0o777) !== 0o600)
+    throw new Error(`Unsafe gateway lock mode (expected 0600): ${path}`);
+}
+
 /**
- * Serializes setup and daemon startup. Node does not expose portable flock(2),
- * so this intentionally uses an atomic private lock file and never steals an
- * existing lock. A stale lock requires explicit operator removal after checking
- * its recorded PID; this is safer than treating socket absence as authority.
- * This is only a temporary foundation lock, not the planned OS-held lock.
+ * Acquires a non-blocking OS-held advisory lock. The regular lock file is
+ * deliberately retained: lock ownership belongs to this descriptor, not to a
+ * PID value or the path's presence.
  */
 export function acquireGatewayLock(
   paths = gatewayPaths(),
@@ -130,51 +150,68 @@ export function acquireGatewayLock(
 ): GatewayLock {
   if (options.createLayout !== false) ensurePrivateLayout(paths);
   else assertOwnedPrivate(paths.dataDir, 0o700, 'directory');
+
   let fd: number | undefined;
-  let created: ReturnType<typeof lstatSync> | undefined;
+  let locked = false;
   try {
-    fd = openSync(paths.lock, 'wx', 0o600);
-    created = lstatSync(paths.lock);
+    let before: Stats;
+    try {
+      before = lstatSync(paths.lock);
+      verifyLockFile(paths.lock, before);
+      fd = openSync(paths.lock, constants.O_RDWR | constants.O_NOFOLLOW);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // O_EXCL prevents an attacker from replacing a previously absent path
+      // between lstat and open. O_NOFOLLOW protects both Linux and macOS.
+      fd = openSync(
+        paths.lock,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      before = lstatSync(paths.lock);
+      verifyLockFile(paths.lock, before);
+    }
+    const opened = fstatSync(fd);
+    if (before.dev !== opened.dev || before.ino !== opened.ino)
+      throw new Error(`Gateway lock path changed while opening: ${paths.lock}`);
+
+    try {
+      flockSync(fd, 'exnb');
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EACCES' || code === 'EAGAIN' || code === 'EWOULDBLOCK')
+        throw new GatewayLockContendedError(paths.lock, error);
+      throw error;
+    }
+    locked = true;
+    // Metadata is diagnostic only. A stale value never affects acquisition.
+    ftruncateSync(fd, 0);
     writeFileSync(fd, `${process.pid}\n`, { encoding: 'utf8' });
-    chmodSync(paths.lock, 0o600);
+
     let released = false;
     return {
       release() {
         if (released) return;
         released = true;
-        closeSync(fd!);
-        // Never unlink a replacement created after our descriptor was closed.
         try {
-          const current = lstatSync(paths.lock);
-          if (current.dev === created!.dev && current.ino === created!.ino) unlinkSync(paths.lock);
-        } catch (error: unknown) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          flockSync(fd!, 'un');
+        } finally {
+          closeSync(fd!);
         }
       },
     };
   } catch (error: unknown) {
     if (fd !== undefined) {
-      closeSync(fd);
       try {
-        const current = lstatSync(paths.lock);
-        if (created && current.dev === created.dev && current.ino === created.ino)
-          unlinkSync(paths.lock);
-      } catch (cleanupError: unknown) {
-        if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') throw cleanupError;
+        if (locked) flockSync(fd, 'un');
+      } finally {
+        closeSync(fd);
       }
     }
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-      throw new Error(`Unable to acquire gateway lock: ${(error as Error).message}`, {
-        cause: error,
-      });
-    }
-    ensurePrivateFile(paths.lock);
-    const holder = readFileSync(paths.lock, 'utf8').trim();
-    throw new Error(
-      `Gateway lock is already held${holder ? ` (pid ${holder})` : ''}: ${paths.lock}. ` +
-        'Stop the daemon or inspect and remove a stale lock before retrying.',
-      { cause: error },
-    );
+    if (error instanceof GatewayLockContendedError) throw error;
+    throw new Error(`Unable to acquire gateway lock: ${(error as Error).message}`, {
+      cause: error,
+    });
   }
 }
 

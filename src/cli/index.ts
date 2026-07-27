@@ -111,7 +111,9 @@ async function doctor(): Promise<number> {
         {
           ...diagnostics(),
           daemon: 'unavailable: offline diagnostics only',
-          lock: `unavailable: ${(error as Error).message}`,
+          lock: `unavailable: ${
+            (error as { code?: string }).code ?? 'LOCK_ERROR'
+          }: ${(error as Error).message}`,
         },
         null,
         2,
