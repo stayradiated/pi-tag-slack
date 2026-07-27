@@ -8,6 +8,7 @@ import {
   copyFileSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -15,9 +16,14 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { validateBootstrapConfigPath } from './config.js';
-import { structuralPathExists, type GatewayPaths } from './paths.js';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { resolveConfigPath, validateBootstrapConfigPath } from './config.js';
+import {
+  acquireGatewayLock,
+  ensurePrivateLayout,
+  structuralPathExists,
+  type GatewayPaths,
+} from './paths.js';
 import type { ResetBackupBundle } from './reset-backup.js';
 
 const JOURNAL_VERSION = 1;
@@ -126,12 +132,43 @@ function validateBundle(bundle: ResetBackupBundle): void {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as ResetBackupBundle['manifest'];
   if (manifest.version !== 1 || manifest.phase !== 'validated')
     throw new Error('Invalid reset backup manifest.');
+  const expectedComponentPaths = {
+    database: 'gateway.db',
+    config: 'config.env',
+    session: 'session',
+  } as const;
+  for (const [name, expectedPath] of Object.entries(expectedComponentPaths)) {
+    const component = manifest.components[name as keyof typeof manifest.components];
+    if (
+      !component ||
+      (component.status !== 'included' && component.status !== 'missing') ||
+      (component.status === 'included' && component.path !== expectedPath)
+    )
+      throw new Error(`Invalid reset backup component manifest: ${name}`);
+  }
   for (const [name, component] of Object.entries(manifest.components)) {
     if (component.status === 'included') {
       const path = join(bundle.path, component.path);
-      // Session hashes cover a tree rather than one file. Its private shape is
-      // checked above; the backup creator has already validated its digest.
-      if (name !== 'session' && (!exists(path) || digest(path) !== component.sha256))
+      if (!exists(path)) throw new Error(`Invalid reset backup component: ${name}`);
+      if (name === 'session') {
+        const hash = createHash('sha256');
+        let size = 0;
+        const visit = (current: string, relative: string) => {
+          const stat = lstatSync(current);
+          if (stat.isDirectory()) {
+            hash.update(`d:${relative}\n`);
+            for (const child of readdirSync(current).sort())
+              visit(join(current, child), join(relative, child));
+          } else {
+            const content = readFileSync(current);
+            size += content.length;
+            hash.update(`f:${relative}:${content.length}\n`).update(content);
+          }
+        };
+        visit(path, '.');
+        if (size !== component.size || hash.digest('hex') !== component.sha256)
+          throw new Error(`Invalid reset backup component: ${name}`);
+      } else if (digest(path) !== component.sha256)
         throw new Error(`Invalid reset backup component: ${name}`);
     }
   }
@@ -292,6 +329,132 @@ export function installFreshReset(options: ResetInstallOptions): void {
   // rather than risking destruction of a validated installed state.
   for (const path of Object.values(rollback)) removeIfPresent(path, step);
   removeIfPresent(paths.journal, step);
+}
+
+export type ResetRecoveryOptions = {
+  paths?: GatewayPaths;
+  configPath?: string;
+  afterStep?: (step: string) => void;
+};
+
+function validateRecoveryJournal(
+  journal: ResetJournal,
+  paths: GatewayPaths,
+  configPath: string,
+): void {
+  const active: ComponentPaths = {
+    config: resolve(configPath),
+    database: paths.db,
+    wal: `${paths.db}-wal`,
+    shm: `${paths.db}-shm`,
+    session: paths.session,
+  };
+  for (const key of Object.keys(active) as (keyof ComponentPaths)[])
+    if (journal.active[key] !== active[key]) throw new Error(`Unsafe reset journal active.${key}.`);
+  const suffix = journal.rollback.config.slice(active.config.length);
+  if (!/^\.rollback-[A-Za-z0-9-]+$/.test(suffix))
+    throw new Error('Unsafe reset journal rollback paths.');
+  for (const key of Object.keys(active) as (keyof ComponentPaths)[])
+    if (journal.rollback[key] !== `${active[key]}${suffix}`)
+      throw new Error(`Unsafe reset journal rollback.${key}.`);
+  const stagingSuffix = journal.staged.config.slice(active.config.length);
+  if (
+    !/^\.setup-[A-Za-z0-9-]+$/.test(stagingSuffix) ||
+    journal.staged.database !== `${active.database}${stagingSuffix}` ||
+    journal.staged.wal !== `${journal.staged.database}-wal` ||
+    journal.staged.shm !== `${journal.staged.database}-shm` ||
+    journal.staged.session !== `${active.session}${stagingSuffix}`
+  )
+    throw new Error('Unsafe reset journal staging paths.');
+  if (
+    dirname(journal.backupBundle) !== paths.backups ||
+    basename(journal.backupBundle).startsWith('.')
+  )
+    throw new Error('Unsafe reset journal backup bundle path.');
+}
+
+function copyPrivateTree(source: string, destination: string): void {
+  const stat = lstatSync(source);
+  if (stat.isSymbolicLink()) throw new Error(`Unsafe reset source: ${source}`);
+  if (stat.isDirectory()) {
+    mkdirSync(destination, { mode: 0o700 });
+    chmodSync(destination, 0o700);
+    for (const name of readdirSync(source))
+      copyPrivateTree(join(source, name), join(destination, name));
+    fsyncPath(destination, true);
+  } else if (stat.isFile()) {
+    copyFileSync(source, destination, constants.COPYFILE_EXCL);
+    chmodSync(destination, 0o600);
+    fsyncPath(destination);
+  } else throw new Error(`Unsafe reset source: ${source}`);
+}
+
+/** Restores a validated backup after any interrupted reset-install phase. */
+export function recoverInterruptedReset(options: ResetRecoveryOptions = {}): void {
+  const paths = ensurePrivateLayout(options.paths);
+  const configPath = resolve(options.configPath ?? resolveConfigPath());
+  const step = options.afterStep ?? (() => {});
+  const lock = acquireGatewayLock(paths);
+  try {
+    const journal = readResetJournal(paths.journal);
+    if (!journal || journal.phase === 'complete')
+      throw new Error('No incomplete reset journal exists.');
+    validateRecoveryJournal(journal, paths, configPath);
+    const bundle: ResetBackupBundle = {
+      path: journal.backupBundle,
+      manifest: JSON.parse(
+        readFileSync(join(journal.backupBundle, 'manifest.json'), 'utf8'),
+      ) as ResetBackupBundle['manifest'],
+    };
+    validateBundle(bundle);
+    if (
+      bundle.manifest.components.config.status !== 'included' ||
+      bundle.manifest.components.session.status !== 'included' ||
+      bundle.manifest.components.database.status !== 'included'
+    )
+      throw new Error('Reset backup bundle cannot restore complete active state.');
+    const suffix = `.recovery-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const staged = {
+      config: `${configPath}${suffix}`,
+      database: `${paths.db}${suffix}`,
+      session: `${paths.session}${suffix}`,
+    };
+    for (const path of Object.values(staged)) absent(path);
+    try {
+      copyPrivateTree(join(bundle.path, 'config.env'), staged.config);
+      copyPrivateTree(join(bundle.path, 'gateway.db'), staged.database);
+      copyPrivateTree(join(bundle.path, 'session'), staged.session);
+      validateConfig(staged.config);
+      validateDatabase(staged.database);
+      privateTree(staged.session);
+      for (const path of Object.values(staged)) fsyncParent(path, step);
+      for (const path of Object.values(journal.active)) removeIfPresent(path, step);
+      for (const key of ['config', 'database', 'session'] as const)
+        moveIfPresent(staged[key], journal.active[key], step);
+      removeIfPresent(journal.active.wal, step);
+      removeIfPresent(journal.active.shm, step);
+      validateConfig(journal.active.config);
+      validateDatabase(journal.active.database);
+      // SQLite validation may create an empty SHM sidecar even for a
+      // self-contained backup image; remove it only after closing SQLite.
+      removeIfPresent(journal.active.wal, step);
+      removeIfPresent(journal.active.shm, step);
+      privateTree(journal.active.session);
+      if (exists(journal.active.wal) || exists(journal.active.shm))
+        throw new Error('Recovered database has unexpected WAL/SHM sidecars.');
+      for (const path of [journal.active.config, journal.active.database, journal.active.session])
+        fsyncParent(path, step);
+      // Only a fully validated, durable restored active state permits disposal
+      // of journal-owned secrets, partial fresh state, and rollback copies.
+      for (const path of [...Object.values(journal.staged), ...Object.values(journal.rollback)])
+        removeIfPresent(path, step);
+      removeIfPresent(paths.journal, step);
+    } finally {
+      for (const path of Object.values(staged)) removeIfPresent(path, step);
+    }
+  } finally {
+    lock.release();
+  }
 }
 
 function rollbackReset(

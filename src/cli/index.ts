@@ -6,7 +6,7 @@ import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
 import { createResetBackupBundle } from '../reset-backup.js';
-import { installFreshReset } from '../reset-install.js';
+import { installFreshReset, recoverInterruptedReset } from '../reset-install.js';
 import {
   addTrustedUser,
   closeDb,
@@ -133,7 +133,14 @@ export async function setup(
   const value = (name: string) => (typeof options[name] === 'string' ? options[name] : undefined);
   const reset = options.reset === true;
   const yes = options.yes === true;
-  if (yes && !reset) throw new Error('--yes is valid only with setup --reset.');
+  // A bare non-interactive setup is normally invalid. Its sole exception is
+  // deterministic repair of a reset journal left by an interrupted reset.
+  if (yes && !reset) {
+    const paths = ensurePrivateLayout();
+    recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
+    console.log(`Recovered interrupted reset at ${paths.db}.`);
+    return 0;
+  }
   const channel = value('channel');
   const cwd = value('cwd');
   const model = value('model');

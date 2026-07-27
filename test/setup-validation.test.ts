@@ -81,6 +81,23 @@ function noApplicationState(): void {
 }
 
 describe.sequential('first-time setup validation', () => {
+  it('rejects setup --yes when no interrupted reset journal exists', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-setup-recovery-'));
+    directories.push(directory);
+    const oldData = process.env.PI_TAG_SLACK_DATA_DIR;
+    const oldConfig = process.env.PI_TAG_SLACK_CONFIG;
+    process.env.PI_TAG_SLACK_DATA_DIR = directory;
+    process.env.PI_TAG_SLACK_CONFIG = join(directory, 'config.env');
+    try {
+      await expect(setup(['--yes'])).rejects.toThrow(/No incomplete reset journal/);
+    } finally {
+      if (oldData === undefined) delete process.env.PI_TAG_SLACK_DATA_DIR;
+      else process.env.PI_TAG_SLACK_DATA_DIR = oldData;
+      if (oldConfig === undefined) delete process.env.PI_TAG_SLACK_CONFIG;
+      else process.env.PI_TAG_SLACK_CONFIG = oldConfig;
+    }
+  });
+
   it('fails old pi validation before staging', async () => {
     await expect(
       run({

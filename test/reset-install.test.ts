@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { closeDb, createGatewayConfig, initDb } from '../src/db.js';
 import { gatewayPaths } from '../src/paths.js';
 import { createResetBackupBundle } from '../src/reset-backup.js';
-import { installFreshReset } from '../src/reset-install.js';
+import { installFreshReset, recoverInterruptedReset } from '../src/reset-install.js';
 import { startGateway } from '../src/index.js';
 
 const roots: string[] = [];
@@ -145,6 +145,148 @@ describe('journaled fresh reset installation', () => {
         },
       }),
     ).rejects.toThrow('install failure');
+    expect(existsSync(paths.journal)).toBe(true);
+  });
+
+  it.each(['prepared', 'active-moved', 'fresh-installed'] as const)(
+    'restores the durable bundle from a %s journal and removes sidecars',
+    async (phase) => {
+      const { paths, configPath, backup } = await fixture();
+      const suffix = '.setup-01234567-89ab-cdef';
+      const rollback = '.rollback-01234567-89ab-cdef';
+      writeFileSync(configPath, 'partial fresh state', { mode: 0o600 });
+      writeFileSync(`${paths.db}-wal`, 'stale', { mode: 0o600 });
+      writeFileSync(`${paths.db}-shm`, 'stale', { mode: 0o600 });
+      rmSync(paths.session, { recursive: true });
+      // Representative abandoned fresh and rollback artifacts contain every
+      // component type, including sidecars and private session state.
+      for (const path of [
+        `${configPath}${suffix}`,
+        `${paths.db}${suffix}`,
+        `${paths.db}${suffix}-wal`,
+        `${paths.db}${suffix}-shm`,
+        `${configPath}${rollback}`,
+        `${paths.db}${rollback}`,
+        `${paths.db}-wal${rollback}`,
+        `${paths.db}-shm${rollback}`,
+      ])
+        writeFileSync(path, 'abandoned', { mode: 0o600 });
+      for (const path of [`${paths.session}${suffix}`, `${paths.session}${rollback}`]) {
+        mkdirSync(path, { mode: 0o700 });
+        writeFileSync(join(path, 'secret.json'), 'abandoned', { mode: 0o600 });
+      }
+      writeFileSync(
+        paths.journal,
+        `${JSON.stringify({
+          version: 1,
+          phase,
+          backupBundle: backup.path,
+          staged: {
+            config: `${configPath}${suffix}`,
+            database: `${paths.db}${suffix}`,
+            wal: `${paths.db}${suffix}-wal`,
+            shm: `${paths.db}${suffix}-shm`,
+            session: `${paths.session}${suffix}`,
+          },
+          active: {
+            config: configPath,
+            database: paths.db,
+            wal: `${paths.db}-wal`,
+            shm: `${paths.db}-shm`,
+            session: paths.session,
+          },
+          rollback: {
+            config: `${configPath}${rollback}`,
+            database: `${paths.db}${rollback}`,
+            wal: `${paths.db}-wal${rollback}`,
+            shm: `${paths.db}-shm${rollback}`,
+            session: `${paths.session}${rollback}`,
+          },
+        })}\n`,
+        { mode: 0o600 },
+      );
+      recoverInterruptedReset({ paths, configPath });
+      expect(readFileSync(configPath, 'utf8')).toContain('xoxb-old');
+      expect(readFileSync(join(paths.session, 'old.json'), 'utf8')).toBe('old');
+      expect(existsSync(`${paths.db}-wal`)).toBe(false);
+      expect(existsSync(`${paths.db}-shm`)).toBe(false);
+      expect(existsSync(paths.journal)).toBe(false);
+      for (const path of [
+        `${configPath}${suffix}`,
+        `${paths.db}${suffix}`,
+        `${paths.db}${suffix}-wal`,
+        `${paths.db}${suffix}-shm`,
+        `${paths.session}${suffix}`,
+        `${configPath}${rollback}`,
+        `${paths.db}${rollback}`,
+        `${paths.db}-wal${rollback}`,
+        `${paths.db}-shm${rollback}`,
+        `${paths.session}${rollback}`,
+      ])
+        expect(existsSync(path)).toBe(false);
+      expect(existsSync(backup.path)).toBe(true);
+    },
+  );
+
+  it('retains the journal after an injected recovery interruption and succeeds on retry', async () => {
+    const { paths, configPath, backup } = await fixture();
+    const suffix = '.setup-01234567-89ab-cdef';
+    const rollback = '.rollback-01234567-89ab-cdef';
+    writeFileSync(
+      paths.journal,
+      `${JSON.stringify({
+        version: 1,
+        phase: 'active-moved',
+        backupBundle: backup.path,
+        staged: {
+          config: `${configPath}${suffix}`,
+          database: `${paths.db}${suffix}`,
+          wal: `${paths.db}${suffix}-wal`,
+          shm: `${paths.db}${suffix}-shm`,
+          session: `${paths.session}${suffix}`,
+        },
+        active: {
+          config: configPath,
+          database: paths.db,
+          wal: `${paths.db}-wal`,
+          shm: `${paths.db}-shm`,
+          session: paths.session,
+        },
+        rollback: {
+          config: `${configPath}${rollback}`,
+          database: `${paths.db}${rollback}`,
+          wal: `${paths.db}-wal${rollback}`,
+          shm: `${paths.db}-shm${rollback}`,
+          session: `${paths.session}${rollback}`,
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    expect(() =>
+      recoverInterruptedReset({
+        paths,
+        configPath,
+        afterStep: (step) => {
+          if (step === `remove:${configPath}`) throw new Error('interrupted');
+        },
+      }),
+    ).toThrow('interrupted');
+    expect(existsSync(paths.journal)).toBe(true);
+    recoverInterruptedReset({ paths, configPath });
+    expect(readFileSync(configPath, 'utf8')).toContain('xoxb-old');
+    expect(existsSync(paths.journal)).toBe(false);
+  });
+
+  it('rejects an unsafe journal without changing active state', async () => {
+    const { paths, configPath, backup } = await fixture();
+    const original = readFileSync(configPath, 'utf8');
+    writeFileSync(
+      paths.journal,
+      `${JSON.stringify({ version: 1, phase: 'prepared', backupBundle: backup.path, staged: {}, active: {}, rollback: {} })}\n`,
+      { mode: 0o600 },
+    );
+    expect(() => recoverInterruptedReset({ paths, configPath })).toThrow(/Invalid reset journal/);
+    expect(readFileSync(configPath, 'utf8')).toBe(original);
     expect(existsSync(paths.journal)).toBe(true);
   });
 
