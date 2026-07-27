@@ -99,6 +99,10 @@ export class PiRpcSession {
     this.startPromise = operation;
     try {
       await operation;
+    } catch (error) {
+      if (!this.stopping)
+        this.recordFailure(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     } finally {
       if (this.startPromise === operation) this.startPromise = undefined;
       if (this.restartAfterStart) {

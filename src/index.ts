@@ -6,6 +6,8 @@ import { PiRpcSession } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import { clearSlackClient, configureSlackClient, reconcileInboxReactions } from './slack-client.js';
+import { existsSync, mkdirSync, renameSync } from 'node:fs';
+import { join } from 'node:path';
 import { startControlServer } from './control.js';
 import { materializeDueSchedules, SchedulerService } from './scheduler.js';
 import {
@@ -63,23 +65,60 @@ export async function startGateway(): Promise<void> {
     if (tokenErrors.length)
       throw new Error(`Invalid bootstrap configuration: ${tokenErrors.join(' ')}`);
     const config = readGatewayConfig();
-    pi = new PiRpcSession({
-      binary: String(config.pi_binary),
-      sessionDir: paths.session,
-      cwd: String(config.working_directory),
-      desired: () => {
-        const current = readGatewayConfig();
-        return {
-          model: String(current.session_model_override ?? current.default_model),
-          thinking: String(current.session_thinking_override ?? current.default_thinking),
-        };
+    const createPi = () => {
+      const rpc = new PiRpcSession({
+        binary: String(config.pi_binary),
+        sessionDir: paths.session,
+        cwd: String(config.working_directory),
+        desired: () => {
+          const current = readGatewayConfig();
+          return {
+            model: String(current.session_model_override ?? current.default_model),
+            thinking: String(current.session_thinking_override ?? current.default_thinking),
+          };
+        },
+      });
+      rpc.setSafeBoundaryHandler(() => void coordinator.run(() => pi!.applyDesired()));
+      return rpc;
+    };
+    pi = createPi();
+    const session = {
+      notify: (message: string) => pi!.notify(message),
+      status: () => pi!.status(),
+      availableModels: () => pi!.availableModels(),
+      availableThinkingLevels: () => pi!.availableThinkingLevels(),
+      applyDesired: () => pi!.applyDesired(),
+      reset: async () => {
+        const status = await pi!.status();
+        if (status.activity === 'active') {
+          const challenge = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
+          throw Object.assign(
+            new Error(
+              `Pi is active. Confirm with: pi-tag-slack session reset --confirm ${challenge}`,
+            ),
+            { code: 'CONFIRMATION_REQUIRED' },
+          );
+        }
+        const old = pi!;
+        await old.stop();
+        let counter = 0;
+        let archivePath: string;
+        do {
+          archivePath = join(
+            paths.archive,
+            `session-${new Date().toISOString().replace(/[:.]/g, '-')}-${counter++}`,
+          );
+        } while (existsSync(archivePath));
+        renameSync(paths.session, archivePath);
+        mkdirSync(paths.session, { mode: 0o700 });
+        pi = createPi();
+        await pi.start();
+        await pi.applyDesired();
+        const recovery = startupRecoveryPrompt();
+        if (recovery) await pi.notify(recovery);
+        return { archivedTo: archivePath, recoverySent: Boolean(recovery) };
       },
-    });
-    pi.setSafeBoundaryHandler(() => {
-      // Lifecycle events originate outside the coordinator, so re-enter its
-      // lane before changing RPC settings at the settled safe boundary.
-      void coordinator.run(() => pi!.applyDesired());
-    });
+    };
     await pi.start();
     // Restore persisted desired overrides/defaults before presenting work.
     // A failed application is retained as desired state and reflected in health.
@@ -97,14 +136,14 @@ export async function startGateway(): Promise<void> {
       botToken: bootstrap.slackBotToken,
       appToken: bootstrap.slackAppToken,
       botId: identity.user_id,
-      notifier: pi,
+      notifier: session,
       coordinator,
     });
     server = await startControlServer({
-      notifier: pi,
+      notifier: session,
       coordinator,
-      sessionStatus: () => coordinator.run(() => pi!.status()),
-      sessionControls: pi,
+      sessionStatus: () => session.status(),
+      sessionControls: session,
     });
     // Reconciliation is bounded and best-effort; it never affects Slack admission.
     void reconcileInboxReactions().catch(() => undefined);
@@ -112,7 +151,7 @@ export async function startGateway(): Promise<void> {
       () => void reconcileInboxReactions().catch(() => undefined),
       15_000,
     );
-    scheduler = new SchedulerService(pi, coordinator);
+    scheduler = new SchedulerService(session, coordinator);
     scheduler.start();
     await new Promise<void>((resolve) => {
       process.once('SIGINT', resolve);

@@ -79,6 +79,22 @@ function services(session: PiRpcSession) {
 const request = (command: string, params: Record<string, unknown>, value: ReturnType<typeof services>) =>
   dispatch({ version: 1, id: 'request', command, params }, value);
 
+describe('session reset control routing', () => {
+  it('returns the active-session confirmation error unchanged', async () => {
+    configured();
+    const confirmation = Object.assign(new Error('Pi is active. Confirm with: pi-tag-slack session reset --confirm s:7'), { code: 'CONFIRMATION_REQUIRED' });
+    const controls = {
+      availableModels: async () => [], availableThinkingLevels: async () => [],
+      applyDesired: async () => ({ application: 'applied' as const }),
+      reset: async () => { throw confirmation; },
+    };
+    await expect(dispatch({ version: 1, id: 'reset', command: 'session.reset', params: {} }, {
+      notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+      coordinator: new GatewayCoordinator(), sessionControls: controls,
+    })).rejects.toBe(confirmation);
+  });
+});
+
 describe('session desired/effective controls', () => {
   it('lists a validated catalog and rejects a malformed catalog without persistence', async () => {
     configured();

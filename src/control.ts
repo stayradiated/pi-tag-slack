@@ -261,6 +261,7 @@ export type ControlServices = {
     availableModels(): Promise<PiModel[]>;
     availableThinkingLevels(): Promise<string[]>;
     applyDesired(): Promise<PiApplyResult>;
+    reset?(): Promise<{ archivedTo: string; recoverySent: boolean }>;
   };
 };
 
@@ -280,6 +281,10 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       if (!services?.sessionStatus)
         fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
       return services.coordinator.run(() => services.sessionStatus!());
+    case 'session.reset':
+      if (!services?.sessionControls?.reset)
+        fail('SESSION_UNAVAILABLE', 'Pi session reset is unavailable.');
+      return services.coordinator.run(() => services.sessionControls!.reset!());
     case 'session.model.list':
       if (!services?.sessionControls)
         fail('SESSION_UNAVAILABLE', 'Pi session controls are unavailable.');
