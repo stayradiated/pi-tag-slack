@@ -27,7 +27,7 @@ const help = `pi-tag-slack
 Usage:
   pi-tag-slack setup --channel <C...|G...> --label <name> --cwd <path> --model <ref>
   pi-tag-slack inbox list|show|working|respond|resolve ...
-  pi-tag-slack slack history|message|thread|send ...
+  pi-tag-slack slack history|message|thread|file download|send ...
   pi-tag-slack task add|list|show|resolve ...
   pi-tag-slack schedule add|list|show|enable|disable|remove ...
   pi-tag-slack trust add|list|remove ...
@@ -55,9 +55,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
   if (group === 'doctor') return doctor();
 
-  const command = commandFor(group, verb);
+  const fileDownload = group === 'slack' && verb === 'file' && rest[0] === 'download';
+  const command = fileDownload ? 'slack.file.download' : commandFor(group, verb);
   if (!command) throw new Error(`Unsupported command.\n${help}`);
-  const response = await request(command, paramsFor(command, rest));
+  const response = await request(command, paramsFor(command, fileDownload ? rest.slice(1) : rest));
   if (response.error)
     throw Object.assign(new Error(response.error.message), { code: response.error.code });
   console.log(JSON.stringify(response.result));
@@ -228,6 +229,7 @@ function commandFor(group: string, verb?: string): string | undefined {
     'slack.history',
     'slack.message',
     'slack.thread',
+    'slack.file.download',
     'slack.send',
     'task.list',
     'task.show',
@@ -267,6 +269,10 @@ function paramsFor(command: string, args: string[]): Record<string, unknown> {
       limit: numberFlag(flags.limit),
       cursor: flags.cursor,
     });
+  }
+  if (command === 'slack.file.download') {
+    parseFlags(args, new Set(['json']));
+    return { fileId: positional(args, new Set(['json']))[0] };
   }
   if (command === 'slack.send') {
     const flags = parseFlags(args, new Set(['thread', 'text']));

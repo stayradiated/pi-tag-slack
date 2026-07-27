@@ -1,6 +1,15 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
@@ -25,6 +34,7 @@ import { validateConfiguredConversation } from '../src/slack-validation.js';
 import {
   clearSlackClient,
   configureSlackClient,
+  downloadSlackFile,
   reconcileInboxReactions,
 } from '../src/slack-client.js';
 import { ensurePrivateLayout, gatewayPaths } from '../src/paths.js';
@@ -832,6 +842,105 @@ describe('Slack live navigation and send controls', () => {
     } finally {
       clearSlackClient();
     }
+  });
+});
+
+describe('on-demand Slack file download', () => {
+  async function withMediaDir(test: (dataDir: string) => Promise<void>): Promise<void> {
+    const oldDataDir = process.env.PI_TAG_SLACK_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'pi-tag-slack-media-'));
+    directories.push(dataDir);
+    process.env.PI_TAG_SLACK_DATA_DIR = dataDir;
+    try {
+      await test(dataDir);
+    } finally {
+      if (oldDataDir === undefined) delete process.env.PI_TAG_SLACK_DATA_DIR;
+      else process.env.PI_TAG_SLACK_DATA_DIR = oldDataDir;
+    }
+  }
+
+  it('downloads a configured-conversation file without putting bytes in the result', async () => {
+    configuredDb();
+    await withMediaDir(async (dataDir) => {
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => new Response('hello');
+      configureSlackClient(
+        {
+          token: 'xoxb-test',
+          files: {
+            info: async () => ({
+              ok: true,
+              file: {
+                id: 'F0123456789',
+                name: '../../report.txt',
+                size: 5,
+                mimetype: 'text/plain',
+                channels: ['C0123456789'],
+                url_private_download: 'https://files.slack.test/report',
+              },
+            }),
+          },
+        } as any,
+        'C0123456789',
+      );
+      try {
+        const result = await downloadSlackFile('F0123456789');
+        expect(result).toMatchObject({
+          fileId: 'F0123456789',
+          size: 5,
+          mediaType: 'text/plain',
+        });
+        expect(result.name).not.toMatch(/[\\/]|^\.\.?$/);
+        expect(result.localPath).toBe(join(dataDir, 'media', `F0123456789-${result.name}`));
+        expect(readFileSync(result.localPath, 'utf8')).toBe('hello');
+      } finally {
+        globalThis.fetch = oldFetch;
+        clearSlackClient();
+      }
+    });
+  });
+
+  it('rejects files not shared in the configured conversation and hard streamed-size failures clean staging', async () => {
+    configuredDb();
+    await withMediaDir(async (dataDir) => {
+      dispatch({
+        version: 1,
+        id: 'limit',
+        command: 'config.set',
+        params: { key: 'maxAttachmentBytes', value: '3' },
+      });
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => new Response('four');
+      configureSlackClient(
+        {
+          files: {
+            info: async ({ file }: { file: string }) => ({
+              ok: true,
+              file: {
+                id: file,
+                name: 'x.txt',
+                size: 1,
+                channels: file === 'FOTHER' ? ['COTHER'] : ['C0123456789'],
+                url_private_download: 'https://files.slack.test/x',
+              },
+            }),
+          },
+        } as any,
+        'C0123456789',
+      );
+      try {
+        await expect(downloadSlackFile('FOTHER')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        await expect(downloadSlackFile('F0123456789')).rejects.toMatchObject({
+          code: 'FILE_TOO_LARGE',
+        });
+        expect(readdirSync(join(dataDir, 'media')).some((name) => name.endsWith('.part'))).toBe(
+          false,
+        );
+      } finally {
+        globalThis.fetch = oldFetch;
+        clearSlackClient();
+      }
+    });
   });
 });
 

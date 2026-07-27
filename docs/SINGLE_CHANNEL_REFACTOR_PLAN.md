@@ -52,7 +52,7 @@ Complete these first so later Slack and RPC work does not depend on unsafe or mi
 - [~] Ingestion stores a reduced file metadata snapshot without downloading, strips exact raw bot mentions from new-message text, and accepts `file_share` attachment-only messages. Attachment schema/validation and complete Slack file payload handling remain incomplete.
 - [~] Relevant events are acknowledged after SQLite admission and then notify pi; ignored events are acknowledged without persistence. Newly created items also attempt a post-commit `👀` reaction and retain actual/error diagnostics. Broader post-commit enrichment, reaction retries/backoff/reconciliation, lifecycle cleanup, and tests remain unimplemented.
 - [~] Implement live history/message/thread navigation, configured-conversation enforcement, pagination, response bounds, send/reply behavior, and outcome-unknown handling. `slack history`, `slack message`, `slack thread`, and `slack send [--thread]` now use only the daemon-owned configured-conversation client; history/thread pass Slack cursors through and return `{ items, nextCursor }`, while lookup returns the exact requested timestamp or `NOT_FOUND`. Explicit Slack response-byte budgeting, `OUTCOME_UNKNOWN`, retry policy, exhaustive error classification, and refined human formatting remain.
-- [ ] Implement validated on-demand download and upload with file ownership, type, symlink, size, sanitization, and re-stat checks.
+- [~] Implement on-demand download and upload with file ownership, type, symlink, size, sanitization, and re-stat checks. `slack file download <F...>` now validates the raw ID, retrieves daemon-owned-client metadata, verifies configured-conversation sharing, enforces metadata and streamed per-file/total limits, and atomically stores a sanitized private file under `media/`; control responses contain metadata/path only. Outbound upload and its re-stat validation remain unimplemented.
 
 #### Persistent pi RPC session
 
@@ -821,7 +821,7 @@ The status markers here are a summary; the detailed handoff checklist above and 
 5. `[ ]` Replace one-shot pi execution with the version-checked persistent RPC lifecycle/coordinator.
 6. `[ ]` Implement event-idempotent new/edit/delete Slack ingestion and prompt/follow-up notification.
 7. `[~]` Implement inbox/task/schedule/trust and live Slack CLI services. Only the minimal local repository-backed subset listed above exists.
-8. `[ ]` Implement reaction reconciliation and on-demand attachment download/upload validation.
+8. `[~]` Implement reaction reconciliation and on-demand attachment download/upload validation. Download validation is implemented; upload remains.
 9. `[ ]` Implement desired/effective session model/thinking controls and confirmed reset.
 10. `[ ]` Rebuild setup around staged backup bundles, reset journaling, plain-setup recovery, and explicit reset confirmation.
 11. `[~]` Remove multi-channel, DM, slash command, panel, legacy queue, Pi runtime imports/peers, and obsolete config code. Legacy source was removed and Pi packages are development-only; dependency/config cleanup remains.

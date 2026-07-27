@@ -28,6 +28,7 @@ import {
   replyToInbox,
   scheduleReactionReconciliation,
   sendSlackMessage,
+  downloadSlackFile,
   slackHistory,
   slackMessage,
   slackThread,
@@ -97,6 +98,13 @@ function decodeCursor(value: unknown): ListCursor | undefined {
   } catch {
     fail('INVALID_PARAMS', 'cursor is invalid.');
   }
+}
+
+function fileId(value: unknown): string {
+  const id = text(value, 'fileId');
+  if (!/^F[A-Z0-9]+$/.test(id))
+    fail('INVALID_PARAMS', 'Slack file ID must be a raw uppercase F... ID.');
+  return id;
 }
 
 function optionalCursor(value: unknown): string | undefined {
@@ -285,6 +293,8 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
         limit(params.limit),
         optionalCursor(params.cursor),
       );
+    case 'slack.file.download':
+      return downloadSlackFile(fileId(params.fileId ?? params.id));
     case 'slack.send':
       return sendSlackMessage(
         text(params.text, 'text'),
