@@ -33,8 +33,9 @@ create table schedules (
  check((kind='at' and at_time is not null and cron_expression is null and timezone is null) or (kind='cron' and at_time is null and cron_expression is not null and timezone is not null))
 ) strict;
 create table tasks (
- id integer primary key, source text not null check(source in ('manual','schedule')), occurrence_key text unique, schedule_id integer references schedules(id), title text not null, instructions text not null, state text not null check(state in ('open','resolved')), resolution_reason text, resolved_at text, rpc_accepted_at text, pi_session_id text, run_sequence integer, created_at text not null,
- check((source='manual' and schedule_id is null and occurrence_key is null) or (source='schedule' and schedule_id is not null and occurrence_key is not null))
+ id integer primary key, source text not null check(source in ('manual','schedule')), occurrence_key text unique, schedule_id integer references schedules(id), title text not null, instructions text not null, catch_up_first_at text, catch_up_last_at text, catch_up_count integer check(catch_up_count is null or catch_up_count >= 2), state text not null check(state in ('open','resolved')), resolution_reason text, resolved_at text, rpc_accepted_at text, pi_session_id text, run_sequence integer, created_at text not null,
+ check((source='manual' and schedule_id is null and occurrence_key is null) or (source='schedule' and schedule_id is not null and occurrence_key is not null)),
+ check((catch_up_first_at is null and catch_up_last_at is null and catch_up_count is null) or (source='schedule' and catch_up_first_at is not null and catch_up_last_at is not null and catch_up_count is not null))
 ) strict;
 create index tasks_state_created on tasks(state, created_at desc, id desc);
 create trigger tasks_no_reopen before update of state on tasks
@@ -173,6 +174,9 @@ const schemaColumns: Record<string, string[]> = {
     'schedule_id',
     'title',
     'instructions',
+    'catch_up_first_at',
+    'catch_up_last_at',
+    'catch_up_count',
     'state',
     'resolution_reason',
     'resolved_at',
@@ -503,6 +507,46 @@ export function inboxSnapshot(id: number): Record<string, unknown> | undefined {
 }
 
 /** Creates a manual task before attempting its intentionally non-atomic pi delivery. */
+export type TaskRow = {
+  id: number;
+  source: 'manual' | 'schedule';
+  occurrence_key: string | null;
+  schedule_id: number | null;
+  title: string;
+  instructions: string;
+  catch_up_first_at: string | null;
+  catch_up_last_at: string | null;
+  catch_up_count: number | null;
+  state: 'open' | 'resolved';
+  resolution_reason: string | null;
+  resolved_at: string | null;
+  rpc_accepted_at: string | null;
+  pi_session_id: string | null;
+  run_sequence: number | null;
+  created_at: string;
+};
+
+export function validateTaskRow(row: Record<string, unknown>): asserts row is TaskRow {
+  const catchUp =
+    row.catch_up_first_at === null && row.catch_up_last_at === null && row.catch_up_count === null;
+  if (
+    !Number.isSafeInteger(row.id) ||
+    (row.source !== 'manual' && row.source !== 'schedule') ||
+    typeof row.title !== 'string' ||
+    typeof row.instructions !== 'string' ||
+    (row.state !== 'open' && row.state !== 'resolved') ||
+    !validTimestamp(row.created_at) ||
+    (!catchUp &&
+      (row.source !== 'schedule' ||
+        !validTimestamp(row.catch_up_first_at) ||
+        !validTimestamp(row.catch_up_last_at) ||
+        row.catch_up_first_at > row.catch_up_last_at ||
+        !Number.isInteger(row.catch_up_count) ||
+        Number(row.catch_up_count) < 2))
+  )
+    throw new Error('Malformed task row.');
+}
+
 export function createManualTask(title: string, instructions: string): Record<string, unknown> {
   const result = requireConfiguredDb()
     .prepare(
@@ -597,7 +641,7 @@ export function removeScheduleRow(id: number): boolean {
   return requireConfiguredDb().prepare('delete from schedules where id=?').run(id).changes === 1;
 }
 
-/** Atomically creates at most one durable occurrence per due definition and advances it. */
+/** Atomically creates one task per due definition and advances it. Recurring downtime is coalesced. */
 export function materializeDueScheduleTasks(
   current: string,
   nextCron: (row: ScheduleRow, after: string) => string,
@@ -613,12 +657,35 @@ export function materializeDueScheduleTasks(
     const created: Array<Record<string, unknown>> = [];
     for (const row of due) {
       const occurrence = row.next_run_at!;
-      const key = `schedule:${row.id}:at:${occurrence}`;
+      let last = occurrence;
+      let count = 1;
+      let next: string | undefined;
+      if (row.kind === 'cron') {
+        next = nextCron(row, last);
+        while (next <= current) {
+          last = next;
+          count += 1;
+          next = nextCron(row, last);
+        }
+      }
+      const catchUp = row.kind === 'cron' && count > 1;
+      const key = catchUp
+        ? `schedule:${row.id}:through:${last}`
+        : `schedule:${row.id}:at:${occurrence}`;
       const inserted = d
         .prepare(
-          "insert into tasks (source,occurrence_key,schedule_id,title,instructions,state,created_at) values ('schedule',?,?,?,?, 'open', ? ) on conflict(occurrence_key) do nothing",
+          "insert into tasks (source,occurrence_key,schedule_id,title,instructions,catch_up_first_at,catch_up_last_at,catch_up_count,state,created_at) values ('schedule',?,?,?,?,?,?,?, 'open', ? ) on conflict(occurrence_key) do nothing",
         )
-        .run(key, row.id, row.title, row.instructions, current);
+        .run(
+          key,
+          row.id,
+          row.title,
+          row.instructions,
+          catchUp ? occurrence : null,
+          catchUp ? last : null,
+          catchUp ? count : null,
+          current,
+        );
       if (inserted.changes)
         created.push(
           d.prepare('select * from tasks where id=?').get(inserted.lastInsertRowid) as Record<
@@ -632,11 +699,8 @@ export function materializeDueScheduleTasks(
           row.id,
         );
       } else {
-        let next = nextCron(row, occurrence);
-        // A delayed tick intentionally produces one task, then skips to a future run.
-        while (next <= current) next = nextCron(row, next);
         d.prepare('update schedules set next_run_at=?, updated_at=? where id=?').run(
-          next,
+          next!,
           current,
           row.id,
         );

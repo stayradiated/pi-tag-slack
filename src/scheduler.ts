@@ -110,9 +110,12 @@ export class SchedulerService {
       const tasks = materializeDueSchedules(this.clock);
       for (const task of tasks) {
         try {
+          const catchUp = task.catch_up_count
+            ? ` This coalesces ${task.catch_up_count} missed occurrences from ${task.catch_up_first_at} through ${task.catch_up_last_at}.`
+            : '';
           const acceptance = await this.notifier.notify(
             `[New scheduled task; task-${task.id}]\nTitle: ${task.title}\nInstructions follow:\n---\n${task.instructions}\n---\n` +
-              `This is durable scheduled task work. Use pi-tag-slack task show task-${task.id} and task resolve task-${task.id}.`,
+              `This is durable scheduled task work.${catchUp} Use pi-tag-slack task show task-${task.id} and task resolve task-${task.id}.`,
           );
           markTaskAccepted(Number(task.id), acceptance);
         } catch {

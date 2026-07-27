@@ -21,8 +21,11 @@ import {
   createGatewayConfig,
   ingestSlackEvent,
   initDb,
+  materializeDueScheduleTasks,
   recordInboxReaction,
   scheduleRow,
+  setScheduleEnabled,
+  updateGatewayConfig,
 } from '../src/db.js';
 import {
   CONTROL_COMMAND_DEADLINE_MS,
@@ -34,7 +37,13 @@ import {
 import { main } from '../src/cli/index.js';
 import { startGateway, startupRecoveryPrompt } from '../src/index.js';
 import { GatewayCoordinator, processSlackEvent } from '../src/slack.js';
-import { addSchedule, materializeDueSchedules, SchedulerService } from '../src/scheduler.js';
+import {
+  addSchedule,
+  enableSchedule,
+  materializeDueSchedules,
+  nextCronOccurrence,
+  SchedulerService,
+} from '../src/scheduler.js';
 import { validateConfiguredConversation } from '../src/slack-validation.js';
 import {
   clearSlackClient,
@@ -89,10 +98,115 @@ describe('schedules', () => {
     const due = new Date('2030-01-01T00:01:00Z');
     const created = materializeDueSchedules(() => due);
     expect(created).toHaveLength(1);
-    expect(materializeDueSchedules(() => due)).toHaveLength(1);
+    const recurringTask = materializeDueSchedules(() => due);
+    expect(recurringTask).toHaveLength(1);
+    expect(recurringTask[0]).toMatchObject({
+      occurrence_key: `schedule:${recurring.id}:at:2030-01-01T00:01:00.000Z`,
+      catch_up_first_at: null,
+      catch_up_last_at: null,
+      catch_up_count: null,
+    });
     expect(materializeDueSchedules(() => due)).toHaveLength(0);
     expect(scheduleRow(once.id)?.enabled).toBe(0);
     expect(scheduleRow(recurring.id)?.next_run_at).toBe('2030-01-01T00:02:00.000Z');
+  });
+
+  it('coalesces recurring downtime into one durable catch-up task', () => {
+    configuredDb();
+    const recurring = addSchedule(
+      { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    const created = materializeDueSchedules(() => new Date('2030-01-01T00:03:30Z'));
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({
+      occurrence_key: `schedule:${recurring.id}:through:2030-01-01T00:03:00.000Z`,
+      catch_up_first_at: '2030-01-01T00:01:00.000Z',
+      catch_up_last_at: '2030-01-01T00:03:00.000Z',
+      catch_up_count: 3,
+    });
+    expect(scheduleRow(recurring.id)?.next_run_at).toBe('2030-01-01T00:04:00.000Z');
+    expect(materializeDueSchedules(() => new Date('2030-01-01T00:03:30Z'))).toEqual([]);
+    expect(
+      dispatch({
+        version: 1,
+        id: 'show-catch-up',
+        command: 'task.show',
+        params: { id: 'task-1' },
+      }),
+    ).toMatchObject({
+      catch_up_first_at: '2030-01-01T00:01:00.000Z',
+      catch_up_last_at: '2030-01-01T00:03:00.000Z',
+      catch_up_count: 3,
+    });
+  });
+
+  it('does not catch up intervals while a recurring schedule is disabled', () => {
+    configuredDb();
+    const recurring = addSchedule(
+      { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    setScheduleEnabled(recurring.id, false, null);
+    const reenabled = enableSchedule(
+      scheduleRow(recurring.id)!,
+      () => new Date('2030-01-01T00:10:30Z'),
+    );
+    expect(reenabled.next_run_at).toBe('2030-01-01T00:11:00.000Z');
+    expect(materializeDueSchedules(() => new Date('2030-01-01T00:10:30Z'))).toEqual([]);
+    const created = materializeDueSchedules(() => new Date('2030-01-01T00:11:00Z'));
+    expect(created[0]).toMatchObject({
+      occurrence_key: `schedule:${recurring.id}:at:2030-01-01T00:11:00.000Z`,
+      catch_up_first_at: null,
+      catch_up_last_at: null,
+      catch_up_count: null,
+    });
+  });
+
+  it('respects the due definition batch limit while coalescing each schedule', () => {
+    configuredDb();
+    updateGatewayConfig('schedulerBatchLimit', '1');
+    addSchedule(
+      { title: 'first', instructions: 'first', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    addSchedule(
+      { title: 'second', instructions: 'second', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    expect(materializeDueSchedules(() => new Date('2030-01-01T00:03:30Z'))).toHaveLength(1);
+  });
+
+  it('rolls back task creation when recurring advancement fails', () => {
+    configuredDb();
+    const recurring = addSchedule(
+      { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    expect(() =>
+      materializeDueScheduleTasks('2030-01-01T00:01:30.000Z', () => {
+        throw new Error('injected cron failure');
+      }),
+    ).toThrow('injected cron failure');
+    expect(scheduleRow(recurring.id)?.next_run_at).toBe('2030-01-01T00:01:00.000Z');
+    expect(dispatch({ version: 1, id: 'tasks', command: 'task.list', params: {} })).toMatchObject({
+      items: [],
+    });
+  });
+
+  it('uses Croner IANA DST behavior for spring-forward and fall-back', () => {
+    expect(
+      nextCronOccurrence('30 2 * * *', 'America/New_York', new Date('2024-03-09T08:00:00Z')),
+    ).toBe('2024-03-10T07:30:00.000Z');
+    const firstFallBackRun = nextCronOccurrence(
+      '30 1 * * *',
+      'America/New_York',
+      new Date('2024-11-02T06:00:00Z'),
+    );
+    expect(firstFallBackRun).toBe('2024-11-03T05:30:00.000Z');
+    expect(nextCronOccurrence('30 1 * * *', 'America/New_York', new Date(firstFallBackRun))).toBe(
+      '2024-11-04T06:30:00.000Z',
+    );
   });
 
   it('rejects offset-less times, invalid cron, and invalid timezones', () => {
@@ -124,6 +238,27 @@ describe('schedules', () => {
     );
     await service.tick();
     expect(notified).toHaveLength(1);
+  });
+
+  it('describes runtime catch-up work in the notification', async () => {
+    configuredDb();
+    addSchedule(
+      { title: 'repeat', instructions: 'again', cron: '* * * * *', timezone: 'UTC' },
+      () => new Date('2030-01-01T00:00:00Z'),
+    );
+    const notified: string[] = [];
+    const service = new SchedulerService(
+      {
+        notify: async (prompt) => {
+          notified.push(prompt);
+          return { acceptedAt: '2030-01-01T00:04:00.000Z' };
+        },
+      },
+      new GatewayCoordinator(),
+      () => new Date('2030-01-01T00:03:30Z'),
+    );
+    await service.tick();
+    expect(notified[0]).toContain('coalesces 3 missed occurrences');
   });
 });
 
@@ -402,24 +537,30 @@ describe('pi RPC session status', () => {
     let malformed = false;
     stdin.on('data', (chunk: Buffer) => {
       const request = JSON.parse(chunk.toString()) as { id: string; type: string };
-      const data = request.type === 'get_state'
-        ? malformed
-          ? { isStreaming: 'yes' }
-          : {
-              isStreaming: true,
-              sessionId: 'session-123',
-              model: { provider: 'anthropic', id: 'claude-test' },
-              thinkingLevel: 'high',
-            }
-        : request.type === 'get_available_models'
-          ? { models: [{ provider: 'configured', id: 'model' }] }
-          : request.type === 'get_available_thinking_levels'
-            ? { levels: ['medium'] }
-            : undefined;
-      stdout.write(JSON.stringify({
-        id: request.id, type: 'response', command: request.type, success: true,
-        ...(data === undefined ? {} : { data }),
-      }) + '\n');
+      const data =
+        request.type === 'get_state'
+          ? malformed
+            ? { isStreaming: 'yes' }
+            : {
+                isStreaming: true,
+                sessionId: 'session-123',
+                model: { provider: 'anthropic', id: 'claude-test' },
+                thinkingLevel: 'high',
+              }
+          : request.type === 'get_available_models'
+            ? { models: [{ provider: 'configured', id: 'model' }] }
+            : request.type === 'get_available_thinking_levels'
+              ? { levels: ['medium'] }
+              : undefined;
+      stdout.write(
+        JSON.stringify({
+          id: request.id,
+          type: 'response',
+          command: request.type,
+          success: true,
+          ...(data === undefined ? {} : { data }),
+        }) + '\n',
+      );
     });
     const session = new PiRpcSession({
       binary: 'fake-pi',
@@ -585,7 +726,10 @@ describe('Slack startup validation', () => {
       validateConfiguredConversation(client({ is_channel: true, is_member: false }), 'C123'),
     ).rejects.toThrow(/not a member/);
     await expect(
-      validateConfiguredConversation(client({ is_group: true, is_member: true, name: 'private-team' }), 'G123'),
+      validateConfiguredConversation(
+        client({ is_group: true, is_member: true, name: 'private-team' }),
+        'G123',
+      ),
     ).resolves.toBe('private-team');
   });
 });
