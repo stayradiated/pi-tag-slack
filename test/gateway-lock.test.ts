@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fork, type ChildProcess } from 'node:child_process';
 import {
-  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -121,9 +120,10 @@ describe('OS-held gateway lock', () => {
     rmSync(directoryLock.lock, { recursive: true });
     writeFileSync(directoryLock.lock, '', { mode: 0o644 });
     const before = process.platform === 'linux' ? readdirSync('/proc/self/fd').length : undefined;
-    expect(() => acquireGatewayLock(directoryLock)).toThrow(/mode/);
+    const repaired = acquireGatewayLock(directoryLock);
+    repaired.release();
+    expect(lstatSync(directoryLock.lock).mode & 0o777).toBe(0o600);
     if (before !== undefined) expect(readdirSync('/proc/self/fd').length).toBe(before);
-    chmodSync(directoryLock.lock, 0o600);
     const getuid = vi.spyOn(process, 'getuid').mockReturnValue(process.getuid!() + 1);
     try {
       expect(() => acquireGatewayLock(directoryLock)).toThrow(/Foreign-owned/);

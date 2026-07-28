@@ -16,6 +16,12 @@ export type SetupValidationInput = {
   trustedUserId: string;
 };
 
+export interface SetupProgress {
+  start(label: string): void;
+  success(label: string): void;
+  failure(label: string): void;
+}
+
 export type SetupValidationResult = {
   channelLabel: string;
   trustedUserLabel: string;
@@ -38,9 +44,13 @@ export type SetupValidationDependencies = {
   ): Promise<void>;
 };
 
+const SETUP_SLACK_TIMEOUT_MS = 10_000;
+const setupWebClient = (token: string) =>
+  new WebClient(token, { timeout: SETUP_SLACK_TIMEOUT_MS, retryConfig: { retries: 0 } });
+
 const defaultDependencies: SetupValidationDependencies = {
-  createBotClient: (token) => new WebClient(token) as unknown as BotClient,
-  createAppClient: (token) => new WebClient(token) as unknown as AppClient,
+  createBotClient: (token) => setupWebClient(token) as unknown as BotClient,
+  createAppClient: (token) => setupWebClient(token) as unknown as AppClient,
   async validatePi({ piBinary, workingDirectory, model, thinking }): Promise<void> {
     // This session is deliberately outside the gateway layout and is always
     // removed: setup validation must not leave an active or staged session.
@@ -51,6 +61,9 @@ const defaultDependencies: SetupValidationDependencies = {
       sessionDir,
       desired: () => ({ model, thinking }),
       version: piVersion,
+      // Setup must fail promptly instead of inheriting the daemon's longer
+      // command deadline.
+      commandTimeoutMs: 10_000,
     });
     try {
       await session.start();
@@ -145,9 +158,27 @@ function cosmeticLabel(value: Record<string, unknown> | undefined, kind: string)
 }
 
 /** Runs every setup check which must precede creation of database/config state. */
+async function stage<T>(
+  progress: SetupProgress | undefined,
+  label: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  progress?.start(label);
+  try {
+    const result = await work();
+    progress?.success(label);
+    return result;
+  } catch (error) {
+    progress?.failure(label);
+    throw error;
+  }
+}
+
+/** Runs every setup check which must precede creation of database/config state. */
 export async function validateFirstTimeSetup(
   input: SetupValidationInput,
   dependencies: SetupValidationDependencies = defaultDependencies,
+  progress?: SetupProgress,
 ): Promise<SetupValidationResult> {
   let workingDirectory;
   try {
@@ -164,20 +195,40 @@ export async function validateFirstTimeSetup(
   if (!input.botToken.startsWith('xoxb-')) throw new Error('Setup requires an xoxb- bot token.');
   if (!input.appToken.startsWith('xapp-')) throw new Error('Setup requires an xapp- app token.');
 
-  const piBinary = resolvePiExecutable(input.piBinary);
-  await dependencies.validatePi({ ...input, piBinary });
+  const piBinary = await stage(progress, 'Validating the Pi executable and version', async () =>
+    resolvePiExecutable(input.piBinary),
+  );
+  // The RPC handshake validates startup, model, and thinking before staging.
+  await stage(progress, 'Starting the temporary Pi RPC session', async () =>
+    dependencies.validatePi({ ...input, piBinary }),
+  );
+  progress?.start('Validating model and thinking settings');
+  progress?.success('Validating model and thinking settings');
 
   const bot = dependencies.createBotClient(input.botToken);
-  const auth = (await bot.auth.test()) as { ok?: unknown; user_id?: unknown; error?: unknown };
+  const auth = (await stage(progress, 'Validating the Slack bot token', async () =>
+    bot.auth.test(),
+  )) as { ok?: unknown; user_id?: unknown; error?: unknown };
   slackOk(auth, 'auth.test');
   if (typeof auth.user_id !== 'string' || !auth.user_id)
     throw new Error('Slack auth.test did not return a bot user ID.');
 
   const app = dependencies.createAppClient(input.appToken);
-  slackOk(await app.apps.connections.open(), 'apps.connections.open');
+  const appResponse = await stage(
+    progress,
+    'Validating the Slack app token and Socket Mode permission',
+    async () => app.apps.connections.open(),
+  );
+  slackOk(appResponse, 'apps.connections.open');
 
-  const channelLabel = await validateConfiguredConversation(bot, input.channelId);
-  const userResponse = (await bot.users.info({ user: input.trustedUserId })) as {
+  const channelLabel = await stage(
+    progress,
+    'Validating conversation access and membership',
+    async () => validateConfiguredConversation(bot, input.channelId),
+  );
+  const userResponse = (await stage(progress, 'Validating the initial trusted user', async () =>
+    bot.users.info({ user: input.trustedUserId }),
+  )) as {
     ok?: unknown;
     user?: Record<string, unknown>;
     error?: unknown;

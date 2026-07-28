@@ -35,7 +35,6 @@ function prompts(values: unknown[] = []): SetupPrompts {
   const next = () => Promise.resolve((values.shift() ?? '') as string | symbol);
   return {
     text: next,
-    password: next,
     select: next,
     confirm: next as () => Promise<boolean | symbol>,
     isCancel: (value) => typeof value === 'symbol',
@@ -136,14 +135,14 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
       output.mockRestore();
     }));
 
-  it('installs then starts the service only after a confirmed reset succeeds', async () =>
+  it('does not manage the service after a confirmed reset succeeds', async () =>
     inRoot(async () => {
       await setup(argumentsFor(), validation, dependencies(false));
       const calls: string[] = [];
       await expect(
         setup(argumentsFor(['--reset']), validation, dependencies(true, ['RESET'], calls)),
       ).resolves.toBe(0);
-      expect(calls).toEqual(['install', 'start']);
+      expect(calls).toEqual([]);
     }));
 
   it('requires affirmative interactive recovery confirmation before restoration', async () =>
@@ -190,7 +189,7 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
       const calls: string[] = [];
       await expect(setup([], validation, dependencies(true, [true], calls))).resolves.toBe(0);
       expect(existsSync(paths.journal)).toBe(false);
-      expect(calls).toEqual(['install', 'start']);
+      expect(calls).toEqual([]);
     }));
 
   it('shows the validated service executable before interactive installation', async () =>
@@ -201,6 +200,7 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
           [],
           validation,
           dependencies(true, [
+            'U0123456789',
             'C0123456789',
             '/tmp',
             'pi',
@@ -208,7 +208,6 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
             'medium',
             'xoxb-token',
             'xapp-token',
-            'U0123456789',
           ]),
         ),
       ).resolves.toBe(0);
@@ -225,7 +224,7 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
       );
       expect(calls).toEqual([]);
       expect(output).toHaveBeenCalledWith(
-        'Next steps:\n  pi-tag-slack daemon install\n  pi-tag-slack daemon start',
+        expect.stringContaining('The daemon was not installed or started.'),
       );
       output.mockRestore();
     }));

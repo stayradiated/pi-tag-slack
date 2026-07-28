@@ -1,5 +1,5 @@
 import { parse } from 'dotenv';
-import { lstatSync, readFileSync } from 'node:fs';
+import { chmodSync, lstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, parse as parsePath, resolve } from 'node:path';
 
@@ -36,7 +36,10 @@ export function resolveConfigPath(): string {
  * daemon-owned regular file. Ancestors may not be symlinks, foreign-owned, or
  * writable by group/other, preventing parent substitution after deployment.
  */
-export function validateBootstrapConfigPath(path = resolveConfigPath()): void {
+export function validateBootstrapConfigPath(
+  path = resolveConfigPath(),
+  options: { repairPermissions?: boolean; onRepair?: (path: string, mode: number) => void } = {},
+): void {
   const target = resolve(path);
   const owner = uid();
   const configParent = dirname(target);
@@ -59,8 +62,19 @@ export function validateBootstrapConfigPath(path = resolveConfigPath()): void {
         throw new Error(`Bootstrap path is writable by group or other: ${current}`);
       if (current === target) {
         if (!stat.isFile()) throw new Error(`Bootstrap config is not a regular file: ${target}`);
-        if ((stat.mode & 0o777) !== 0o600)
-          throw new Error(`Bootstrap config must have mode 0600: ${target}`);
+        if ((stat.mode & 0o777) !== 0o600) {
+          if (!options.repairPermissions)
+            throw new Error(`Bootstrap config must have mode 0600: ${target}`);
+          try {
+            chmodSync(target, 0o600);
+          } catch (error) {
+            throw new Error(
+              `Unable to repair permissions for ${target} (run chmod 600 ${target}): ${(error as Error).message}`,
+              { cause: error },
+            );
+          }
+          options.onRepair?.(target, 0o600);
+        }
       } else if (!stat.isDirectory()) {
         throw new Error(`Bootstrap config parent is not a directory: ${current}`);
       }

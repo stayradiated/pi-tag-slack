@@ -5,6 +5,7 @@ import {
   closeSync,
   constants,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -16,7 +17,11 @@ import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { presentFailure, presentSuccess } from './presentation.js';
-import { validateFirstTimeSetup, type SetupValidationDependencies } from '../setup-validation.js';
+import {
+  validateFirstTimeSetup,
+  type SetupProgress,
+  type SetupValidationDependencies,
+} from '../setup-validation.js';
 import { createResetBackupBundle } from '../reset-backup.js';
 import { installFreshReset, readResetJournal, recoverInterruptedReset } from '../reset-install.js';
 import { daemon } from '../daemon.js';
@@ -166,10 +171,9 @@ async function doctor(): Promise<number> {
 }
 
 export interface SetupDependencies {
-  /** Interactive seams keep tests away from terminals and service managers. */
+  /** Interactive seams keep tests away from terminals. */
   isInteractive(): boolean;
   prompts: SetupPrompts;
-  installAndStartDaemon(): void;
   /** Test-only setup/reset durability failure seam. */
   afterStep?: (step: string) => void;
 }
@@ -178,20 +182,20 @@ export function systemSetupDependencies(): SetupDependencies {
   return {
     isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
     prompts: systemSetupPrompts,
-    installAndStartDaemon: () => {
-      daemon('install');
-      daemon('start');
-    },
   };
 }
 
-function setupSuccess(interactive: boolean, dependencies: SetupDependencies): void {
-  if (interactive) {
-    dependencies.installAndStartDaemon();
-    console.log('Setup complete and daemon service started.');
-  } else {
-    console.log('Next steps:\n  pi-tag-slack daemon install\n  pi-tag-slack daemon start');
-  }
+function setupSuccess(): void {
+  console.log(`Setup complete. The daemon was not installed or started.
+
+To install the user service (first time only):
+  pi-tag-slack daemon install
+
+To start it:
+  pi-tag-slack daemon start
+
+To verify it:
+  pi-tag-slack daemon status`);
 }
 
 export async function setup(
@@ -225,7 +229,7 @@ export async function setup(
       console.log(`Recovering interrupted reset from ${paths.journal}.`);
       recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
       console.log(`Recovered interrupted reset at ${paths.db}.`);
-      setupSuccess(interactive, dependencies);
+      setupSuccess();
       return 0;
     }
     if (!interactive)
@@ -235,14 +239,14 @@ export async function setup(
     console.log(`Recovering interrupted reset from ${paths.journal}.`);
     recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
     console.log(`Recovered interrupted reset at ${paths.db}.`);
-    setupSuccess(true, dependencies);
+    setupSuccess();
     return 0;
   }
   // --yes is reserved for deterministic reset-journal recovery, never setup consent.
   if (!reset && yes) {
     recoverInterruptedReset({ paths, configPath: resolveConfigPath() });
     console.log(`Recovered interrupted reset at ${paths.db}.`);
-    setupSuccess(interactive, dependencies);
+    setupSuccess();
     return 0;
   }
   const required = ['channel', 'cwd', 'model', 'bot-token', 'app-token', 'trusted-user'];
@@ -275,8 +279,9 @@ export async function setup(
       async (message) => confirmInteractiveReset(dependencies.prompts, message),
       dependencies.afterStep,
       (piBinary) => console.log(`Validated pi binary: ${piBinary}`),
+      consoleSetupProgress(),
     ).then((result) => {
-      if (result === 0) setupSuccess(true, dependencies);
+      if (result === 0) setupSuccess();
       return result;
     });
   }
@@ -288,9 +293,18 @@ export async function setup(
       : undefined,
     dependencies.afterStep,
     interactive ? (piBinary) => console.log(`Validated pi binary: ${piBinary}`) : undefined,
+    consoleSetupProgress(),
   );
-  if (result === 0) setupSuccess(interactive, dependencies);
+  if (result === 0) setupSuccess();
   return result;
+}
+
+function consoleSetupProgress(): SetupProgress {
+  return {
+    start: (label) => console.log(`${label}...`),
+    success: (label) => console.log(`${label}: ok`),
+    failure: (label) => console.log(`${label}: failed`),
+  };
 }
 
 function validateSetupBootstrapDatabase(expected: {
@@ -347,6 +361,7 @@ async function setupCore(
   confirmReset?: (message: string) => Promise<boolean>,
   afterStep: (step: string) => void = () => {},
   onValidatedPiBinary?: (piBinary: string) => void,
+  progress?: SetupProgress,
 ): Promise<number> {
   const options = parseFlags(
     args,
@@ -384,8 +399,12 @@ async function setupCore(
 
   // Lock/layout checks are the only structural work before validation. They
   // create no application config/database state and serialize setup attempts.
-  const paths = ensurePrivateLayout();
-  const lock = acquireGatewayLock(paths);
+  const repaired = (path: string, mode: number) =>
+    console.log(`Repaired permissions: ${path} (${mode.toString(8).padStart(4, '0')})`);
+  progress?.start('Checking local paths and acquiring the setup lock');
+  const paths = ensurePrivateLayout(undefined, repaired);
+  const lock = acquireGatewayLock(paths, { onRepair: repaired });
+  progress?.success('Checking local paths and acquiring the setup lock');
   const configPath = resolveConfigPath();
   const suffix = `.setup-${randomUUID()}`;
   const stagedDb = `${paths.db}${suffix}`;
@@ -395,9 +414,9 @@ async function setupCore(
   let installedDb = false;
   let installationComplete = false;
   try {
-    validateBootstrapConfigPath(configPath);
-    ensurePrivateFile(paths.db);
-    ensurePrivateFile(configPath);
+    validateBootstrapConfigPath(configPath, { repairPermissions: true, onRepair: repaired });
+    ensurePrivateFile(paths.db, repaired);
+    ensurePrivateFile(configPath, repaired);
     if ((structuralPathExists(paths.db) || structuralPathExists(configPath)) && !reset) {
       throw new Error(
         'Gateway state already exists; plain setup never replaces it. Use setup --reset.',
@@ -418,6 +437,7 @@ async function setupCore(
         trustedUserId: trusted,
       },
       validationDependencies,
+      progress,
     );
     onValidatedPiBinary?.(validated.piBinary);
     console.warn(
@@ -435,6 +455,7 @@ async function setupCore(
 
     // Build all durable state off to the side first. Nothing active is changed
     // until validation of the complete database singleton has succeeded.
+    progress?.start('Writing and verifying staged state');
     initDb(stagedDb);
     try {
       createGatewayConfig({
@@ -473,8 +494,27 @@ async function setupCore(
       closeDb();
     }
 
-    mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
-    chmodSync(dirname(configPath), 0o700);
+    const configDirectory = dirname(configPath);
+    const customConfigPath = Boolean(process.env.PI_TAG_SLACK_CONFIG?.trim());
+    try {
+      const configDirectoryStat = lstatSync(configDirectory);
+      if (!configDirectoryStat.isDirectory() || configDirectoryStat.isSymbolicLink())
+        throw new Error(`Bootstrap config parent is not a safe directory: ${configDirectory}`);
+      if (customConfigPath && (configDirectoryStat.mode & 0o777) !== 0o700)
+        throw new Error(
+          `Custom bootstrap config parent must have mode 0700: ${configDirectory}. Run chmod 700 ${configDirectory} or choose another path.`,
+        );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (customConfigPath)
+        throw new Error(
+          `Custom bootstrap config parent does not exist: ${configDirectory}. Create it with mode 0700 first.`,
+          { cause: error },
+        );
+      mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+    }
+    // Only setup's default application directory is part of its owned layout.
+    if (!customConfigPath) chmodSync(configDirectory, 0o700);
     writeFileSync(
       stagedConfig,
       `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\nSLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`,
@@ -491,6 +531,8 @@ async function setupCore(
       `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\nSLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`
     )
       throw new Error('Staged bootstrap config validation failed.');
+    progress?.success('Writing and verifying staged state');
+    progress?.start('Installing setup state');
     if (reset) {
       mkdirSync(stagedSession, { mode: 0o700 });
       chmodSync(stagedSession, 0o700);
@@ -526,8 +568,8 @@ async function setupCore(
       afterStep(`rename:${stagedDb}:${paths.db}`);
       fsyncSetupPath(dirname(paths.db), true);
       afterStep(`fsync:${dirname(paths.db)}`);
-      ensurePrivateFile(configPath);
-      ensurePrivateFile(paths.db);
+      ensurePrivateFile(configPath, repaired);
+      ensurePrivateFile(paths.db, repaired);
       const expectedConfig =
         `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\n` +
         `SLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`;
@@ -541,6 +583,7 @@ async function setupCore(
       }
     }
     installationComplete = true;
+    progress?.success('Installing setup state');
     console.log(`Initialized schema v2 at ${paths.db}.`);
     return 0;
   } finally {

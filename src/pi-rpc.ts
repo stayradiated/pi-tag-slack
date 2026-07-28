@@ -36,13 +36,17 @@ export const PI_STOP_MAX_MS = PI_STOP_GRACE_MS + PI_STOP_TERMINATE_MS * 2;
 export const PI_STOP_LIFECYCLE_TIMEOUT_MS = PI_STOP_MAX_MS + 1_000;
 const DEFAULT_RPC_FRAME_BYTES = 1024 * 1024;
 const DEFAULT_RPC_COMMAND_TIMEOUT_MS = 30_000;
+export const SETUP_PI_VERSION_TIMEOUT_MS = 10_000;
 const DEFAULT_STDERR_LOG_BYTES = 64 * 1024;
 const DEFAULT_STDERR_LOG_EVENTS = 16;
 
 /** Run the configured executable's version command before opening an RPC session. */
-export async function piVersion(binary: string): Promise<string> {
+export async function piVersion(
+  binary: string,
+  timeoutMs = SETUP_PI_VERSION_TIMEOUT_MS,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(binary, ['--version'], { encoding: 'utf8' }, (error, stdout) => {
+    execFile(binary, ['--version'], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout) => {
       if (error) {
         reject(new Error(`Unable to run ${binary} --version: ${error.message}`));
         return;

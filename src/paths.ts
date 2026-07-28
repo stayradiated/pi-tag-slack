@@ -53,7 +53,15 @@ function uid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 
-function assertOwnedPrivate(path: string, expectedMode: number, kind: 'directory' | 'file'): void {
+export type PermissionRepairReporter = (path: string, mode: number) => void;
+
+function assertOwnedPrivate(
+  path: string,
+  expectedMode: number,
+  kind: 'directory' | 'file',
+  onRepair?: PermissionRepairReporter,
+  repair = true,
+): void {
   const stat = lstatSync(path);
   if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink structural path: ${path}`);
   if ((kind === 'directory' && !stat.isDirectory()) || (kind === 'file' && !stat.isFile())) {
@@ -63,7 +71,19 @@ function assertOwnedPrivate(path: string, expectedMode: number, kind: 'directory
   }
   const owner = uid();
   if (owner !== undefined && stat.uid !== owner) throw new Error(`Foreign-owned path: ${path}`);
-  if ((stat.mode & 0o777) !== expectedMode) chmodSync(path, expectedMode);
+  if ((stat.mode & 0o777) !== expectedMode) {
+    if (!repair)
+      throw new Error(`Unsafe ${kind} mode (expected ${expectedMode.toString(8)}): ${path}`);
+    try {
+      chmodSync(path, expectedMode);
+    } catch (error) {
+      throw new Error(
+        `Unable to repair permissions for ${path} (run chmod ${expectedMode.toString(8)} ${path}): ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+    onRepair?.(path, expectedMode);
+  }
 }
 
 function assertSafeExistingAncestors(path: string): void {
@@ -97,7 +117,10 @@ function assertSafeExistingAncestors(path: string): void {
 }
 
 /** Creates and validates the daemon-private structural layout. */
-export function ensurePrivateLayout(paths = gatewayPaths()): GatewayPaths {
+export function ensurePrivateLayout(
+  paths = gatewayPaths(),
+  onRepair?: PermissionRepairReporter,
+): GatewayPaths {
   for (const path of [
     paths.dataDir,
     paths.sessions,
@@ -108,7 +131,7 @@ export function ensurePrivateLayout(paths = gatewayPaths()): GatewayPaths {
   ]) {
     assertSafeExistingAncestors(path);
     if (!existsSync(path)) mkdirSync(path, { recursive: true, mode: 0o700 });
-    assertOwnedPrivate(path, 0o700, 'directory');
+    assertOwnedPrivate(path, 0o700, 'directory', onRepair);
   }
   return paths;
 }
@@ -123,8 +146,8 @@ export function structuralPathExists(path: string): boolean {
   }
 }
 
-export function ensurePrivateFile(path: string): void {
-  if (structuralPathExists(path)) assertOwnedPrivate(path, 0o600, 'file');
+export function ensurePrivateFile(path: string, onRepair?: PermissionRepairReporter): void {
+  if (structuralPathExists(path)) assertOwnedPrivate(path, 0o600, 'file', onRepair);
 }
 
 export interface GatewayLock {
@@ -141,13 +164,28 @@ export class GatewayLockContendedError extends Error {
   }
 }
 
-function verifyLockFile(path: string, stat: Stats): void {
+function verifyLockFile(
+  path: string,
+  stat: Stats,
+  onRepair?: PermissionRepairReporter,
+  repair = true,
+): void {
   if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink structural path: ${path}`);
   if (!stat.isFile()) throw new Error(`Unexpected non-file path: ${path}`);
   const owner = uid();
   if (owner !== undefined && stat.uid !== owner) throw new Error(`Foreign-owned path: ${path}`);
-  if ((stat.mode & 0o777) !== 0o600)
-    throw new Error(`Unsafe gateway lock mode (expected 0600): ${path}`);
+  if ((stat.mode & 0o777) !== 0o600) {
+    if (!repair) throw new Error(`Unsafe gateway lock mode (expected 0600): ${path}`);
+    try {
+      chmodSync(path, 0o600);
+    } catch (error) {
+      throw new Error(
+        `Unable to repair permissions for ${path} (run chmod 600 ${path}): ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+    onRepair?.(path, 0o600);
+  }
 }
 
 /**
@@ -162,10 +200,19 @@ export function acquireGatewayLock(
     createFile?: boolean;
     writeMetadata?: boolean;
     readOnly?: boolean;
+    onRepair?: PermissionRepairReporter;
   } = {},
 ): GatewayLock {
-  if (options.createLayout !== false) ensurePrivateLayout(paths);
-  else assertOwnedPrivate(paths.dataDir, 0o700, 'directory');
+  if (options.createLayout !== false)
+    ensurePrivateLayout(paths, options.readOnly ? undefined : options.onRepair);
+  else
+    assertOwnedPrivate(
+      paths.dataDir,
+      0o700,
+      'directory',
+      options.readOnly ? undefined : options.onRepair,
+      !options.readOnly,
+    );
 
   let fd: number | undefined;
   let locked = false;
@@ -173,7 +220,12 @@ export function acquireGatewayLock(
     let before: Stats;
     try {
       before = lstatSync(paths.lock);
-      verifyLockFile(paths.lock, before);
+      verifyLockFile(
+        paths.lock,
+        before,
+        options.readOnly ? undefined : options.onRepair,
+        !options.readOnly,
+      );
       const noAtime = options.readOnly ? (constants.O_NOATIME ?? 0) : 0;
       fd = openSync(
         paths.lock,
@@ -190,7 +242,12 @@ export function acquireGatewayLock(
         0o600,
       );
       before = lstatSync(paths.lock);
-      verifyLockFile(paths.lock, before);
+      verifyLockFile(
+        paths.lock,
+        before,
+        options.readOnly ? undefined : options.onRepair,
+        !options.readOnly,
+      );
     }
     const opened = fstatSync(fd);
     if (before.dev !== opened.dev || before.ino !== opened.ino)

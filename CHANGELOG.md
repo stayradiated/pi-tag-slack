@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased — breaking single-conversation release
+## 0.2.1
+
+### Setup UX
+
+- Setup asks for the trusted user first, uses visible token entry, reports bounded validation progress, repairs safe same-user modes, and never installs or starts the daemon service automatically.
+
+## 0.2.0 — breaking single-conversation release
 
 This Linux-only alpha release hard-cuts to one configured public/private Slack conversation and one daemon-owned persistent pi RPC session.
 

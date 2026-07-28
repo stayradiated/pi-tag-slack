@@ -13,7 +13,6 @@ export type InteractiveSetupValues = {
 
 export interface SetupPrompts {
   text(options: { message: string; initialValue?: string }): Promise<string | symbol>;
-  password(options: { message: string }): Promise<string | symbol>;
   select(options: {
     message: string;
     initialValue?: string;
@@ -26,7 +25,6 @@ export interface SetupPrompts {
 
 export const systemSetupPrompts: SetupPrompts = {
   text: clack.text,
-  password: clack.password,
   select: clack.select,
   confirm: clack.confirm,
   isCancel: clack.isCancel,
@@ -43,6 +41,8 @@ function cancelled(prompts: SetupPrompts, value: unknown): boolean {
 export async function collectInteractiveSetup(
   prompts: SetupPrompts,
 ): Promise<InteractiveSetupValues | undefined> {
+  const trustedUser = await prompts.text({ message: 'Initial trusted Slack user (U... or W...)' });
+  if (cancelled(prompts, trustedUser)) return undefined;
   const channel = await prompts.text({ message: 'Slack channel ID (C... or G...)' });
   if (cancelled(prompts, channel)) return undefined;
   const cwd = await prompts.text({ message: 'Working directory', initialValue: process.cwd() });
@@ -60,12 +60,12 @@ export async function collectInteractiveSetup(
     })),
   });
   if (cancelled(prompts, thinking)) return undefined;
-  const botToken = await prompts.password({ message: 'Slack bot token (xoxb-...)' });
+  // Visible entry is intentional: tokens stay out of argv/history but can be
+  // observed in this terminal or its recording.
+  const botToken = await prompts.text({ message: 'Slack bot token (xoxb-...)' });
   if (cancelled(prompts, botToken)) return undefined;
-  const appToken = await prompts.password({ message: 'Slack app token (xapp-...)' });
+  const appToken = await prompts.text({ message: 'Slack app token (xapp-...)' });
   if (cancelled(prompts, appToken)) return undefined;
-  const trustedUser = await prompts.text({ message: 'Initial trusted Slack user (U... or W...)' });
-  if (cancelled(prompts, trustedUser)) return undefined;
   return {
     channel: channel as string,
     cwd: cwd as string,

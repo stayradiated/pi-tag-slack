@@ -29,7 +29,7 @@ pnpm add -g @stayradiated/pi-tag-slack
 
 1. Create a Slack app from [`manifest.yaml`](./manifest.yaml), enable Socket Mode, install it to the workspace, and create an app-level token with `connections:write`.
 2. Invite the bot to the target conversation. Record its raw `C...` or `G...` ID and an initial trusted member's `U...` or `W...` ID.
-3. Provide bootstrap tokens and run setup. Prefer interactive setup: leave the token flags and `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN` unset, then enter each token at its prompt. This keeps literal tokens out of the command line and shell history. For automation, obtain tokens through a secret manager or another history-safe mechanism; do not put literal tokens in commands or `export` statements.
+3. Provide bootstrap tokens and run setup. Interactive setup asks for the initial trusted user first. Token input is intentionally visible: this keeps literal tokens out of command-line arguments and shell history, but exposes them to screen observers and terminal recording software. For automation, obtain tokens through a secret manager or another history-safe mechanism; do not put literal tokens in commands or `export` statements.
 
 ```bash
 pi-tag-slack setup \
@@ -39,15 +39,16 @@ pi-tag-slack setup \
   --trusted-user U0123456789
 ```
 
-Setup validates pi, the Slack tokens, Socket Mode authentication, conversation type/access/membership, and the trusted user before staging and installing state. `--thinking <off|minimal|low|medium|high|xhigh|max>` is optional.
+Setup reports each validation stage, uses bounded setup-only Pi and Slack requests, and validates pi, the Slack tokens, Socket Mode authentication, conversation type/access/membership, and the trusted user before staging and installing state. Same-user managed files and directories with incorrect modes are repaired to `0600`/`0700`; symlinks, foreign-owned paths, and wrong file types are refused. `--thinking <off|minimal|low|medium|high|xhigh|max>` is optional.
 
 `--pi-bin` defaults to `pi`; it may be a command name found on setup's `PATH` or an absolute path, but not a relative path. Setup resolves, checks, and stores the canonical absolute executable, so the systemd service does not depend on the invoking shell's `PATH`.
 
-Interactive setup collects missing values and installs and starts the user service after success. Non-interactive setup prints the service steps:
+Setup never installs or starts a service. After either interactive or non-interactive success, explicitly run:
 
 ```bash
 pi-tag-slack daemon install
 pi-tag-slack daemon start
+pi-tag-slack daemon status
 ```
 
 Reapply the manifest and reinstall/approve the Slack app whenever scopes or subscriptions change. The manifest subscribes only to `message.channels` and `message.groups`; it requests the conversation/history/user/file/reaction/send scopes used by this gateway.
