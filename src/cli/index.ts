@@ -17,6 +17,8 @@ import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { presentFailure, presentSuccess } from './presentation.js';
+import { parseCliCommand, parseSetupOptions, type SetupOptions } from './parsing.js';
+export { commandFor, paramsFor } from './parsing.js';
 import {
   validateFirstTimeSetup,
   type SetupProgress,
@@ -72,25 +74,22 @@ Usage:
 
 Runtime commands use the daemon control socket. Run setup before starting the daemon.`;
 
-type Flags = Record<string, string | boolean | string[]>;
-
 export async function main(argv = process.argv.slice(2)): Promise<number> {
-  const [group, verb, ...rest] = argv;
-  if (!group || group === 'help' || group === '--help') {
+  const parsed = parseCliCommand(argv);
+  if (parsed.kind === 'help') {
     console.log(help);
     return 0;
   }
-  if (group === 'setup')
-    return setup([verb, ...rest].filter((value): value is string => Boolean(value)));
-  if (group === 'start') {
+  if (parsed.kind === 'setup') return setup(parsed.args);
+  if (parsed.kind === 'start') {
     const { startGateway } = await import('../index.js');
     await startGateway();
     return 0;
   }
-  if (group === 'doctor') return doctor();
-  if (group === 'daemon') {
-    const status = daemon(verb ?? '');
-    if (verb !== 'status' || status !== 'running') return 0;
+  if (parsed.kind === 'doctor') return doctor();
+  if (parsed.kind === 'daemon') {
+    const status = daemon(parsed.verb);
+    if (parsed.verb !== 'status' || status !== 'running') return 0;
     try {
       const health = await request('health', {});
       if (health.error) {
@@ -110,31 +109,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 1;
     }
   }
-
-  const json = argv.includes('--json');
-  // Presentation is a CLI concern, not a control-protocol parameter. Removing
-  // it here lets every runtime command support the flag consistently.
-  const runtimeArgs = rest.filter((argument) => argument !== '--json');
-  const fileDownload = group === 'slack' && verb === 'file' && runtimeArgs[0] === 'download';
-  const sessionNested =
-    group === 'session' && (verb === 'model' || verb === 'thinking' || verb === 'archive');
-  const command = fileDownload
-    ? 'slack.file.download'
-    : commandFor(group, verb, sessionNested ? runtimeArgs[0] : undefined);
-  if (!command)
-    throw Object.assign(new Error('Unsupported command. Run pi-tag-slack help for usage.'), {
-      code: 'UNKNOWN_COMMAND',
-    });
-  const response = await request(
-    command,
-    paramsFor(
-      command,
-      fileDownload ? runtimeArgs.slice(1) : sessionNested ? runtimeArgs.slice(1) : runtimeArgs,
-    ),
-  );
+  const response = await request(parsed.command, parsed.params);
   if (response.error)
     throw Object.assign(new Error(response.error.message), { code: response.error.code });
-  console.log(presentSuccess(command, response.result, json));
+  console.log(presentSuccess(parsed.command, response.result, parsed.json));
   return 0;
 }
 
@@ -203,23 +181,8 @@ export async function setup(
   validationDependencies?: SetupValidationDependencies,
   dependencies = systemSetupDependencies(),
 ): Promise<number> {
-  const options = parseFlags(
-    args,
-    new Set([
-      'channel',
-      'cwd',
-      'pi-bin',
-      'model',
-      'thinking',
-      'bot-token',
-      'app-token',
-      'trusted-user',
-      'reset',
-      'yes',
-    ]),
-  );
-  const reset = options.reset === true;
-  const yes = options.yes === true;
+  const options = parseSetupOptions(args);
+  const { reset, yes } = options;
   const paths = ensurePrivateLayout();
   const journal = structuralPathExists(paths.journal) ? readResetJournal(paths.journal) : undefined;
   const incompleteJournal = journal !== undefined && journal.phase !== 'complete';
@@ -249,8 +212,13 @@ export async function setup(
     setupSuccess();
     return 0;
   }
-  const required = ['channel', 'cwd', 'model', 'bot-token', 'app-token', 'trusted-user'];
-  const missingRequired = required.some((name) => typeof options[name] !== 'string');
+  const missingRequired =
+    !options.channel ||
+    !options.cwd ||
+    !options.model ||
+    !options.botToken ||
+    !options.appToken ||
+    !options.trustedUser;
   if (interactive && missingRequired) {
     const values = await collectInteractiveSetup(dependencies.prompts);
     if (!values) return 1;
@@ -274,7 +242,7 @@ export async function setup(
       ...(reset ? ['--reset'] : []),
     ];
     return setupCore(
-      collected,
+      parseSetupOptions(collected),
       validationDependencies,
       async (message) => confirmInteractiveReset(dependencies.prompts, message),
       dependencies.afterStep,
@@ -286,7 +254,7 @@ export async function setup(
     });
   }
   const result = await setupCore(
-    args,
+    options,
     validationDependencies,
     interactive && reset && !yes
       ? async (message) => confirmInteractiveReset(dependencies.prompts, message)
@@ -356,44 +324,24 @@ function fsyncSetupPath(path: string, directory = false): void {
 }
 
 async function setupCore(
-  args: string[],
+  options: SetupOptions,
   validationDependencies?: SetupValidationDependencies,
   confirmReset?: (message: string) => Promise<boolean>,
   afterStep: (step: string) => void = () => {},
   onValidatedPiBinary?: (piBinary: string) => void,
   progress?: SetupProgress,
 ): Promise<number> {
-  const options = parseFlags(
-    args,
-    new Set([
-      'channel',
-      'cwd',
-      'pi-bin',
-      'model',
-      'thinking',
-      'bot-token',
-      'app-token',
-      'trusted-user',
-      'reset',
-      'yes',
-    ]),
-  );
-  const value = (name: string) => (typeof options[name] === 'string' ? options[name] : undefined);
-  const reset = options.reset === true;
-  const yes = options.yes === true;
-  const channel = value('channel');
-  const cwd = value('cwd');
-  const model = value('model');
-  const botToken = value('bot-token') ?? process.env.SLACK_BOT_TOKEN?.trim();
-  const appToken = value('app-token') ?? process.env.SLACK_APP_TOKEN?.trim();
-  const trusted = value('trusted-user');
+  const { channel, cwd, model, reset, yes } = options;
+  const botToken = options.botToken ?? process.env.SLACK_BOT_TOKEN?.trim();
+  const appToken = options.appToken ?? process.env.SLACK_APP_TOKEN?.trim();
+  const trusted = options.trustedUser;
   if (!channel || !cwd || !model || !botToken || !appToken || !trusted) {
     throw new Error(
       'Usage: pi-tag-slack setup --channel <C...|G...> --cwd <path> --model <ref> --trusted-user <U...|W...> (--bot-token <xoxb-...> --app-token <xapp-...> | environment tokens)',
     );
   }
-  const piBinary = value('pi-bin') ?? 'pi';
-  const thinking = value('thinking') ?? 'medium';
+  const piBinary = options.piBin ?? 'pi';
+  const thinking = options.thinking ?? 'medium';
   if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinking))
     throw new Error('Invalid default thinking level.');
 
@@ -606,199 +554,6 @@ async function setupCore(
     }
     lock.release();
   }
-}
-
-export function commandFor(group: string, verb?: string, nestedVerb?: string): string | undefined {
-  const allowed = new Set([
-    'inbox.list',
-    'inbox.show',
-    'inbox.resolve',
-    'inbox.working',
-    'inbox.respond',
-    'slack.history',
-    'slack.message',
-    'slack.thread',
-    'slack.file.download',
-    'slack.send',
-    'task.list',
-    'task.show',
-    'task.add',
-    'task.resolve',
-    'schedule.add',
-    'schedule.list',
-    'schedule.show',
-    'schedule.enable',
-    'schedule.disable',
-    'schedule.remove',
-    'trust.list',
-    'trust.add',
-    'trust.remove',
-    'config.show',
-    'config.set',
-    'config.reset',
-    'session.status',
-    'session.reset',
-    'session.archive.list',
-    'session.archive.cleanup',
-    'session.model.list',
-    'session.model.set',
-    'session.model.reset',
-    'session.thinking.set',
-    'session.thinking.reset',
-  ]);
-  const command = nestedVerb ? `${group}.${verb ?? ''}.${nestedVerb}` : `${group}.${verb ?? ''}`;
-  return allowed.has(command) ? command : undefined;
-}
-
-export function paramsFor(command: string, args: string[]): Record<string, unknown> {
-  if (command === 'slack.history') {
-    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
-    return compact({ limit: numberFlag(flags.limit), cursor: flags.cursor });
-  }
-  if (command === 'slack.message') {
-    parseFlags(args, new Set(['json']));
-    return { messageTs: positional(args, new Set(['json']))[0] };
-  }
-  if (command === 'slack.thread') {
-    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
-    return compact({
-      threadTs: positional(args, new Set(['limit', 'cursor', 'json']))[0],
-      limit: numberFlag(flags.limit),
-      cursor: flags.cursor,
-    });
-  }
-  if (command === 'slack.file.download') {
-    parseFlags(args, new Set(['json']));
-    return { fileId: positional(args, new Set(['json']))[0] };
-  }
-  if (command === 'slack.send') {
-    const flags = parseFlags(args, new Set(['thread', 'text', 'file', 'json']), new Set(['file']));
-    return compact({
-      threadTs: flags.thread,
-      text: flags.text,
-      files: typeof flags.file === 'string' ? [flags.file] : flags.file,
-    });
-  }
-  if (command === 'session.archive.list') {
-    const flags = parseFlags(args, new Set(['limit', 'cursor', 'json']));
-    return compact({ limit: numberFlag(flags.limit), cursor: flags.cursor });
-  }
-  if (command === 'session.archive.cleanup') {
-    parseFlags(args, new Set());
-    return {};
-  }
-  if (command.endsWith('.list')) {
-    const flags = parseFlags(args, new Set(['state', 'limit', 'cursor', 'json']));
-    return compact({ state: flags.state, limit: numberFlag(flags.limit), cursor: flags.cursor });
-  }
-  if (command.endsWith('.show') || command === 'inbox.working') return { id: args[0] };
-  if (command === 'inbox.respond') {
-    const flags = parseFlags(args, new Set(['text', 'file', 'json']), new Set(['file']));
-    return {
-      id: positional(args, new Set(['text', 'file']))[0],
-      text: flags.text,
-      ...(flags.file === undefined
-        ? {}
-        : { files: typeof flags.file === 'string' ? [flags.file] : flags.file }),
-    };
-  }
-  if (command.endsWith('.resolve')) {
-    const flags = parseFlags(args, new Set(['reason']));
-    return {
-      ids: positional(args, new Set(['reason'])),
-      ...(typeof flags.reason === 'string' ? { reason: flags.reason } : {}),
-    };
-  }
-  if (command === 'task.add') {
-    const flags = parseFlags(args, new Set(['title', 'instructions']));
-    return { title: flags.title, instructions: flags.instructions };
-  }
-  if (command === 'schedule.add') {
-    const flags = parseFlags(args, new Set(['title', 'instructions', 'at', 'cron', 'timezone']));
-    return compact({
-      title: flags.title,
-      instructions: flags.instructions,
-      at: flags.at,
-      cron: flags.cron,
-      timezone: flags.timezone,
-    });
-  }
-  if (
-    command === 'schedule.enable' ||
-    command === 'schedule.disable' ||
-    command === 'schedule.remove'
-  )
-    return { id: args[0] };
-  if (command === 'trust.add') return { userId: args[0] };
-  if (command === 'trust.remove') return { userId: args[0] };
-  if (command === 'config.set') return { key: args[0], value: args[1] };
-  if (command === 'config.reset') return { key: args[0] };
-  if (command === 'session.status' || command === 'session.model.list') {
-    parseFlags(args, new Set(['json']));
-    return {};
-  }
-  if (command === 'session.reset') {
-    const flags = parseFlags(args, new Set(['confirm', 'json']));
-    return compact({ confirm: flags.confirm });
-  }
-  if (command === 'session.model.set') {
-    parseFlags(args, new Set());
-    return { ref: positional(args, new Set())[0] };
-  }
-  if (command === 'session.model.reset' || command === 'session.thinking.reset') {
-    parseFlags(args, new Set());
-    return {};
-  }
-  if (command === 'session.thinking.set') {
-    parseFlags(args, new Set());
-    return { level: positional(args, new Set())[0] };
-  }
-  return {};
-}
-
-function compact(values: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
-}
-
-function numberFlag(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined;
-  return Number(value);
-}
-
-function positional(args: string[], flagNames: Set<string>): string[] {
-  const result: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index].startsWith('--')) {
-      if (flagNames.has(args[index].slice(2))) index += 1;
-      continue;
-    }
-    result.push(args[index]);
-  }
-  return result;
-}
-
-function parseFlags(args: string[], names: Set<string>, repeatable = new Set<string>()): Flags {
-  const result: Flags = {};
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (!argument.startsWith('--')) continue;
-    const name = argument.slice(2);
-    if (!names.has(name)) throw new Error(`Unknown option: ${argument}`);
-    if (name === 'json' || name === 'reset' || name === 'yes') {
-      result[name] = true;
-      continue;
-    }
-    const value = args[index + 1];
-    if (!value || value.startsWith('--')) throw new Error(`Option ${argument} requires a value.`);
-    if (repeatable.has(name)) {
-      const current = result[name];
-      result[name] = current === undefined ? [value] : [...(current as string[]), value];
-    } else {
-      result[name] = value;
-    }
-    index += 1;
-  }
-  return result;
 }
 
 const MAX_RESPONSE_FRAME_BYTES = 1024 * 1024;
