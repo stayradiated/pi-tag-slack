@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+### Pi runtime environment
+
+- Support an optional bootstrap `EXTRA_PATH` setting, prepended only when validating or launching Pi. This permits package-manager Pi shims to find their runtime under a minimal service PATH.
+
 ## 0.2.1
 
 ### Setup UX
