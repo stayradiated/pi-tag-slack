@@ -57,10 +57,10 @@ Thanks for your interest in contributing! This guide will help you get started.
 4. Commit your changes with a descriptive message following [Conventional Commits](https://www.conventionalcommits.org/):
 
    ```
-   feat: add slash command for channel settings
-   fix: prevent duplicate queue entries
+   feat: add inbox filtering
+   fix: prevent duplicate inbox admission
    docs: update setup instructions
-   chore: bump @slack/bolt to v4.8
+   chore: bump @slack/bolt to v5.0.0
    ```
 
 5. Push your branch and open a Pull Request against `main`.

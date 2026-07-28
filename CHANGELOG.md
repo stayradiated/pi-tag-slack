@@ -10,6 +10,7 @@ This alpha release hard-cuts to one configured public/private Slack conversation
 - Runtime interaction is through the daemon-owned inbox, task, schedule, Slack, trust, configuration, and session CLI groups. Pi output remains session-local unless pi explicitly uses `slack send` or `inbox respond`.
 - Bootstrap configuration is limited to Slack tokens and the `PI_TAG_SLACK_CONFIG` / `PI_TAG_SLACK_DATA_DIR` deployment path overrides. Operational settings are persisted by the gateway.
 - The Slack app manifest has changed. Reapply `manifest.yaml`, then reinstall/approve the Slack app.
+- Removed obsolete runtime declarations for `@slack/types`, `minimatch`, and `pino-pretty`. Exact-pinned Pi packages remain development-only; runtime integration is exclusively through the configured `pi` executable.
 
 ### Required migration
 
@@ -26,6 +27,13 @@ This alpha release hard-cuts to one configured public/private Slack conversation
    ```
 
 This release does not migrate or silently adopt prior gateway state. `setup --reset --yes` is an explicit replacement operation and creates a backup bundle; it is not a cleanup instruction.
+
+### Alpha operational limitations
+
+- Trusted Slack users can influence agent decisions and tool use with the daemon account's local capabilities. Slack trust is remote authority over that account.
+- Pi runs headlessly over RPC. Project or user extensions that require interactive UI/dialog input can block the persistent session and should be disabled for this daemon.
+- Upload path checks reduce accidental races but cannot prevent a same-UID process from changing a file after the final check and before the Slack library opens it.
+- Log rotation is deferred for alpha. Linux uses host `journald` retention; macOS daemon log files are unbounded unless the operator configures external rotation. Archive and media retention settings do not cover logs.
 
 ## Earlier releases
 

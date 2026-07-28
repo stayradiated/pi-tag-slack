@@ -2,16 +2,18 @@
 
 ## Status
 
-**Not shippable.** The hard-cut single-conversation architecture is broadly implemented, but several correctness defects and missing failure tests remain release-blocking.
+**Automated gate complete; manual release validation remains.** The hard-cut single-conversation architecture and its automatable operational cleanup are implemented. The unchecked live Slack, systemd, and launchd gates still block release sign-off.
 
-Verified against the current tree in March 2026:
+Verified against the current tree in July 2026:
 
-- `pnpm test`: 156 passed, 1 skipped
+- `pnpm install --frozen-lockfile`: passed
+- `pnpm audit --prod`: no known vulnerabilities
+- `pnpm format:check`: passed
 - `pnpm lint`: passed
+- `pnpm test`: 209 passed, 1 skipped
 - `pnpm build`: passed
-- `pnpm format:check`: failed on `test/session-controls.test.ts`
 
-Passing tests do not establish completion. The release gate is the acceptance checklist in this document, including manual Slack, systemd, and launchd validation.
+Passing automated checks do not establish completion of the unchecked manual platform and Slack validation below.
 
 ## Goal
 
@@ -146,12 +148,12 @@ Required change:
 
 Acceptance tests:
 
-- [ ] A real top-level Events API fixture reaches SQLite before the captured acknowledgement callback.
-- [ ] Injected SQLite failure produces no acknowledgement and no post-commit side effect.
-- [ ] Duplicate delivery is acknowledged but causes no second notification/reaction.
-- [ ] Ignored bot/untrusted/channel-mismatch/missing-mention events acknowledge without persistence.
-- [ ] New/edit/delete public and private channel fixtures use top-level `event_id`.
-- [ ] Restart and concurrent duplicate tests prove one inbox mutation and one notification.
+- [x] A real top-level Events API fixture reaches SQLite before the captured acknowledgement callback.
+- [x] Injected SQLite failure produces no acknowledgement and no post-commit side effect.
+- [x] Duplicate delivery is acknowledged but causes no second notification/reaction.
+- [x] Ignored bot/untrusted/channel-mismatch/missing-mention events acknowledge without persistence.
+- [x] New/edit/delete public and private channel fixtures use top-level `event_id`.
+- [x] Restart and concurrent duplicate tests prove one inbox mutation and one notification.
 
 ### 2. Repair reaction reconciliation
 
@@ -168,13 +170,13 @@ Required change:
 
 Acceptance tests:
 
-- [ ] Removal succeeds/addition fails/retry eventually adds the desired reaction.
-- [ ] `no_reaction` is handled idempotently.
-- [ ] `👀 -> ⏳`, response cleanup, and silent-resolution `✅` work.
-- [ ] Pi crash and session reset revert open `⏳` items to `👀`.
-- [ ] User reactions are not removed.
-- [ ] Restart preserves enough retry state to continue reconciliation.
-- [ ] Deleted-source handling converges without repeated retries.
+- [x] Removal succeeds/addition fails/retry eventually adds the desired reaction.
+- [x] `no_reaction` is handled idempotently.
+- [x] `👀 -> ⏳`, response cleanup, and silent-resolution `✅` work.
+- [x] Pi crash and session reset revert open `⏳` items to `👀`.
+- [x] User reactions are not removed.
+- [x] Restart preserves enough retry state to continue reconciliation.
+- [x] Deleted-source handling converges without repeated retries.
 
 ### 3. Harden persistent pi RPC transport
 
@@ -191,13 +193,13 @@ Required change:
 
 Acceptance tests:
 
-- [ ] Large stderr output cannot stall command responses.
-- [ ] Oversized unterminated and terminated frames degrade/restart the session without unbounded allocation.
-- [ ] Unicode line separators do not split frames; invalid UTF-8 is fatal.
-- [ ] Wrong-command and malformed same-ID responses are rejected.
-- [ ] Nonresponding commands time out and do not leak pending entries.
-- [ ] Exit/error races reject pending work once and schedule at most one restart.
-- [ ] Automatic restart sends no prompt; exhausted-window new work behavior remains correct.
+- [x] Large stderr output cannot stall command responses.
+- [x] Oversized unterminated and terminated frames degrade/restart the session without unbounded allocation.
+- [x] Unicode line separators do not split frames; invalid UTF-8 is fatal.
+- [x] Wrong-command and malformed same-ID responses are rejected.
+- [x] Nonresponding commands time out and do not leak pending entries.
+- [x] Exit/error races reject pending work once and schedule at most one restart.
+- [x] Automatic restart sends no prompt; exhausted-window new work behavior remains correct.
 
 ### 4. Close coordinator, configuration, and reset races
 
@@ -216,15 +218,15 @@ Required change:
 
 Acceptance tests:
 
-- [ ] Invalid live default model/thinking values leave SQLite unchanged.
-- [ ] Idle defaults apply immediately; active defaults apply only after `agent_settled`.
-- [ ] Wrong and stale reset challenges do nothing.
-- [ ] The successful confirmation response flushes before child termination begins.
-- [ ] Settlement or new-run change between reservation and flush makes confirmation stale.
-- [ ] Client disconnect before flush cancels reset.
-- [ ] Concurrent Slack delivery/task creation/reset has deterministic durable results.
-- [ ] Reset preserves open inbox items, tasks, schedules, cwd, and desired overrides.
-- [ ] Reset sends one aggregate recovery summary and updates no individual acceptance metadata.
+- [x] Invalid live default model/thinking values leave SQLite unchanged.
+- [x] Idle defaults apply immediately; active defaults apply only after `agent_settled`.
+- [x] Wrong and stale reset challenges do nothing.
+- [x] The successful confirmation response flushes before child termination begins.
+- [x] Settlement or new-run change between reservation and flush makes confirmation stale.
+- [x] Client disconnect before flush cancels reset.
+- [x] Concurrent Slack delivery/task creation/reset has deterministic durable results.
+- [x] Reset preserves open inbox items, tasks, schedules, cwd, and desired overrides.
+- [x] Reset sends one aggregate recovery summary and updates no individual acceptance metadata.
 
 ### 5. Complete persistence and control-boundary validation
 
@@ -240,13 +242,13 @@ Required change:
 
 Acceptance tests:
 
-- [ ] Malformed rows fail startup/application reads with a safe diagnostic.
-- [ ] State/resolved timestamp, source deletion, JSON, schedule, and RPC metadata constraints reject inconsistent rows.
-- [ ] WAL/FULL/foreign-keys/busy-timeout/trusted-schema are read back and verified.
-- [ ] Invalid user/public IDs and expected Slack failures never become `INTERNAL`.
-- [ ] SQLite details and sensitive paths never cross the control boundary.
-- [ ] Slack response budgeting returns `RESPONSE_TOO_LARGE` predictably.
-- [ ] Partial, oversized, malformed, second-frame, EOF-before-LF, idle-timeout, and correlation tests remain green.
+- [x] Malformed rows fail startup/application reads with a safe diagnostic.
+- [x] State/resolved timestamp, source deletion, JSON, schedule, and RPC metadata constraints reject inconsistent rows.
+- [x] WAL/FULL/foreign-keys/busy-timeout/trusted-schema are read back and verified.
+- [x] Invalid user/public IDs and expected Slack failures never become `INTERNAL`.
+- [x] SQLite details and sensitive paths never cross the control boundary.
+- [x] Slack response budgeting returns `RESPONSE_TOO_LARGE` predictably.
+- [x] Partial, oversized, malformed, second-frame, EOF-before-LF, idle-timeout, and correlation tests remain green.
 
 ## Operational completion
 
@@ -271,19 +273,19 @@ The journaled implementation exists, but it needs adversarial validation before 
 - [x] Keep offline doctor lock-gated and source-state read-only, including WAL-resident commits in its disposable snapshot.
 - [x] Report every canonical path with owner, mode, type, and symlink diagnostics.
 - [x] Surface degraded pi and control-server runtime errors in doctor/session/daemon status.
-- [ ] Decide and document log rotation/retention behavior or explicitly defer it for alpha.
+- [x] Decide and document log rotation/retention behavior or explicitly defer it for alpha.
 - [ ] Run Linux systemd user-service install/start/status/log/stop/uninstall smoke tests.
 - [ ] Run macOS launchd install/start/status/log/stop/uninstall smoke tests.
 - [x] Verify bounded ordered shutdown with active Slack, control, scheduler, coordinator, and pi work.
 
 ### Dependency and documentation cleanup
 
-- [ ] Fix formatting and keep format/lint/test/build green.
-- [ ] Remove dependencies proven obsolete after implementation settles.
-- [ ] Keep exact-pinned Pi packages development-only for types; the configured executable is the sole runtime integration.
-- [ ] Re-audit README, `.env.example`, changelog, manifest instructions, service reinstall instructions, and prompt examples against the final CLI.
-- [ ] Document that project/user pi extensions requiring interactive UI may block in RPC/headless mode.
-- [ ] Document same-UID upload TOCTOU limits and the trusted Slack user's ability to influence an agent with daemon-account capabilities.
+- [x] Fix formatting and keep format/lint/test/build green.
+- [x] Remove dependencies proven obsolete after implementation settles.
+- [x] Keep exact-pinned Pi packages development-only for types; the configured executable is the sole runtime integration.
+- [x] Re-audit README, `.env.example`, changelog, manifest instructions, service reinstall instructions, and prompt examples against the final CLI.
+- [x] Document that project/user pi extensions requiring interactive UI may block in RPC/headless mode.
+- [x] Document same-UID upload TOCTOU limits and the trusted Slack user's ability to influence an agent with daemon-account capabilities.
 
 ## Required public CLI
 
@@ -307,7 +309,7 @@ pi-tag-slack task list [--state <open|resolved|all>] [--limit <n>] [--cursor <op
 pi-tag-slack task show <task-id> [--json]
 pi-tag-slack task resolve <task-id> [<task-id> ...] [--reason <text>]
 
-pi-tag-slack schedule add --title <text> --instructions <text> --at <ISO-8601>
+pi-tag-slack schedule add --title <text> --instructions <text> --at <ISO-8601-with-Z-or-offset>
 pi-tag-slack schedule add --title <text> --instructions <text> --cron <five-field> --timezone <IANA>
 pi-tag-slack schedule list [--limit <n>] [--cursor <opaque>] [--json]
 pi-tag-slack schedule show <schedule-id> [--json]
@@ -335,7 +337,7 @@ pi-tag-slack session archive cleanup
 Local/offline commands:
 
 ```text
-pi-tag-slack setup [--reset] [--yes]
+pi-tag-slack setup [--reset] [--yes] [--channel <C...|G...> --cwd <path> --model <provider/model> --trusted-user <U...|W...>] [--pi-bin <path>] [--thinking <level>] [--bot-token <xoxb-...> --app-token <xapp-...>]
 pi-tag-slack daemon install|uninstall|start|stop|status|logs
 pi-tag-slack doctor
 pi-tag-slack help
@@ -404,9 +406,9 @@ Automated:
 3. [x] `pnpm lint`
 4. [x] `pnpm test`
 5. [x] `pnpm build`
-6. [ ] Production dependency audit
-7. [ ] All acceptance tests in sections 1–5
-8. [ ] Reset failure-injection and WAL-only commit tests
+6. [x] Production dependency audit
+7. [x] All acceptance tests in sections 1–5
+8. [x] Reset failure-injection and WAL-only commit tests
 
 Manual:
 

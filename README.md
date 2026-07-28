@@ -5,7 +5,7 @@
 `pi-tag-slack` accepts trusted, explicitly mentioned Slack work into a durable inbox and presents it to one daemon-owned [pi](https://github.com/badlogic/pi-mono) session. Pi decides whether and how to act; ordinary assistant output remains in that pi session and is never posted to Slack automatically.
 
 > [!WARNING]
-> This is a breaking alpha release. The configured working directory and its project resources are trusted by pi. Trusted Slack users can influence an agent running with the daemon account's local capabilities. Anyone with the same OS UID can use the local CLI/control socket with equivalent authority; this is not a privilege boundary. Do not run it as root. User or project extensions that request headless UI/dialog interaction may block: extension UI/dialog support is out of scope.
+> This is a breaking alpha release. The configured working directory and its project resources are trusted by pi. Trusted Slack users can influence the agent's decisions and tool use with the daemon account's local filesystem, process, network, and credential capabilities; Slack trust is therefore remote authority over that account, not merely permission to chat. Anyone with the same OS UID can use the local CLI/control socket with equivalent authority; this is not a privilege boundary. Do not run it as root. Pi runs in headless RPC mode: user or project extensions that open interactive UI, dialogs, or prompts may wait forever and block the persistent session. Disable those extensions for the daemon because interactive extension support is out of scope.
 
 ## Requirements
 
@@ -100,6 +100,10 @@ pi-tag-slack doctor
 
 `start` runs the gateway in the foreground and is primarily the service entrypoint. `doctor` uses daemon health when available, otherwise performs lock-gated read-only diagnostics.
 
+### Alpha log retention decision
+
+Automatic log rotation and deletion are explicitly deferred for alpha. On Linux, logs go to the systemd journal and retention is whatever the host's `journald` policy provides. On macOS, launchd appends to `<data-dir>/daemon.stdout.log` and `<data-dir>/daemon.stderr.log`; the gateway does not rotate or truncate them. Operators must configure host rotation/retention and monitor disk use. `archiveRetentionDays` and `mediaRetentionHours` do not apply to daemon logs.
+
 ## CLI reference
 
 Successful read/list commands support `--json`; list commands use `--limit` and `--cursor` where shown. Runtime failures have stable error codes.
@@ -120,7 +124,7 @@ pi-tag-slack slack file download <file-id> [--json]
 pi-tag-slack slack send [--thread <thread-ts>] --text <text> [--file <path> ...]
 ```
 
-Slack navigation always reads the configured conversation live and does not ingest ambient history. File download is on demand. Outbound files must be daemon-readable regular files; symlinks, directories, devices, and sockets are rejected, and configured file/aggregate limits apply.
+Slack navigation always reads the configured conversation live and does not ingest ambient history. File download is on demand. Outbound files must be daemon-readable regular files; symlinks, directories, devices, and sockets are rejected, and configured file/aggregate limits apply. Uploads are identity-checked again immediately before the Slack API call, but the Web API library later reopens the path. A process with the same UID can still replace or modify a file in that interval (including an in-place change that preserves checked metadata), so upload validation is best-effort TOCTOU hardening, not protection from same-UID processes. Copy sensitive output into a private, stable file before sending.
 
 ### Tasks and schedules
 
@@ -174,7 +178,7 @@ This release does not migrate prior state. Preserve it.
 
 1. Stop the old daemon/service.
 2. Preserve the old data directory, bootstrap config, and all old session directories. Do **not** delete legacy sessions or any reset backup bundle.
-3. Install the new package.
+3. Install the new package. Pi is invoked only through the configured `pi` executable; this package does not bundle or import Pi as a runtime library.
 4. Run the new `pi-tag-slack setup` for the one intended conversation and trusted user. Use `setup --reset --yes` only when deliberately replacing existing gateway state; reset creates a backup bundle.
 5. Reapply [`manifest.yaml`](./manifest.yaml) in Slack, then reinstall/approve the app so the new scopes and event subscriptions take effect.
 6. Reinstall and start the user service:
