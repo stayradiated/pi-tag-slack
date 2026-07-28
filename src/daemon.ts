@@ -5,9 +5,14 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveConfigPath, resolveDataDir } from './config.js';
 import { gatewayPaths } from './paths.js';
+import {
+  LAUNCHD_LABEL,
+  launchdPlist,
+  SYSTEMD_SERVICE_NAME,
+  systemdUnit,
+} from './daemon-service-definitions.js';
 
-export const SYSTEMD_SERVICE_NAME = 'pi-tag-slack.service';
-export const LAUNCHD_LABEL = 'com.stayradiated.pi-tag-slack';
+export { LAUNCHD_LABEL, launchdPlist, SYSTEMD_SERVICE_NAME, systemdUnit };
 
 export type DaemonStatus = 'not-installed' | 'stopped' | 'running';
 
@@ -184,90 +189,4 @@ function launchd(action: string, deps: DaemonDependencies): DaemonStatus | void 
 function reportStatus(status: DaemonStatus): DaemonStatus {
   console.log(`Daemon status: ${status}.`);
   return status;
-}
-
-function systemdEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
-export function systemdUnit(
-  deps: Pick<DaemonDependencies, 'nodePath' | 'cliPath' | 'configPath' | 'dataDir'>,
-): string {
-  const quote = (value: string) => `"${systemdEscape(value)}"`;
-  return [
-    '[Unit]',
-    'Description=pi-tag-slack Slack Gateway',
-    'After=network-online.target',
-    'Wants=network-online.target',
-    '',
-    '[Service]',
-    'Type=simple',
-    `ExecStart=${quote(deps.nodePath)} ${quote(deps.cliPath)} start`,
-    'Restart=on-failure',
-    'RestartSec=10',
-    'StandardOutput=journal',
-    'StandardError=journal',
-    `Environment="PI_TAG_SLACK_CONFIG=${systemdEscape(deps.configPath)}"`,
-    `Environment="PI_TAG_SLACK_DATA_DIR=${systemdEscape(deps.dataDir)}"`,
-    '',
-    '[Install]',
-    'WantedBy=default.target',
-    '',
-  ].join('\n');
-}
-
-function xml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-export function launchdPlist(
-  deps: Pick<
-    DaemonDependencies,
-    'nodePath' | 'cliPath' | 'configPath' | 'dataDir' | 'homeDirectory' | 'pathEnvironment'
-  >,
-): string {
-  const paths = gatewayPaths(deps.dataDir);
-  return [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-    '<plist version="1.0">',
-    '<dict>',
-    '  <key>Label</key>',
-    `  <string>${LAUNCHD_LABEL}</string>`,
-    '  <key>ProgramArguments</key>',
-    '  <array>',
-    `    <string>${xml(deps.nodePath)}</string>`,
-    `    <string>${xml(deps.cliPath)}</string>`,
-    '    <string>start</string>',
-    '  </array>',
-    '  <key>WorkingDirectory</key>',
-    `  <string>${xml(deps.homeDirectory)}</string>`,
-    '  <key>EnvironmentVariables</key>',
-    '  <dict>',
-    '    <key>PI_TAG_SLACK_CONFIG</key>',
-    `    <string>${xml(deps.configPath)}</string>`,
-    '    <key>PI_TAG_SLACK_DATA_DIR</key>',
-    `    <string>${xml(deps.dataDir)}</string>`,
-    '    <key>PATH</key>',
-    `    <string>${xml(deps.pathEnvironment)}</string>`,
-    '  </dict>',
-    '  <key>KeepAlive</key>',
-    '  <dict>',
-    '    <key>SuccessfulExit</key>',
-    '    <false/>',
-    '  </dict>',
-    '  <key>ThrottleInterval</key>',
-    '  <integer>10</integer>',
-    '  <key>StandardOutPath</key>',
-    `  <string>${xml(paths.stdout)}</string>`,
-    '  <key>StandardErrorPath</key>',
-    `  <string>${xml(paths.stderr)}</string>`,
-    '</dict>',
-    '</plist>',
-    '',
-  ].join('\n');
 }
