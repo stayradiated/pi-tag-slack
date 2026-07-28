@@ -1,4 +1,5 @@
-import { App } from '@slack/bolt';
+import { SocketModeReceiver } from '@slack/bolt';
+import { WebClient } from '@slack/web-api';
 import {
   inboxSnapshot,
   ingestSlackEvent,
@@ -158,7 +159,41 @@ export async function processSlackEvent(
   return 'accepted';
 }
 
-/** Starts the one Socket Mode client. Socket Mode acknowledgement is handled by Bolt. */
+export type SocketModeEnvelope = {
+  type?: unknown;
+  body?: unknown;
+  ack: () => Promise<void> | void;
+};
+
+/**
+ * Owns acknowledgement of one low-level Socket Mode envelope. Keeping this
+ * seam below Bolt's listener middleware prevents its Events API auto-ack.
+ */
+export async function handleSocketModeEnvelope(
+  envelope: SocketModeEnvelope,
+  botId: string,
+  notifier: PiNotifier,
+  coordinator: GatewayCoordinator,
+  receipts?: ReceiptReconciler,
+  logger?: DaemonLogger,
+): Promise<'ignored' | 'duplicate' | 'accepted'> {
+  if (envelope.type !== 'events_api' || !envelope.body || typeof envelope.body !== 'object') {
+    await envelope.ack();
+    return 'ignored';
+  }
+  return coordinator.run(() =>
+    processSlackEvent(
+      envelope.body as SlackEventBody,
+      botId,
+      notifier,
+      envelope.ack,
+      receipts,
+      logger,
+    ),
+  );
+}
+
+/** Starts the one low-level Socket Mode connection with gateway-owned acknowledgement. */
 export async function startSlackGateway(options: {
   botToken: string;
   appToken: string;
@@ -167,13 +202,18 @@ export async function startSlackGateway(options: {
   coordinator?: GatewayCoordinator;
   logger?: DaemonLogger;
 }): Promise<{ stop(): Promise<void> }> {
-  const app = new App({ token: options.botToken, appToken: options.appToken, socketMode: true });
+  const receiver = new SocketModeReceiver({ appToken: options.appToken });
+  // SocketModeReceiver installs a Bolt dispatch listener in its constructor.
+  // Remove it and consume the same client's raw envelopes so no Bolt middleware
+  // can acknowledge before our SQLite admission transaction commits.
+  receiver.client.removeAllListeners('slack_event');
+  const web = new WebClient(options.botToken);
   const coordinator = options.coordinator ?? new GatewayCoordinator();
   const receipts: ReceiptReconciler = {
     async received(inbox) {
       const id = inbox.id as number;
       try {
-        await app.client.reactions.add({
+        await web.reactions.add({
           channel: String(inbox.slack_message_id).split(':', 1)[0],
           timestamp: String(inbox.message_ts),
           name: 'eyes',
@@ -184,22 +224,20 @@ export async function startSlackGateway(options: {
       }
     },
   };
-  app.event('message', async ({ body }) => {
-    await coordinator.run(() =>
-      processSlackEvent(
-        body as unknown as SlackEventBody,
-        options.botId,
-        options.notifier,
-        async () => undefined,
-        receipts,
-        options.logger,
-      ),
-    );
+  receiver.client.on('slack_event', (envelope: SocketModeEnvelope) => {
+    void handleSocketModeEnvelope(
+      envelope,
+      options.botId,
+      options.notifier,
+      coordinator,
+      receipts,
+      options.logger,
+    ).catch(() => options.logger?.error({ event: 'slack_admission_failed' }));
   });
-  await app.start();
+  await receiver.start();
   return {
-    stop: async () => {
-      await app.stop();
-    },
+    // Await the low-level disconnect itself; SocketModeReceiver.stop() does not
+    // await its client's asynchronous disconnect in Bolt 5.0.0.
+    stop: () => receiver.client.disconnect(),
   };
 }
