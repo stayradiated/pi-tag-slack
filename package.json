@@ -1,6 +1,6 @@
 {
   "name": "@stayradiated/pi-tag-slack",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Lightweight Slack gateway for pi coding agent",
   "license": "MIT",
   "repository": {
