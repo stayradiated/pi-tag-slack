@@ -83,7 +83,7 @@ Bootstrap config: ~/.config/pi-tag-slack/config.env
 Data directory:  ~/.local/share/pi-tag-slack
 ```
 
-The bootstrap config holds only `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`. Files are private (`0600`) and structural directories are private (`0700`) for the daemon UID. Override locations only with:
+The bootstrap config holds `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and optionally `EXTRA_PATH`. `EXTRA_PATH` is a colon-separated list of directories prepended to `PATH` only when pi is checked or launched; use it for a Pi shell shim whose runtime is outside systemd's default PATH. Files are private (`0600`) and structural directories are private (`0700`) for the daemon UID. Override locations only with:
 
 ```bash
 PI_TAG_SLACK_CONFIG=/private/path/config.env

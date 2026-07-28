@@ -9,7 +9,7 @@ import {
 import { loadBootstrapConfig, validateSlackTokens } from './config.js';
 import { WebClient } from '@slack/web-api';
 import { readGatewayConfig } from './db.js';
-import { PiRpcSession, type PiSessionStatus } from './pi-rpc.js';
+import { PiRpcSession, piEnvironment, type PiSessionStatus } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import {
@@ -195,11 +195,13 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
     if (tokenErrors.length)
       throw new Error(`Invalid bootstrap configuration: ${tokenErrors.join(' ')}`);
     const config = readGatewayConfig();
+    const environment = piEnvironment(bootstrap.extraPath);
     logger.level = String(config.log_level);
     logger.info({ event: 'configuration_loaded' });
     const createPi = () => {
       const rpc = new PiRpcSession({
         binary: String(config.pi_binary),
+        environment,
         sessionDir: paths.session,
         cwd: String(config.working_directory),
         onRuntimeFailure: () => logFailure(logger, 'pi_runtime_failure', 'pi'),
