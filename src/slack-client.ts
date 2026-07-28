@@ -134,6 +134,25 @@ export function scheduleReactionReconciliation(): void {
 
 type SlackPage = { items: unknown[]; nextCursor: string | null };
 
+/** Leaves framing/error-envelope headroom beneath the 1 MiB control limit. */
+export const SLACK_RESPONSE_BUDGET_BYTES = 900 * 1024;
+
+function budgetSlackResult<T>(value: T): T {
+  let bytes: number;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(value));
+  } catch {
+    throw Object.assign(new Error('Slack response could not be encoded safely.'), {
+      code: 'SLACK_ERROR',
+    });
+  }
+  if (bytes > SLACK_RESPONSE_BUDGET_BYTES)
+    throw Object.assign(new Error('Slack response exceeds the control response budget.'), {
+      code: 'RESPONSE_TOO_LARGE',
+    });
+  return value;
+}
+
 export type SlackUser = { id: string; label: string };
 
 type SlackFailure = Error & { code: 'NOT_FOUND' | 'SLACK_UNAVAILABLE' | 'SLACK_ERROR' };
@@ -141,7 +160,6 @@ type SlackFailure = Error & { code: 'NOT_FOUND' | 'SLACK_UNAVAILABLE' | 'SLACK_E
 function slackError(error: unknown): SlackFailure {
   const details = error as { code?: string; message?: string; data?: { error?: string } };
   const reason = details.data?.error ?? details.code;
-  const message = details.message ?? `Slack request failed: ${reason ?? 'unknown error'}.`;
   const code: SlackFailure['code'] =
     reason === 'channel_not_found' ||
     reason === 'user_not_found' ||
@@ -152,6 +170,12 @@ function slackError(error: unknown): SlackFailure {
       : /^(ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN)$/.test(String(reason))
         ? 'SLACK_UNAVAILABLE'
         : 'SLACK_ERROR';
+  const message =
+    code === 'NOT_FOUND'
+      ? 'The requested Slack resource was not found.'
+      : code === 'SLACK_UNAVAILABLE'
+        ? 'Slack is currently unavailable.'
+        : 'Slack request failed.';
   return Object.assign(new Error(message), { code });
 }
 
@@ -195,7 +219,7 @@ export async function slackHistory(limit: number, nextCursor?: string): Promise<
   );
   if (!response.ok)
     throw slackError(Object.assign(new Error('Slack history request failed.'), response));
-  return { items: response.messages ?? [], nextCursor: cursor(response) };
+  return budgetSlackResult({ items: response.messages ?? [], nextCursor: cursor(response) });
 }
 
 /** Looks up an exact timestamp without ever searching another conversation. */
@@ -218,7 +242,7 @@ export async function slackMessage(messageTs: string): Promise<unknown> {
       code: 'NOT_FOUND',
     });
   }
-  return message;
+  return budgetSlackResult(message);
 }
 
 /** Fetches one configured-conversation thread with Slack's cursor unchanged. */
@@ -238,7 +262,7 @@ export async function slackThread(
   );
   if (!response.ok)
     throw slackError(Object.assign(new Error('Slack thread request failed.'), response));
-  return { items: response.messages ?? [], nextCursor: cursor(response) };
+  return budgetSlackResult({ items: response.messages ?? [], nextCursor: cursor(response) });
 }
 
 type UploadFile = { path: string; dev: number; ino: number; size: number; mtimeMs: number };

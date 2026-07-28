@@ -22,6 +22,9 @@ import {
   setInboxWorking,
   resetGatewayConfig,
   updateGatewayConfig,
+  validateInboxRow,
+  validateTaskRow,
+  validateTrustedUserRow,
   type MutableConfigKey,
 } from './db.js';
 import type { PiNotifier, GatewayCoordinator } from './slack.js';
@@ -215,6 +218,10 @@ function rows(
     .all(...args, requestedLimit + 1) as Array<
     Record<string, unknown> & { created_at: string; id: number }
   >;
+  for (const row of results) {
+    if (table === 'inbox') validateInboxRow(row);
+    else validateTaskRow(row);
+  }
   const hasNext = results.length > requestedLimit;
   const page = hasNext ? results.slice(0, requestedLimit) : results;
   return {
@@ -226,9 +233,12 @@ function rows(
 function one(db: Database.Database, table: 'inbox' | 'tasks', value: string) {
   const prefix = table === 'inbox' ? 'inbox' : 'task';
   const id = parsePublicId(prefix, value);
-  const row = db.prepare(`select * from ${table} where id = ?`).get(id);
+  const row = db.prepare(`select * from ${table} where id = ?`).get(id) as
+    Record<string, unknown> | undefined;
   if (!row) fail('NOT_FOUND', `${value} was not found.`);
-  return { ...(row as object), id: value };
+  if (table === 'inbox') validateInboxRow(row);
+  else validateTaskRow(row);
+  return { ...row, id: value };
 }
 
 function resolveRows(
@@ -244,10 +254,14 @@ function resolveRows(
   return db.transaction(() => {
     const found = numericIds.map(
       (id) =>
-        db.prepare(`select state from ${table} where id = ?`).get(id) as
-          { state: string } | undefined,
+        db.prepare(`select * from ${table} where id = ?`).get(id) as
+          Record<string, unknown> | undefined,
     );
     if (found.some((row) => !row)) fail('NOT_FOUND', 'One or more work items were not found.');
+    for (const row of found) {
+      if (table === 'inbox') validateInboxRow(row!);
+      else validateTaskRow(row!);
+    }
     if (found.some((row) => row?.state !== 'open'))
       fail('INVALID_STATE', 'One or more work items are already resolved.');
     const stamp = new Date().toISOString();
@@ -500,11 +514,10 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
           );
           markTaskAccepted(id, acceptance);
           return { id: taskId, notified: true };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Unknown pi RPC failure.';
+        } catch {
           throw Object.assign(
             new Error(
-              `Task ${taskId} was created and remains open, but pi notification failed: ${message}. ` +
+              `Task ${taskId} was created and remains open, but pi notification failed. ` +
                 'Do not retry task add; inspect the task and notify pi manually if needed.',
             ),
             { code: 'PARTIAL_SUCCESS' },
@@ -579,15 +592,17 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       const values: unknown[] = [];
       const where = cursor ? 'where (created_at > ? or (created_at = ? and user_id > ?))' : '';
       if (cursor) values.push(cursor.createdAt, cursor.createdAt, cursor.userId);
-      const result = db
+      const stored = db
         .prepare(
-          `select user_id as userId, label, created_at as createdAt from trusted_users ${where} order by created_at asc, user_id asc limit ?`,
+          `select * from trusted_users ${where} order by created_at asc, user_id asc limit ?`,
         )
-        .all(...values, requestedLimit + 1) as Array<{
-        userId: string;
-        label: string;
-        createdAt: string;
-      }>;
+        .all(...values, requestedLimit + 1) as Array<Record<string, unknown>>;
+      for (const row of stored) validateTrustedUserRow(row);
+      const result = stored.map((row) => ({
+        userId: String(row.user_id),
+        label: String(row.label),
+        createdAt: String(row.created_at),
+      }));
       const hasNext = result.length > requestedLimit;
       const items = hasNext ? result.slice(0, requestedLimit) : result;
       return { items, nextCursor: hasNext ? encodeTrustCursor(items[items.length - 1]) : null };
@@ -665,10 +680,56 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
   }
 }
 
-function errorReply(id: string, error: unknown): Reply {
+export function errorReply(id: string, error: unknown): Reply {
   const known = error as { code?: string; message?: string };
-  if (known.code)
-    return { id, error: { code: known.code, message: known.message ?? 'Request failed.' } };
+  const safeMessages: Record<string, string> = {
+    SLACK_ERROR: 'Slack request failed.',
+    SLACK_UNAVAILABLE: 'Slack is currently unavailable.',
+    INVALID_FILE: 'An upload file is unavailable or unsafe.',
+    FILE_TOO_LARGE: 'A file exceeds the configured media limit.',
+    MEDIA_LIMIT_EXCEEDED: 'The configured total media limit would be exceeded.',
+    FILE_CHANGED: 'An upload file changed before it could be sent.',
+    FILE_EXISTS: 'The media destination already exists.',
+    UNSAFE_MEDIA_PATH: 'The local media store is unsafe.',
+  };
+  const publicCodes = new Set([
+    'INVALID_REQUEST',
+    'INVALID_PARAMS',
+    'INVALID_STATE',
+    'NOT_FOUND',
+    'NOT_CONFIGURED',
+    'SOURCE_DELETED',
+    'SESSION_UNAVAILABLE',
+    'STALE_CONFIRMATION',
+    'CONFIRMATION_REQUIRED',
+    'PARTIAL_SUCCESS',
+    'OUTCOME_UNKNOWN',
+    'DEADLINE_EXCEEDED',
+    'FRAME_TOO_LARGE',
+    'INCOMPLETE_FRAME',
+    'TRAILING_DATA',
+    'UNKNOWN_COMMAND',
+    'RESPONSE_TOO_LARGE',
+    ...Object.keys(safeMessages),
+  ]);
+  if (
+    known.code &&
+    /^(?:EACCES|EPERM|ENOENT|ENOTDIR|EISDIR|ENOSPC|EROFS|EMFILE|ENFILE|EEXIST|ELOOP|ENAMETOOLONG|EDQUOT|EBUSY)$/.test(
+      known.code,
+    )
+  )
+    return {
+      id,
+      error: { code: 'FILESYSTEM_ERROR', message: 'A local filesystem operation failed.' },
+    };
+  if (known.code && publicCodes.has(known.code))
+    return {
+      id,
+      error: {
+        code: known.code,
+        message: safeMessages[known.code] ?? known.message ?? 'Request failed.',
+      },
+    };
   const message = known.message ?? '';
   // Persistence deliberately throws ordinary Errors; map expected caller input
   // failures here and never expose SQLite implementation details.
@@ -950,7 +1011,10 @@ export async function startControlServer(
     if (!(await staleSocket(path))) throw new Error(`Control socket is already live: ${path}`);
     unlinkOwnedSocket(path, staleIdentity);
   }
-  const server = createServer((socket) => serve(socket, services));
+  // Clients half-close after their one LF-terminated frame. Keep the writable
+  // half open while asynchronous commands complete so their response is not
+  // discarded by Node's default allowHalfOpen=false behavior.
+  const server = createServer({ allowHalfOpen: true }, (socket) => serve(socket, services));
   let listening = false;
   let runtimeError: Error | null = null;
   server.on('error', (error) => {
