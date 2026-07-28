@@ -13,8 +13,6 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { connect } from 'node:net';
-import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
 import { presentFailure, presentSuccess } from './presentation.js';
 import { parseCliCommand, parseSetupOptions, type SetupOptions } from './parsing.js';
@@ -42,15 +40,15 @@ import {
   requireConfiguredDb,
 } from '../db.js';
 import { resolveConfigPath, validateBootstrapConfigPath } from '../config.js';
-import { CONTROL_COMMAND_DEADLINE_MS, SLACK_NETWORK_DEADLINE_MS } from '../control.js';
 import { offlineDoctor, onlineDoctor } from '../doctor.js';
 import {
   acquireGatewayLock,
   ensurePrivateFile,
   ensurePrivateLayout,
-  gatewayPaths,
   structuralPathExists,
 } from '../paths.js';
+import { request } from './control-client.js';
+export { request } from './control-client.js';
 
 const help = `pi-tag-slack
 
@@ -554,146 +552,6 @@ async function setupCore(
     }
     lock.release();
   }
-}
-
-const MAX_RESPONSE_FRAME_BYTES = 1024 * 1024;
-type ControlResponse = {
-  id: string;
-  result?: unknown;
-  error?: { code: string; message: string };
-};
-
-function protocolError(message: string): Error {
-  return Object.assign(new Error(message), { code: 'INVALID_RESPONSE' });
-}
-
-const SLACK_NETWORK_COMMANDS = new Set([
-  'slack.history',
-  'slack.message',
-  'slack.thread',
-  'slack.file.download',
-  'slack.send',
-  'inbox.respond',
-  'trust.add',
-]);
-const SLACK_MUTATIONS = new Set(['slack.send', 'inbox.respond']);
-
-function timeoutError(command: string, id: string): Error & { code: string; requestId: string } {
-  const mutation = SLACK_MUTATIONS.has(command);
-  return Object.assign(
-    new Error(
-      mutation
-        ? `The Slack operation may have completed. Request ID: ${id}. Inspect Slack/inbox state before retrying.`
-        : `Control command deadline exceeded. Request ID: ${id}.`,
-    ),
-    { code: mutation ? 'OUTCOME_UNKNOWN' : 'DEADLINE_EXCEEDED', requestId: id },
-  );
-}
-
-export function request(
-  command: string,
-  params: Record<string, unknown>,
-): Promise<ControlResponse> {
-  return new Promise((resolve, reject) => {
-    const id = randomUUID();
-    const socket = connect(gatewayPaths().socket);
-    const mutation = SLACK_MUTATIONS.has(command);
-    const needsReceipt = command === 'session.reset' && typeof params.confirm === 'string';
-    let output = Buffer.alloc(0);
-    let settled = false;
-    let deliveryStarted = false;
-    const ambiguous = (fallback: Error): Error =>
-      mutation && deliveryStarted ? timeoutError(command, id) : fallback;
-    const rejectOnce = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(error);
-    };
-    const invalidResponse = (message: string) => rejectOnce(ambiguous(protocolError(message)));
-    const parseResponse = () => {
-      if (settled) return;
-      const newline = output.indexOf(0x0a);
-      if (newline === -1) return;
-      if (newline !== output.length - 1 || output.length > MAX_RESPONSE_FRAME_BYTES) {
-        invalidResponse('Daemon response must contain exactly one LF-terminated frame.');
-        return;
-      }
-      let response: unknown;
-      try {
-        response = JSON.parse(
-          new TextDecoder('utf-8', { fatal: true }).decode(output.subarray(0, -1)),
-        );
-      } catch {
-        invalidResponse('Daemon response must be valid UTF-8 JSON.');
-        return;
-      }
-      if (!response || typeof response !== 'object' || (response as ControlResponse).id !== id) {
-        invalidResponse('Daemon response has an invalid correlation ID.');
-        return;
-      }
-      const value = response as ControlResponse;
-      const hasResult = Object.hasOwn(value, 'result');
-      const hasError = Object.hasOwn(value, 'error');
-      if (
-        hasResult === hasError ||
-        (hasError &&
-          (!value.error ||
-            typeof value.error.code !== 'string' ||
-            typeof value.error.message !== 'string'))
-      ) {
-        invalidResponse('Daemon response has an invalid schema.');
-        return;
-      }
-      settled = true;
-      socket.setTimeout(0);
-      resolve(value);
-      if (needsReceipt && hasResult) {
-        // Promise continuations present the confirmation response before this
-        // macrotask acknowledges delivery and permits reset termination.
-        setImmediate(() => socket.end(`${JSON.stringify({ receipt: id })}\n`));
-      } else {
-        socket.end();
-      }
-    };
-    socket.setTimeout(
-      SLACK_NETWORK_COMMANDS.has(command) ? SLACK_NETWORK_DEADLINE_MS : CONTROL_COMMAND_DEADLINE_MS,
-    );
-    socket.once('error', () =>
-      rejectOnce(
-        ambiguous(
-          Object.assign(new Error('pi-tag-slack daemon is unavailable.'), {
-            code: 'DAEMON_UNAVAILABLE',
-          }),
-        ),
-      ),
-    );
-    socket.once('timeout', () => rejectOnce(timeoutError(command, id)));
-    socket.on('data', (chunk: Buffer) => {
-      output = Buffer.concat([output, chunk]);
-      if (output.length > MAX_RESPONSE_FRAME_BYTES + 1) {
-        invalidResponse('Daemon response exceeds frame limit.');
-        return;
-      }
-      parseResponse();
-    });
-    socket.on('end', () => {
-      if (settled) return;
-      parseResponse();
-      if (!settled)
-        invalidResponse('Daemon response must contain exactly one LF-terminated frame.');
-    });
-    socket.on('connect', () => {
-      deliveryStarted = true;
-      const frame = `${JSON.stringify({ version: 1, id, command, params })}\n`;
-      // Ordinary commands half-close after their sole frame, allowing the
-      // daemon to reject trailing frames before dispatch. Confirmed reset is
-      // the sole bidirectional exchange: it retains the write half for its
-      // correlated delivery receipt.
-      if (needsReceipt) socket.write(frame);
-      else socket.end(frame);
-    });
-  });
 }
 
 if (process.argv[1]?.endsWith('/cli/index.js') || process.argv[1]?.endsWith('/cli/index.ts')) {
