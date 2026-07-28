@@ -1,16 +1,32 @@
 # Changelog
 
-## 0.1.3 — 2026-07-27
+## Unreleased — breaking single-conversation release
 
-- Add `PATH_PREPEND` for tools needed by pi and its subprocesses when the gateway runs as a daemon.
+This alpha release hard-cuts to one configured public/private Slack conversation and one daemon-owned persistent pi RPC session.
 
-## 0.1.0 — 2026-07-26
+### Breaking changes
 
-First public release of **pi-tag-slack**.
+- Slack admission now requires the configured `C...` or `G...` conversation, a trusted sender at event time, and a real bot mention on every new message and thread reply.
+- Runtime interaction is through the daemon-owned inbox, task, schedule, Slack, trust, configuration, and session CLI groups. Pi output remains session-local unless pi explicitly uses `slack send` or `inbox respond`.
+- Bootstrap configuration is limited to Slack tokens and the `PI_TAG_SLACK_CONFIG` / `PI_TAG_SLACK_DATA_DIR` deployment path overrides. Operational settings are persisted by the gateway.
+- The Slack app manifest has changed. Reapply `manifest.yaml`, then reinstall/approve the Slack app.
 
-- Slack Socket Mode gateway with explicit trusted-user access control.
-- Persistent per-channel sessions, queue recovery, and threaded responses.
-- Incoming attachments and explicit outgoing file support.
-- Scheduled tasks and an interactive Slack control panel.
-- Linux and macOS daemon support.
-- Setup and diagnostics CLI.
+### Required migration
+
+1. Stop the old daemon/service.
+2. Preserve the old data directory, bootstrap config, and session directories. Never delete legacy sessions or reset backup bundles.
+3. Install this release and run the new `pi-tag-slack setup` for the intended conversation and initial trusted user.
+4. Reapply `manifest.yaml` and reinstall/approve the Slack app.
+5. Reinstall and start the service:
+
+   ```bash
+   pi-tag-slack daemon uninstall
+   pi-tag-slack daemon install
+   pi-tag-slack daemon start
+   ```
+
+This release does not migrate or silently adopt prior gateway state. `setup --reset --yes` is an explicit replacement operation and creates a backup bundle; it is not a cleanup instruction.
+
+## Earlier releases
+
+Earlier alpha releases used a different deployment model and are not compatible with this release. Preserve their data for rollback; do not expect this daemon to adopt it.
