@@ -507,14 +507,13 @@ describe('control configuration', () => {
       default_model: 'provider/model',
       session_model_override: null,
     });
-    expect(
+    expect(request('config.set', { key: 'archiveRetentionDays', value: '14' })).toMatchObject({
+      archive_retention_days: 14,
+    });
+    expect(() =>
       request('config.set', { key: 'sessionModelOverride', value: 'other/model' }),
-    ).toMatchObject({
-      session_model_override: 'other/model',
-    });
-    expect(request('config.reset', { key: 'sessionModelOverride' })).toMatchObject({
-      session_model_override: null,
-    });
+    ).toThrow(/Live pi catalogs are required/);
+    expect(request('config.show', {})).toMatchObject({ session_model_override: null });
     expect(() => request('config.set', { key: 'workingDirectory', value: '/elsewhere' })).toThrow(
       /Unsupported configuration key/,
     );

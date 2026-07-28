@@ -9,7 +9,7 @@ import {
 import { loadBootstrapConfig, validateSlackTokens } from './config.js';
 import { WebClient } from '@slack/web-api';
 import { readGatewayConfig } from './db.js';
-import { PiRpcSession } from './pi-rpc.js';
+import { PiRpcSession, type PiSessionStatus } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
 import {
@@ -60,6 +60,70 @@ export function startupRecoveryPrompt(): string | undefined {
     'This is a neutral summary; inspect durable work before acting. ' +
     'Use pi-tag-slack inbox list/show and pi-tag-slack task list/show to inspect all remaining work.'
   );
+}
+
+type ResetSession = {
+  status(): Promise<PiSessionStatus>;
+  currentActivityEpoch(): number;
+};
+
+/** Build stale-safe reset controls around the daemon's replaceable session owner. */
+export function createSessionResetControls(options: {
+  current(): ResetSession;
+  performReset(): Promise<{ archivedTo: string; recoverySent: boolean }>;
+  setReserved(reserved: boolean): void;
+  onFailure(error: unknown): void;
+}) {
+  const stale = (message = 'The session reset confirmation is stale.') =>
+    Object.assign(new Error(message), { code: 'STALE_CONFIRMATION' });
+  return {
+    reset: async () => {
+      const status = await options.current().status();
+      if (status.activity === 'active') {
+        const challenge = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
+        throw Object.assign(
+          new Error(
+            `Pi is active. Confirm with: pi-tag-slack session reset --confirm ${challenge}`,
+          ),
+          { code: 'CONFIRMATION_REQUIRED' },
+        );
+      }
+      return options.performReset();
+    },
+    confirmReset: async (challenge: string) => {
+      const reservedPi = options.current();
+      const status = await reservedPi.status();
+      const exact = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
+      if (status.activity !== 'active' || challenge !== exact) throw stale();
+      const activityEpoch = reservedPi.currentActivityEpoch();
+      options.setReserved(true);
+      return {
+        result: { confirmed: true },
+        cancelPostFlush: () => options.setReserved(false),
+        postFlush: async () => {
+          try {
+            const current = await reservedPi.status();
+            const currentExact = `${current.sessionId ?? 'unknown'}:${current.runSequence}`;
+            if (
+              options.current() !== reservedPi ||
+              current.activity !== 'active' ||
+              currentExact !== challenge ||
+              reservedPi.currentActivityEpoch() !== activityEpoch
+            )
+              throw stale('The session reset confirmation became stale.');
+            try {
+              await options.performReset();
+            } catch (error) {
+              options.onFailure(error);
+              throw error;
+            }
+          } finally {
+            options.setReserved(false);
+          }
+        },
+      };
+    },
+  };
 }
 
 /** Starts the single configured gateway owner. */
@@ -173,6 +237,14 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
       if (recovery) await pi.notify(recovery);
       return { archivedTo: archivePath, recoverySent: Boolean(recovery) };
     };
+    const resetControls = createSessionResetControls({
+      current: () => pi!,
+      performReset,
+      setReserved: (reserved) => {
+        resetReserved = reserved;
+      },
+      onFailure: () => logFailure(logger, 'session_reset_failed', 'pi'),
+    });
     const session = {
       notify: (message: string) => {
         if (resetReserved) return Promise.reject(new Error('Session reset is reserved.'));
@@ -182,41 +254,7 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
       availableModels: () => pi!.availableModels(),
       availableThinkingLevels: () => pi!.availableThinkingLevels(),
       applyDesired: () => pi!.applyDesired(),
-      reset: async () => {
-        const status = await pi!.status();
-        if (status.activity === 'active') {
-          const challenge = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
-          throw Object.assign(
-            new Error(
-              `Pi is active. Confirm with: pi-tag-slack session reset --confirm ${challenge}`,
-            ),
-            { code: 'CONFIRMATION_REQUIRED' },
-          );
-        }
-        return performReset();
-      },
-      confirmReset: async (challenge: string) => {
-        const status = await pi!.status();
-        const exact = `${status.sessionId ?? 'unknown'}:${status.runSequence}`;
-        if (status.activity !== 'active' || challenge !== exact)
-          throw Object.assign(new Error('The session reset confirmation is stale.'), {
-            code: 'STALE_CONFIRMATION',
-          });
-        resetReserved = true;
-        return {
-          result: { confirmed: true },
-          cancelPostFlush: () => {
-            resetReserved = false;
-          },
-          postFlush: async () => {
-            try {
-              await performReset();
-            } finally {
-              resetReserved = false;
-            }
-          },
-        };
-      },
+      ...resetControls,
     };
     await pi.start();
     // Restore persisted desired overrides/defaults before presenting work.

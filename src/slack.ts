@@ -20,6 +20,11 @@ export interface ReceiptReconciler {
 export type SlackEventBody = { event_id?: unknown; event?: Record<string, unknown> };
 
 /** Serializes all admission/post-commit pi notifications in delivery order. */
+export type CoordinatorReservation<T> = {
+  value: T;
+  release(): void;
+};
+
 export class GatewayCoordinator {
   private tail = Promise.resolve();
   private accepting = true;
@@ -32,6 +37,47 @@ export class GatewayCoordinator {
     );
     return next;
   }
+
+  /**
+   * Return a value to the caller while retaining the serialization lane. The
+   * caller must release the lease after its external boundary (currently the
+   * control response flush) succeeds or is cancelled.
+   */
+  reserve<T>(operation: () => Promise<T> | T): Promise<CoordinatorReservation<T>> {
+    if (!this.accepting) return Promise.reject(new Error('Gateway is shutting down.'));
+    let deliver!: (reservation: CoordinatorReservation<T>) => void;
+    let reject!: (error: unknown) => void;
+    const result = new Promise<CoordinatorReservation<T>>((resolve, fail) => {
+      deliver = resolve;
+      reject = fail;
+    });
+    const hold = this.tail.then(async () => {
+      try {
+        const value = await operation();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        let released = false;
+        deliver({
+          value,
+          release: () => {
+            if (released) return;
+            released = true;
+            release();
+          },
+        });
+        await gate;
+      } catch (error) {
+        reject(error);
+        throw error;
+      }
+    });
+    this.tail = hold.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   /** Reject future work, while allowing already accepted work to finish. */
   close(): void {
     this.accepting = false;

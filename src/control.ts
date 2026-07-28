@@ -305,9 +305,25 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
         fail('INVALID_PARAMS', 'confirm must be a <session-id>:<run-sequence> challenge.');
       if (!services.sessionControls.confirmReset)
         fail('SESSION_UNAVAILABLE', 'Pi session confirmation is unavailable.');
-      return services.coordinator.run(() =>
-        services.sessionControls!.confirmReset!(params.confirm as string),
-      );
+      return services.coordinator
+        .reserve(() => services.sessionControls!.confirmReset!(params.confirm as string))
+        .then(({ value, release }) => ({
+          result: value.result,
+          cancelPostFlush: () => {
+            try {
+              value.cancelPostFlush();
+            } finally {
+              release();
+            }
+          },
+          postFlush: async () => {
+            try {
+              await value.postFlush();
+            } finally {
+              release();
+            }
+          },
+        }));
     }
     case 'session.archive.list': {
       if (!services?.archivePath)
@@ -392,44 +408,50 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     case 'inbox.show':
       return one(db, 'inbox', text(params.id, 'id'));
     case 'inbox.resolve': {
-      const result = resolveRows(
-        db,
-        'inbox',
-        ids(params.ids),
-        text(params.reason ?? 'resolved', 'reason'),
-      );
-      scheduleReactionReconciliation();
-      return result;
+      const operation = () => {
+        const result = resolveRows(
+          db,
+          'inbox',
+          ids(params.ids),
+          text(params.reason ?? 'resolved', 'reason'),
+        );
+        scheduleReactionReconciliation();
+        return result;
+      };
+      return services ? services.coordinator.run(operation) : operation();
     }
     case 'inbox.working': {
-      const id = parsePublicId('inbox', text(params.id, 'id'));
-      const result = { ...setInboxWorking(id), id: publicId('inbox', id) };
-      scheduleReactionReconciliation();
-      return result;
+      const operation = () => {
+        const id = parsePublicId('inbox', text(params.id, 'id'));
+        const result = { ...setInboxWorking(id), id: publicId('inbox', id) };
+        scheduleReactionReconciliation();
+        return result;
+      };
+      return services ? services.coordinator.run(operation) : operation();
     }
     case 'inbox.respond': {
-      const idText = text(params.id, 'id');
-      const id = parsePublicId('inbox', idText);
-      const row = one(db, 'inbox', idText) as Record<string, unknown>;
-      if (row.source_deleted_at) fail('SOURCE_DELETED', 'The Slack source message was deleted.');
-      return replyToInbox(
-        String(row.thread_ts),
-        text(params.text, 'text'),
-        filePaths(params.files),
-      ).then((replyTs) => {
+      const operation = async () => {
+        const idText = text(params.id, 'id');
+        const id = parsePublicId('inbox', idText);
+        const row = one(db, 'inbox', idText) as Record<string, unknown>;
+        if (row.source_deleted_at) fail('SOURCE_DELETED', 'The Slack source message was deleted.');
+        const replyTs = await replyToInbox(
+          String(row.thread_ts),
+          text(params.text, 'text'),
+          filePaths(params.files),
+        );
         try {
           recordInboxReply(id, replyTs);
         } catch {
           throw Object.assign(
             new Error(`Slack reply succeeded at ${replyTs}, but local update failed.`),
-            {
-              code: 'PARTIAL_SUCCESS',
-            },
+            { code: 'PARTIAL_SUCCESS' },
           );
         }
         scheduleReactionReconciliation();
         return { id: idText, replyTs, resolved: row.state === 'open' };
-      });
+      };
+      return services ? services.coordinator.run(operation) : operation();
     }
     case 'slack.history':
       return slackHistory(limit(params.limit), optionalCursor(params.cursor));
@@ -491,8 +513,11 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
       };
       return services.coordinator.run(add);
     }
-    case 'task.resolve':
-      return resolveRows(db, 'tasks', ids(params.ids), text(params.reason ?? 'resolved', 'reason'));
+    case 'task.resolve': {
+      const operation = () =>
+        resolveRows(db, 'tasks', ids(params.ids), text(params.reason ?? 'resolved', 'reason'));
+      return services ? services.coordinator.run(operation) : operation();
+    }
     case 'schedule.add':
       return scheduleMutation(() => {
         const title = text(params.title, 'title');
@@ -582,13 +607,59 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
     }
     case 'config.show':
       return readGatewayConfig();
-    case 'config.set':
-      return updateGatewayConfig(
-        text(params.key, 'key') as MutableConfigKey,
-        text(params.value, 'value'),
-      );
-    case 'config.reset':
-      return resetGatewayConfig(text(params.key, 'key') as MutableConfigKey);
+    case 'config.set': {
+      const key = text(params.key, 'key') as MutableConfigKey;
+      const value = text(params.value, 'value');
+      const sessionSetting =
+        key === 'defaultModel' ||
+        key === 'defaultThinking' ||
+        key === 'sessionModelOverride' ||
+        key === 'sessionThinkingOverride';
+      if (!sessionSetting) {
+        const operation = () => updateGatewayConfig(key, value);
+        return services ? services.coordinator.run(operation) : operation();
+      }
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Live pi catalogs are required for session settings.');
+      return services.coordinator.run(async () => {
+        if (key === 'defaultModel' || key === 'sessionModelOverride') {
+          const models = await services.sessionControls!.availableModels();
+          if (!models.some((model) => model.ref === value))
+            fail('INVALID_PARAMS', `Unknown pi model: ${value}.`);
+        } else {
+          const levels = await services.sessionControls!.availableThinkingLevels();
+          if (!levels.includes(value))
+            fail('INVALID_PARAMS', `Unsupported pi thinking level: ${value}.`);
+        }
+        const config = updateGatewayConfig(key, value);
+        return { ...config, ...(await services.sessionControls!.applyDesired()) };
+      });
+    }
+    case 'config.reset': {
+      const key = text(params.key, 'key') as MutableConfigKey;
+      const sessionSetting = key === 'sessionModelOverride' || key === 'sessionThinkingOverride';
+      if (!sessionSetting) {
+        const operation = () => resetGatewayConfig(key);
+        return services ? services.coordinator.run(operation) : operation();
+      }
+      if (!services?.sessionControls)
+        fail('SESSION_UNAVAILABLE', 'Live pi catalogs are required for session settings.');
+      return services.coordinator.run(async () => {
+        if (key === 'sessionModelOverride') {
+          const desired = String(readGatewayConfig().default_model);
+          const models = await services.sessionControls!.availableModels();
+          if (!models.some((model) => model.ref === desired))
+            fail('INVALID_PARAMS', `Unknown configured pi model: ${desired}.`);
+        } else {
+          const desired = String(readGatewayConfig().default_thinking);
+          const levels = await services.sessionControls!.availableThinkingLevels();
+          if (!levels.includes(desired))
+            fail('INVALID_PARAMS', `Unsupported configured pi thinking level: ${desired}.`);
+        }
+        const config = resetGatewayConfig(key);
+        return { ...config, ...(await services.sessionControls!.applyDesired()) };
+      });
+    }
     default:
       fail('UNKNOWN_COMMAND', `Unsupported command: ${request.command}`);
   }
@@ -764,7 +835,10 @@ function serve(socket: Socket, services?: ControlServices): void {
               flushed = true;
               socket.off('error', cancel);
               socket.off('close', cancel);
-              void result.postFlush();
+              // Reset failures are recorded by the session controller. The
+              // response has already crossed the control boundary, so there is
+              // no second frame on which to report this asynchronous result.
+              void result.postFlush().catch(() => undefined);
             });
           })
           .catch((error) => finish(errorReply(request.id, error)));

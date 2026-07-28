@@ -74,6 +74,7 @@ export class PiRpcSession {
   private buffer = Buffer.alloc(0);
   private readonly pending = new Map<string, PendingCommand>();
   private streaming = false;
+  private activityEpoch = 0;
   private sessionId: string | undefined;
   private sequence = 0;
   private lastError: string | undefined;
@@ -350,6 +351,11 @@ export class PiRpcSession {
     });
   }
 
+  /** Monotonic token used to detect settle/restart transitions during reset flush. */
+  currentActivityEpoch(): number {
+    return this.activityEpoch;
+  }
+
   /** Returns a read-only, runtime-validated view of the child session. */
   async status(): Promise<PiSessionStatus> {
     if (this.child) {
@@ -401,8 +407,13 @@ export class PiRpcSession {
     return data as Frame;
   }
 
+  private setStreaming(streaming: boolean): void {
+    if (this.streaming !== streaming) this.activityEpoch += 1;
+    this.streaming = streaming;
+  }
+
   private applyState(state: Frame): void {
-    this.streaming = state.isStreaming === true;
+    this.setStreaming(state.isStreaming === true);
     this.sessionId = typeof state.sessionId === 'string' ? state.sessionId : undefined;
     this.effectiveThinking =
       typeof state.thinkingLevel === 'string' ? state.thinkingLevel : undefined;
@@ -496,9 +507,9 @@ export class PiRpcSession {
     const frame = parsed as Frame;
     if (typeof frame.type !== 'string' || !frame.type) throw new Error('frame type is missing');
 
-    if (frame.type === 'agent_start') this.streaming = true;
+    if (frame.type === 'agent_start') this.setStreaming(true);
     if (frame.type === 'agent_settled') {
-      this.streaming = false;
+      this.setStreaming(false);
       this.safeBoundaryHandler?.();
     }
 
@@ -580,7 +591,7 @@ export class PiRpcSession {
     if (!this.stopping) this.recordFailure(error);
     if (this.child === child) this.child = undefined;
     this.buffer = Buffer.alloc(0);
-    this.streaming = false;
+    this.setStreaming(false);
     child.stdin.end();
     child.kill();
   }
@@ -591,7 +602,7 @@ export class PiRpcSession {
     if (this.child !== child) return;
     this.child = undefined;
     this.buffer = Buffer.alloc(0);
-    this.streaming = false;
+    this.setStreaming(false);
     if (!this.stopping) this.options.onUnexpectedExit?.();
     if (this.stopping) {
       this.rejectPending(new Error('pi RPC process stopped.'));
