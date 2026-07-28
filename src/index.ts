@@ -282,6 +282,14 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
         notifier: session,
         coordinator,
         sessionStatus: () => session.status(),
+        runtimeStatus: () => {
+          const runtimeError = server?.lastError();
+          return {
+            control: runtimeError ? 'degraded' : 'ok',
+            // Keep listener diagnostics visible but sanitized at the control boundary.
+            lastError: runtimeError ? 'Control server runtime error.' : null,
+          };
+        },
         sessionControls: session,
         archivePath: paths.archive,
       },

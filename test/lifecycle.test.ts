@@ -25,6 +25,48 @@ describe('GatewayLifecycle', () => {
     expect(calls).toEqual(['slack', 'control', 'timers', 'drain', 'pi', 'database', 'lock']);
   });
 
+  it('waits for active Slack, control, scheduler, coordinator, and pi work in order', async () => {
+    const calls: string[] = [];
+    const releases: Array<() => void> = [];
+    const active = (name: string) => async () => {
+      calls.push(`${name}:start`);
+      await new Promise<void>((resolve) => releases.push(resolve));
+      calls.push(`${name}:done`);
+    };
+    const lifecycle = new GatewayLifecycle({
+      logger: logger(),
+      stopAccepting: { stop: active('slack') },
+      stopControl: { close: active('control') },
+      stopTimers: { stop: active('scheduler') },
+      drainCoordinator: active('coordinator'),
+      stopPi: active('pi'),
+      closeDatabase: () => calls.push('database'),
+      releaseLock: () => calls.push('lock'),
+    });
+    const shutdown = lifecycle.shutdown();
+    for (const name of ['slack', 'control', 'scheduler', 'coordinator', 'pi']) {
+      await vi.waitFor(() => expect(calls.at(-1)).toBe(`${name}:start`));
+      expect(releases).toHaveLength(1);
+      releases.shift()!();
+      await vi.waitFor(() => expect(calls).toContain(`${name}:done`));
+    }
+    await shutdown;
+    expect(calls).toEqual([
+      'slack:start',
+      'slack:done',
+      'control:start',
+      'control:done',
+      'scheduler:start',
+      'scheduler:done',
+      'coordinator:start',
+      'coordinator:done',
+      'pi:start',
+      'pi:done',
+      'database',
+      'lock',
+    ]);
+  });
+
   it('continues through cleanup failure and shares one shutdown for repeated signals', async () => {
     let releases = 0;
     const stop = vi.fn(async () => {

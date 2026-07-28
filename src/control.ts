@@ -280,10 +280,17 @@ function resolveRows(
   })();
 }
 
+export type DaemonRuntimeStatus = {
+  control: 'ok' | 'degraded';
+  lastError: string | null;
+};
+
 export type ControlServices = {
   notifier: PiNotifier;
   coordinator: GatewayCoordinator;
   sessionStatus?: () => Promise<unknown>;
+  /** Daemon-owned runtime state; never inspect persistence to produce this value. */
+  runtimeStatus?: () => DaemonRuntimeStatus;
   archivePath?: string;
   sessionControls?: {
     availableModels(): Promise<PiModel[]>;
@@ -301,15 +308,24 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
   const scheduleMutation = <T>(operation: () => T): T | Promise<T> =>
     services ? services.coordinator.run(operation) : operation();
   switch (request.command) {
-    case 'health':
+    case 'health': {
       if (!services?.sessionStatus) return { database: 'ok', control: 'ok' };
-      return services
-        .sessionStatus()
-        .then((session) => ({ database: 'ok', control: 'ok', session }));
+      return services.sessionStatus().then((session) => ({
+        database: 'ok',
+        ...(services.runtimeStatus?.() ?? { control: 'ok' as const }),
+        session,
+      }));
+    }
     case 'session.status':
       if (!services?.sessionStatus)
         fail('SESSION_UNAVAILABLE', 'Pi session status is unavailable.');
-      return services.coordinator.run(() => services.sessionStatus!());
+      return services.coordinator.run(async () => {
+        const session = await services.sessionStatus!();
+        const runtime = services.runtimeStatus?.();
+        return runtime && session && typeof session === 'object'
+          ? { ...(session as Record<string, unknown>), daemon: runtime }
+          : session;
+      });
     case 'session.reset': {
       if (!services?.sessionControls?.reset)
         fail('SESSION_UNAVAILABLE', 'Pi session reset is unavailable.');

@@ -518,6 +518,37 @@ describe('control configuration', () => {
     ).resolves.toEqual({ database: 'ok', control: 'ok', session });
   });
 
+  it('surfaces a degraded control listener in health and session status', async () => {
+    configuredDb();
+    const services = {
+      notifier: {
+        async notify() {
+          return { acceptedAt: '', runSequence: 0 };
+        },
+      },
+      coordinator: new GatewayCoordinator(),
+      sessionStatus: async () => ({ running: true, health: 'healthy', lastError: null }),
+      runtimeStatus: () => ({
+        control: 'degraded' as const,
+        lastError: 'Control server runtime error.',
+      }),
+    };
+    await expect(
+      dispatch({ version: 1, id: 'health', command: 'health', params: {} }, services),
+    ).resolves.toMatchObject({
+      database: 'ok',
+      control: 'degraded',
+      lastError: 'Control server runtime error.',
+      session: { health: 'healthy' },
+    });
+    await expect(
+      dispatch({ version: 1, id: 'session', command: 'session.status', params: {} }, services),
+    ).resolves.toMatchObject({
+      health: 'healthy',
+      daemon: { control: 'degraded', lastError: 'Control server runtime error.' },
+    });
+  });
+
   it('updates only typed non-structural settings and resets session overrides', () => {
     configuredDb();
     const request = (command: string, params: Record<string, unknown>) =>

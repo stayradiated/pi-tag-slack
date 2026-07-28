@@ -267,14 +267,14 @@ The journaled implementation exists, but it needs adversarial validation before 
 
 ### Doctor and daemon lifecycle
 
-- [ ] Keep online doctor database/session inspection control-socket-only.
-- [ ] Keep offline doctor lock-gated and source-state read-only, including WAL-resident commits in its disposable snapshot.
-- [ ] Report every canonical path with owner, mode, type, and symlink diagnostics.
-- [ ] Surface degraded pi and control-server runtime errors in doctor/session/daemon status.
+- [x] Keep online doctor database/session inspection control-socket-only.
+- [x] Keep offline doctor lock-gated and source-state read-only, including WAL-resident commits in its disposable snapshot.
+- [x] Report every canonical path with owner, mode, type, and symlink diagnostics.
+- [x] Surface degraded pi and control-server runtime errors in doctor/session/daemon status.
 - [ ] Decide and document log rotation/retention behavior or explicitly defer it for alpha.
 - [ ] Run Linux systemd user-service install/start/status/log/stop/uninstall smoke tests.
 - [ ] Run macOS launchd install/start/status/log/stop/uninstall smoke tests.
-- [ ] Verify bounded ordered shutdown with active Slack, control, scheduler, coordinator, and pi work.
+- [x] Verify bounded ordered shutdown with active Slack, control, scheduler, coordinator, and pi work.
 
 ### Dependency and documentation cleanup
 
@@ -399,11 +399,11 @@ All items are required unless explicitly moved out of scope in the changelog/rel
 
 Automated:
 
-1. [ ] `pnpm install --frozen-lockfile`
-2. [ ] `pnpm format:check`
-3. [ ] `pnpm lint`
-4. [ ] `pnpm test`
-5. [ ] `pnpm build`
+1. [x] `pnpm install --frozen-lockfile`
+2. [x] `pnpm format:check`
+3. [x] `pnpm lint`
+4. [x] `pnpm test`
+5. [x] `pnpm build`
 6. [ ] Production dependency audit
 7. [ ] All acceptance tests in sections 1–5
 8. [ ] Reset failure-injection and WAL-only commit tests

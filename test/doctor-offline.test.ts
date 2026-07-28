@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { main } from '../src/cli/index.js';
 import { createGatewayConfig, closeDb, initDb } from '../src/db.js';
-import { offlineDoctor } from '../src/doctor.js';
+import { offlineDoctor, onlineDoctor } from '../src/doctor.js';
 import {
   acquireGatewayLock,
   ensurePrivateLayout,
@@ -77,6 +77,30 @@ afterEach(async () => {
 });
 
 describe('bounded doctor diagnostics', () => {
+  it('marks degraded pi and control runtime state unhealthy', () => {
+    configuredFixture();
+    for (const health of [
+      {
+        database: 'ok',
+        control: 'ok',
+        session: { running: false, health: 'degraded', lastError: 'Pi RPC timed out.' },
+      },
+      {
+        database: 'ok',
+        control: 'degraded',
+        lastError: 'Control server runtime error.',
+        session: { running: true, health: 'healthy', lastError: null },
+      },
+    ]) {
+      const result = onlineDoctor(health);
+      expect(result.exitCode).toBe(1);
+      expect(result.report).toMatchObject({ healthy: false, daemon: health });
+      expect(result.report.findings).toContainEqual(
+        expect.objectContaining({ code: 'DAEMON_UNHEALTHY' }),
+      );
+    }
+  });
+
   it('uses daemon control health online and never parses SQLite', async () => {
     const { paths } = configuredFixture();
     // This is intentionally not SQLite. Healthy online doctor must trust only
@@ -151,6 +175,11 @@ describe('bounded doctor diagnostics', () => {
       resetJournal: { status: 'absent' },
       socket: 'absent',
     });
+    for (const diagnostic of result.report.paths as Array<Record<string, unknown>>) {
+      for (const field of ['kind', 'mode', 'uid', 'owner', 'symlink'])
+        expect(Object.hasOwn(diagnostic, field)).toBe(true);
+      expect(diagnostic.owner).toEqual(expect.any(String));
+    }
     files.forEach((path, index) => {
       const after = lstatSync(path);
       if (process.platform === 'linux') expect(after.atimeMs).toBe(stats[index].atimeMs);

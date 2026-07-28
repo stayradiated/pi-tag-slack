@@ -84,9 +84,26 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
   if (group === 'doctor') return doctor();
   if (group === 'daemon') {
-    const { daemon } = await import('../daemon.js');
-    daemon(verb ?? '');
-    return 0;
+    const status = daemon(verb ?? '');
+    if (verb !== 'status' || status !== 'running') return 0;
+    try {
+      const health = await request('health', {});
+      if (health.error) {
+        console.log(`Daemon runtime: degraded (${health.error.code}).`);
+        return 1;
+      }
+      const healthy = daemonHealthIsHealthy(health.result);
+      console.log(`Daemon runtime: ${healthy ? 'healthy' : 'degraded'}.`);
+      if (!healthy) console.log(presentSuccess('daemon.status', health.result, false));
+      return healthy ? 0 : 1;
+    } catch (error: unknown) {
+      const code =
+        typeof (error as { code?: unknown }).code === 'string'
+          ? (error as { code: string }).code
+          : 'INTERNAL';
+      console.log(`Daemon runtime: degraded (${code}).`);
+      return 1;
+    }
   }
 
   const json = argv.includes('--json');
@@ -111,6 +128,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     throw Object.assign(new Error(response.error.message), { code: response.error.code });
   console.log(presentSuccess(command, response.result, json));
   return 0;
+}
+
+export function daemonHealthIsHealthy(health: unknown): boolean {
+  if (!health || typeof health !== 'object') return false;
+  const value = health as Record<string, unknown>;
+  const session = value.session as Record<string, unknown> | undefined;
+  return value.database === 'ok' && value.control === 'ok' && session?.health === 'healthy';
 }
 
 async function doctor(): Promise<number> {

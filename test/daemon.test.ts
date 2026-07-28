@@ -205,6 +205,51 @@ describe('launchd lifecycle', () => {
   });
 });
 
+describe.each([
+  ['linux', 'systemctl'],
+  ['darwin', 'launchctl'],
+] as const)('injected %s lifecycle smoke', (platform, manager) => {
+  it('installs, starts, reports, reads logs, stops, and uninstalls through command seams', () => {
+    const deps = fake(platform, false);
+    let running = false;
+    deps.run = (command, args) => {
+      deps.calls.push([command, ...args]);
+      if (platform === 'linux') {
+        if (command === 'systemctl' && args.includes('start')) running = true;
+        if (command === 'systemctl' && args.includes('stop')) running = false;
+        if (command === 'systemctl' && args.includes('is-active'))
+          return { status: running ? 0 : 3, stdout: '', stderr: '' };
+      } else if (command === 'launchctl') {
+        if (args[0] === 'bootstrap' || args[0] === 'kickstart') running = true;
+        if (args[0] === 'bootout') running = false;
+        if (args[0] === 'print')
+          return {
+            status: running ? 0 : 3,
+            stdout: running ? 'state = running\n' : '',
+            stderr: '',
+          };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    daemon('install', deps);
+    daemon('start', deps);
+    expect(daemon('status', deps)).toBe('running');
+    daemon('logs', deps);
+    daemon('stop', deps);
+    expect(daemon('status', deps)).toBe('stopped');
+    daemon('uninstall', deps);
+    expect(daemon('status', deps)).toBe('not-installed');
+
+    expect(deps.calls.some(([command]) => command === manager)).toBe(true);
+    expect(
+      deps.calls.some(([command]) => command === (platform === 'linux' ? 'journalctl' : 'tail')),
+    ).toBe(true);
+    log.mockRestore();
+  });
+});
+
 describe('unsupported daemon platforms', () => {
   it('does not attempt process-manager commands', () => {
     const deps = fake('win32');

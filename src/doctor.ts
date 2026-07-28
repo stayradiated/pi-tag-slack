@@ -34,11 +34,11 @@ type Diagnostic = {
   expectedKind: Kind;
   expectedMode: string;
   exists: boolean;
-  kind?: string;
-  mode?: string;
-  uid?: number;
-  owner?: 'current-user' | 'foreign';
-  symlink?: boolean;
+  kind: string | null;
+  mode: string | null;
+  uid: number | null;
+  owner: 'current-user' | 'foreign' | 'unknown';
+  symlink: boolean | null;
   healthy: boolean;
   error?: string;
 };
@@ -79,6 +79,11 @@ function diagnostic(
         expectedKind,
         expectedMode: expectedModeText,
         exists: false,
+        kind: null,
+        mode: null,
+        uid: null,
+        owner: 'unknown',
+        symlink: null,
         healthy: !required,
       };
     }
@@ -125,6 +130,11 @@ function diagnostic(
       expectedKind,
       expectedMode: expectedModeText,
       exists: false,
+      kind: null,
+      mode: null,
+      uid: null,
+      owner: 'unknown',
+      symlink: null,
       healthy: false,
       error: 'inspection-failed',
     };
