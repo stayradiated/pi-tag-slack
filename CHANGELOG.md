@@ -2,7 +2,7 @@
 
 ## Unreleased — breaking single-conversation release
 
-This alpha release hard-cuts to one configured public/private Slack conversation and one daemon-owned persistent pi RPC session.
+This Linux-only alpha release hard-cuts to one configured public/private Slack conversation and one daemon-owned persistent pi RPC session.
 
 ### Breaking changes
 
@@ -33,7 +33,8 @@ This release does not migrate or silently adopt prior gateway state. `setup --re
 - Trusted Slack users can influence agent decisions and tool use with the daemon account's local capabilities. Slack trust is remote authority over that account.
 - Pi runs headlessly over RPC. Project or user extensions that require interactive UI/dialog input can block the persistent session and should be disabled for this daemon.
 - Upload path checks reduce accidental races but cannot prevent a same-UID process from changing a file after the final check and before the Slack library opens it.
-- Log rotation is deferred for alpha. Linux uses host `journald` retention; macOS daemon log files are unbounded unless the operator configures external rotation. Archive and media retention settings do not cover logs.
+- Linux is the only supported platform for this alpha. macOS/launchd is unvalidated and out of release scope.
+- Log rotation is deferred for alpha and uses host `journald` retention. Archive and media retention settings do not cover logs.
 
 ## Earlier releases
 

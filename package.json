@@ -12,8 +12,7 @@
     "url": "https://github.com/stayradiated/pi-tag-slack/issues"
   },
   "os": [
-    "linux",
-    "darwin"
+    "linux"
   ],
   "keywords": [
     "slack",

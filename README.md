@@ -9,7 +9,7 @@
 
 ## Requirements
 
-- Node.js 22.19 or newer on Linux or macOS
+- Linux with Node.js 22.19 or newer and a systemd user manager
 - pi 0.82.0 or newer, installed and authenticated for the daemon account
 - A Slack app using Socket Mode and a bot already invited to one public or private conversation
 
@@ -102,7 +102,9 @@ pi-tag-slack doctor
 
 ### Alpha log retention decision
 
-Automatic log rotation and deletion are explicitly deferred for alpha. On Linux, logs go to the systemd journal and retention is whatever the host's `journald` policy provides. On macOS, launchd appends to `<data-dir>/daemon.stdout.log` and `<data-dir>/daemon.stderr.log`; the gateway does not rotate or truncate them. Operators must configure host rotation/retention and monitor disk use. `archiveRetentionDays` and `mediaRetentionHours` do not apply to daemon logs.
+Automatic log rotation and deletion are explicitly deferred for alpha. Logs go to the systemd journal and retention is whatever the host's `journald` policy provides. Operators must configure host retention and monitor disk use. `archiveRetentionDays` and `mediaRetentionHours` do not apply to daemon logs.
+
+This alpha release supports Linux only. macOS/launchd behavior is unvalidated and is not part of the supported release surface.
 
 ## CLI reference
 

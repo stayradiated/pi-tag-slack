@@ -2,7 +2,7 @@
 
 ## Status
 
-**Automated gate complete; manual release validation remains.** The hard-cut single-conversation architecture and its automatable operational cleanup are implemented. The unchecked live Slack, systemd, and launchd gates still block release sign-off.
+**Automated gate complete; manual validation has been run but release sign-off is blocked by live failures and remaining Linux checks.** Linux systemd plus public/private Slack testing was performed on 2026-07-28. Most scenarios passed, but unmentioned thread activity can indirectly notify pi, successful V2 multi-file upload reports an error, and a disconnected active-reset client can still trigger reset. A live oversized-response fixture and interrupted-reset recovery through plain `setup` remain outstanding. macOS/launchd has been explicitly removed from the supported alpha scope. See [`SHIP_READINESS_PLAN.md`](./SHIP_READINESS_PLAN.md) for the remediation and final release gate.
 
 Verified against the current tree in July 2026:
 
@@ -274,8 +274,8 @@ The journaled implementation exists, but it needs adversarial validation before 
 - [x] Report every canonical path with owner, mode, type, and symlink diagnostics.
 - [x] Surface degraded pi and control-server runtime errors in doctor/session/daemon status.
 - [x] Decide and document log rotation/retention behavior or explicitly defer it for alpha.
-- [ ] Run Linux systemd user-service install/start/status/log/stop/uninstall smoke tests.
-- [ ] Run macOS launchd install/start/status/log/stop/uninstall smoke tests.
+- [x] Run Linux systemd user-service install/start/status/log/stop/uninstall smoke tests.
+- macOS launchd validation is out of scope for the Linux-only alpha.
 - [x] Verify bounded ordered shutdown with active Slack, control, scheduler, coordinator, and pi work.
 
 ### Dependency and documentation cleanup
@@ -410,18 +410,20 @@ Automated:
 7. [x] All acceptance tests in sections 1–5
 8. [x] Reset failure-injection and WAL-only commit tests
 
-Manual:
+Manual (run on Linux on 2026-07-28 unless noted):
 
-1. [ ] Linux systemd lifecycle smoke test
-2. [ ] macOS launchd lifecycle smoke test
-3. [ ] Public configured-channel Socket Mode smoke test
-4. [ ] Private configured-channel Socket Mode smoke test
-5. [ ] Mentioned text, attachment-only, edit, deletion, and mentioned thread-reply tests
-6. [ ] Live history/message/thread pagination and response-bound tests
-7. [ ] File download, text send, thread send, and multi-file upload tests
-8. [ ] Idle prompt, active follow-up, pi crash/backoff, and no-auto-post tests
-9. [ ] Active reset confirmation, disconnect, stale challenge, and recovery-summary tests
-10. [ ] Interrupted reset recovery through plain `setup`
+1. [x] Linux systemd lifecycle smoke test
+2. macOS launchd lifecycle smoke test — removed from the Linux-only alpha scope
+3. [x] Public configured-channel Socket Mode smoke test
+4. [x] Private configured-channel Socket Mode smoke test
+5. [x] Mentioned text, attachment-only, real edit, deletion, and mentioned thread-reply tests
+6. [ ] Live history/message/thread pagination and response-bound tests — reads and pagination passed; no live oversized-response fixture was available
+7. [ ] File download, text send, thread send, and multi-file upload tests — download/text/thread passed; multi-file upload reached Slack but incorrectly returned `SLACK_ERROR`
+8. [x] Idle prompt, active follow-up, pi crash/backoff, and no-auto-post tests
+9. [ ] Active reset confirmation, disconnect, stale challenge, and recovery-summary tests — confirmation/stale/recovery passed; deterministic pre-flush disconnect still reset the session
+10. [ ] Interrupted reset recovery through plain `setup` — ordinary journaled reset and backup passed; interrupted recovery was not exercised manually
+
+Additional live failure discovered while exercising item 5: an unmentioned thread reply can produce a synthetic parent `message_changed` event that advances the accepted parent revision and notifies pi. The listed mentioned-thread case itself passed, but the broader conversation/trust invariant remains blocked until this synthetic update is ignored.
 
 ## Definition of done
 
