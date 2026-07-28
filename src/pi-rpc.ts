@@ -92,6 +92,8 @@ export class PiRpcSession {
       stopGraceMs?: number;
       stopTerminateMs?: number;
       onRuntimeFailure?: () => void;
+      /** Called once when this session loses ownership of a running child. */
+      onUnexpectedExit?: () => void;
     },
   ) {}
 
@@ -459,6 +461,7 @@ export class PiRpcSession {
     if (this.child !== child) return;
     this.child = undefined;
     this.streaming = false;
+    if (!this.stopping) this.options.onUnexpectedExit?.();
     if (this.stopping) {
       this.rejectPending(new Error('pi RPC process stopped.'));
       return;

@@ -255,7 +255,9 @@ function resolveRows(
       const updatedAt = table === 'inbox' ? ', updated_at = ?' : '';
       const values = table === 'inbox' ? [reason, stamp, stamp, id] : [reason, stamp, id];
       const reaction =
-        table === 'inbox' ? ", reaction_desired = 'white_check_mark', reaction_error = null" : '';
+        table === 'inbox'
+          ? ", reaction_desired = 'white_check_mark', reaction_error = null, reaction_next_attempt_at = null"
+          : '';
       db.prepare(
         `update ${table} set state = 'resolved', resolution_reason = ?, resolved_at = ?${reaction}${updatedAt} where id = ?`,
       ).run(...values);

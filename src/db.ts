@@ -753,9 +753,19 @@ export function setInboxWorking(id: number): Record<string, unknown> {
   if (!row) throw new Error(`Inbox item inbox-${id} was not found.`);
   if (row.state !== 'open') throw new Error('Inbox item is already resolved.');
   d.prepare(
-    "update inbox set reaction_desired='hourglass_flowing_sand', reaction_error=null, updated_at=? where id=?",
+    "update inbox set reaction_desired='hourglass_flowing_sand', reaction_error=null, reaction_next_attempt_at=null, updated_at=? where id=?",
   ).run(now(), id);
   return inboxSnapshot(id)!;
+}
+
+/** Returns abandoned in-progress markers to the open-work receipt state. */
+export function revertOpenInboxWorkingReactions(): number {
+  const stamp = now();
+  return requireConfiguredDb()
+    .prepare(
+      "update inbox set reaction_desired='eyes', reaction_error=null, reaction_next_attempt_at=null, updated_at=? where state='open' and reaction_desired='hourglass_flowing_sand'",
+    )
+    .run(stamp).changes;
 }
 
 /** Resolves an open inbox after a confirmed Slack reply, preserving terminal snapshots. */
@@ -772,7 +782,7 @@ export function recordInboxReply(id: number, replyTs: string): void {
     const stamp = now();
     if (row.state === 'open') {
       d.prepare(
-        "update inbox set state='resolved', resolution_reason='replied', resolved_at=?, latest_reply_ts=?, latest_reply_at=?, reaction_desired=null, reaction_error=null, updated_at=? where id=?",
+        "update inbox set state='resolved', resolution_reason='replied', resolved_at=?, latest_reply_ts=?, latest_reply_at=?, reaction_desired=null, reaction_error=null, reaction_next_attempt_at=null, updated_at=? where id=?",
       ).run(stamp, replyTs, stamp, stamp, id);
     } else {
       d.prepare(
@@ -910,7 +920,7 @@ export function ingestSlackEvent(event: SlackMutation): {
       };
     }
     d.prepare(
-      "update inbox set content='', attachments='[]', state='resolved', source_deleted_at=?, resolution_reason='source-deleted', resolved_at=?, updated_at=?, reaction_desired=null where id=?",
+      "update inbox set content='', attachments='[]', state='resolved', source_deleted_at=?, resolution_reason='source-deleted', resolved_at=?, updated_at=?, reaction_desired=null, reaction_actual=null, reaction_error=null, reaction_next_attempt_at=null where id=?",
     ).run(stamp, stamp, stamp, existing.id);
     d.prepare('insert into slack_events values (?, ?, ?, ?, ?, null, null, null, ?)').run(
       identity,

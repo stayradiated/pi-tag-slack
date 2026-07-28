@@ -1,11 +1,23 @@
-import { closeDb, initDb, openWorkSummary, publicId, requireConfiguredDb } from './db.js';
+import {
+  closeDb,
+  initDb,
+  openWorkSummary,
+  publicId,
+  requireConfiguredDb,
+  revertOpenInboxWorkingReactions,
+} from './db.js';
 import { loadBootstrapConfig, validateSlackTokens } from './config.js';
 import { WebClient } from '@slack/web-api';
 import { readGatewayConfig } from './db.js';
 import { PiRpcSession } from './pi-rpc.js';
 import { GatewayCoordinator, startSlackGateway } from './slack.js';
 import { validateConfiguredConversation } from './slack-validation.js';
-import { clearSlackClient, configureSlackClient, reconcileInboxReactions } from './slack-client.js';
+import {
+  clearSlackClient,
+  configureSlackClient,
+  reconcileInboxReactions,
+  scheduleReactionReconciliation,
+} from './slack-client.js';
 import { createDaemonLogger, logFailure } from './logging.js';
 import { GatewayLifecycle } from './lifecycle.js';
 import { mkdirSync } from 'node:fs';
@@ -19,6 +31,12 @@ import {
   ensurePrivateLayout,
   structuralPathExists,
 } from './paths.js';
+
+export function restoreOpenInboxReceiptsAfterSessionLoss(): number {
+  const changed = revertOpenInboxWorkingReactions();
+  scheduleReactionReconciliation();
+  return changed;
+}
 
 export function startupRecoveryPrompt(): string | undefined {
   const work = openWorkSummary();
@@ -121,6 +139,9 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
         sessionDir: paths.session,
         cwd: String(config.working_directory),
         onRuntimeFailure: () => logFailure(logger, 'pi_runtime_failure', 'pi'),
+        onUnexpectedExit: () => {
+          void coordinator.run(restoreOpenInboxReceiptsAfterSessionLoss).catch(() => undefined);
+        },
         desired: () => {
           const current = readGatewayConfig();
           return {
@@ -138,6 +159,7 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
     let resetReserved = false;
     const performReset = async () => {
       const old = pi!;
+      restoreOpenInboxReceiptsAfterSessionLoss();
       await old.stop();
       const archivePath = archiveActiveSession(paths);
       mkdirSync(paths.session, { mode: 0o700 });

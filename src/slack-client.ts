@@ -35,47 +35,91 @@ function requireClient(): { client: WebClient; channelId: string } {
   return { client, channelId };
 }
 let reconciliationQueued = false;
+let reconciliationRunning: Promise<void> | undefined;
 const reactionAttempts = new Map<number, number>();
 
-/** Reconciles only gateway-owned reactions; Slack removes only the caller's own reaction. */
-export async function reconcileInboxReactions(limit = 50): Promise<void> {
+function slackReactionError(error: unknown): string | undefined {
+  return (error as { data?: { error?: string } }).data?.error;
+}
+
+function reactionFailure(id: number, error: unknown): void {
+  const attempts = (reactionAttempts.get(id) ?? 0) + 1;
+  reactionAttempts.set(id, attempts);
+  const delayMs = Math.min(60_000, 1_000 * 2 ** attempts);
+  recordInboxReaction(id, {
+    error: error instanceof Error ? error.message : String(error),
+    nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+  });
+}
+
+function reactionSourceGone(id: number): void {
+  reactionAttempts.delete(id);
+  recordInboxReaction(id, { desired: null, actual: null, error: null, nextAttemptAt: null });
+}
+
+async function runReactionReconciliation(limit: number): Promise<void> {
   const runtime = requireClient();
   for (const inbox of inboxReactionsDue(limit)) {
     const id = Number(inbox.id);
     const desired = inbox.reaction_desired as string | null;
-    const actual = inbox.reaction_actual as string | null;
-    try {
-      if (actual) {
-        await runtime.client.reactions.remove({
-          channel: String(inbox.slack_message_id).split(':', 1)[0],
-          timestamp: String(inbox.message_ts),
-          name: actual,
-        });
+    let actual = inbox.reaction_actual as string | null;
+    const target = {
+      channel: String(inbox.slack_message_id).split(':', 1)[0],
+      timestamp: String(inbox.message_ts),
+    };
+
+    // Persist a confirmed removal before attempting the independent addition.
+    // Slack's no_reaction means the same desired absence and is therefore success.
+    if (actual) {
+      try {
+        await runtime.client.reactions.remove({ ...target, name: actual });
+      } catch (error) {
+        const code = slackReactionError(error);
+        if (code === 'message_not_found') {
+          reactionSourceGone(id);
+          continue;
+        }
+        if (code !== 'no_reaction') {
+          reactionFailure(id, error);
+          continue;
+        }
       }
-      if (desired) {
-        await runtime.client.reactions.add({
-          channel: String(inbox.slack_message_id).split(':', 1)[0],
-          timestamp: String(inbox.message_ts),
-          name: desired,
-        });
-      }
-      reactionAttempts.delete(id);
-      recordInboxReaction(id, { actual: desired, error: null, nextAttemptAt: null });
-    } catch (error) {
-      // A deleted Slack source has no reaction state left to reconcile.
-      if ((error as { data?: { error?: string } }).data?.error === 'message_not_found') {
-        recordInboxReaction(id, { desired: null, actual: null, error: null, nextAttemptAt: null });
-        continue;
-      }
-      const attempts = (reactionAttempts.get(id) ?? 0) + 1;
-      reactionAttempts.set(id, attempts);
-      const delayMs = Math.min(60_000, 1_000 * 2 ** attempts);
-      recordInboxReaction(id, {
-        error: (error as Error).message,
-        nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
-      });
+      actual = null;
+      recordInboxReaction(id, { actual: null, error: null, nextAttemptAt: null });
     }
+
+    if (desired) {
+      try {
+        await runtime.client.reactions.add({ ...target, name: desired });
+      } catch (error) {
+        const code = slackReactionError(error);
+        if (code === 'message_not_found') {
+          reactionSourceGone(id);
+          continue;
+        }
+        // The add may have committed at Slack before a lost response or local
+        // crash. already_reacted confirms the gateway's own desired presence.
+        if (code !== 'already_reacted') {
+          reactionFailure(id, error);
+          continue;
+        }
+      }
+      actual = desired;
+    }
+
+    reactionAttempts.delete(id);
+    recordInboxReaction(id, { actual, error: null, nextAttemptAt: null });
   }
+}
+
+/** Reconciles only gateway-owned reactions; Slack removes only the caller's own reaction. */
+export function reconcileInboxReactions(limit = 50): Promise<void> {
+  if (reconciliationRunning) return reconciliationRunning;
+  const operation = runReactionReconciliation(limit);
+  reconciliationRunning = operation;
+  return operation.finally(() => {
+    if (reconciliationRunning === operation) reconciliationRunning = undefined;
+  });
 }
 
 /** Coalesces post-transition reconciliation without blocking a control response. */
