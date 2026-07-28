@@ -72,12 +72,23 @@ function assertSafeExistingAncestors(path: string): void {
     try {
       const stat = lstatSync(current);
       if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink structural path: ${current}`);
-      // System-owned read-only ancestors are safe. A sticky directory (such as
-      // /tmp) is safe from replacement by another unprivileged user.
-      if ((stat.mode & 0o022) !== 0 && !(stat.mode & 0o1000))
+      if (!stat.isDirectory())
+        throw new Error(`Structural ancestor is not a directory: ${current}`);
+      const owner = uid();
+      // Structural ancestors may be owned only by this account or by the
+      // system administrator. This rejects a path rooted in another user's
+      // tree even when its current mode happens not to be writable.
+      if (owner !== undefined && stat.uid !== owner && stat.uid !== 0)
+        throw new Error(`Foreign-owned structural ancestor: ${current}`);
+      // Group/other writable ancestors permit replacement. Root-owned sticky
+      // directories (notably /tmp) are the sole safe shared exception.
+      if ((stat.mode & 0o022) !== 0 && !(stat.uid === 0 && (stat.mode & 0o1000) !== 0))
         throw new Error(`Structural path is writable by group or other: ${current}`);
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      // ENOTDIR means a lower component is a non-directory; walking upward
+      // identifies and reports that component without following anything.
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
     }
     const parent = dirname(current);
     if (parent === current || current === parsePath(current).root) return;

@@ -1,7 +1,9 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -376,6 +378,24 @@ describe('schema v2', () => {
     symlinkSync(target, join(directory, 'redirect'));
     expect(() => ensurePrivateLayout(gatewayPaths(join(directory, 'redirect', 'data')))).toThrow(
       /Unsafe symlink structural path/,
+    );
+  });
+
+  it.each([
+    ['non-directory', () => writeFileSync(join(directories.at(-1)!, 'ancestor'), 'file')],
+    [
+      'group-writable',
+      () => {
+        mkdirSync(join(directories.at(-1)!, 'ancestor'));
+        chmodSync(join(directories.at(-1)!, 'ancestor'), 0o770);
+      },
+    ],
+  ])('refuses a %s structural ancestor', (_name, createAncestor) => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-layout-'));
+    directories.push(directory);
+    createAncestor();
+    expect(() => ensurePrivateLayout(gatewayPaths(join(directory, 'ancestor', 'data')))).toThrow(
+      /Structural ancestor is not a directory|writable by group or other/,
     );
   });
 

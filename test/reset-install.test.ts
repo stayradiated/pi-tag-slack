@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
@@ -54,6 +55,44 @@ async function fixture() {
   return { paths, configPath, backup, staged };
 }
 
+async function interruptedFixture() {
+  const current = await fixture();
+  const { paths, configPath, backup } = current;
+  const suffix = '.setup-01234567-89ab-cdef';
+  const rollback = '.rollback-01234567-89ab-cdef';
+  writeFileSync(
+    paths.journal,
+    `${JSON.stringify({
+      version: 1,
+      phase: 'active-moved',
+      backupBundle: backup.path,
+      staged: {
+        config: `${configPath}${suffix}`,
+        database: `${paths.db}${suffix}`,
+        wal: `${paths.db}${suffix}-wal`,
+        shm: `${paths.db}${suffix}-shm`,
+        session: `${paths.session}${suffix}`,
+      },
+      active: {
+        config: configPath,
+        database: paths.db,
+        wal: `${paths.db}-wal`,
+        shm: `${paths.db}-shm`,
+        session: paths.session,
+      },
+      rollback: {
+        config: `${configPath}${rollback}`,
+        database: `${paths.db}${rollback}`,
+        wal: `${paths.db}-wal${rollback}`,
+        shm: `${paths.db}-shm${rollback}`,
+        session: `${paths.session}${rollback}`,
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  return current;
+}
+
 describe('journaled fresh reset installation', () => {
   it('publishes validated fresh state, then removes rollback state and journal last', async () => {
     const { paths, configPath, backup, staged } = await fixture();
@@ -106,6 +145,58 @@ describe('journaled fresh reset installation', () => {
     } finally {
       if (previous === undefined) delete process.env.PI_TAG_SLACK_DATA_DIR;
       else process.env.PI_TAG_SLACK_DATA_DIR = previous;
+    }
+  });
+
+  it('never leaves mixed active state after failure injection at every install boundary', async () => {
+    const baseline = await fixture();
+    const normalize = (step: string, root: string) =>
+      step.replaceAll(root, '<root>').replace(/\.rollback-[A-Za-z0-9.-]+/g, '.rollback-ID');
+    const steps: string[] = [];
+    installFreshReset({
+      ...baseline,
+      afterStep: (step) => steps.push(normalize(step, baseline.paths.dataDir)),
+    });
+    expect(steps.some((step) => step.startsWith('write:'))).toBe(true);
+    expect(steps.some((step) => step.startsWith('fsync:'))).toBe(true);
+    expect(steps.some((step) => step.startsWith('rename:'))).toBe(true);
+    for (const boundary of [...new Set(steps)]) {
+      const current = await fixture();
+      let injected = false;
+      expect(() =>
+        installFreshReset({
+          ...current,
+          afterStep: (step) => {
+            if (!injected && normalize(step, current.paths.dataDir) === boundary) {
+              injected = true;
+              throw new Error('boundary failure');
+            }
+          },
+        }),
+      ).toThrow('boundary failure');
+      expect(injected).toBe(true);
+      const configValue = readFileSync(current.configPath, 'utf8');
+      const old = configValue.includes('xoxb-old');
+      const fresh = configValue.includes('xoxb-fresh');
+      expect(old || fresh).toBe(true);
+      expect(
+        existsSync(join(current.paths.session, old ? 'old.json' : 'fresh.json')),
+        boundary,
+      ).toBe(true);
+      const db = new Database(current.paths.db, { readonly: true });
+      expect(db.prepare('select channel_label from gateway_config').get()).toEqual({
+        channel_label: old ? 'old' : 'fresh',
+      });
+      expect(db.pragma('quick_check', { simple: true })).toBe('ok');
+      db.close();
+      if (existsSync(current.paths.journal)) {
+        const journal = JSON.parse(readFileSync(current.paths.journal, 'utf8')) as {
+          phase: string;
+        };
+        expect(['prepared', 'active-moved', 'fresh-installed', 'complete']).toContain(
+          journal.phase,
+        );
+      }
     }
   });
 
@@ -277,6 +368,44 @@ describe('journaled fresh reset installation', () => {
     expect(existsSync(paths.journal)).toBe(false);
   });
 
+  it('restores a validated bundle after failure at every recovery boundary', async () => {
+    const baseline = await interruptedFixture();
+    const normalize = (step: string, root: string) =>
+      step.replaceAll(root, '<root>').replace(/\.recovery-[A-Za-z0-9.-]+/g, '.recovery-ID');
+    const steps: string[] = [];
+    recoverInterruptedReset({
+      paths: baseline.paths,
+      configPath: baseline.configPath,
+      afterStep: (step) => steps.push(normalize(step, baseline.paths.dataDir)),
+    });
+    expect(steps.some((step) => step.startsWith('write:'))).toBe(true);
+    expect(steps.some((step) => step.startsWith('fsync:'))).toBe(true);
+    expect(steps.some((step) => step.startsWith('rename:'))).toBe(true);
+    for (const boundary of [...new Set(steps)]) {
+      const current = await interruptedFixture();
+      let injected = false;
+      expect(() =>
+        recoverInterruptedReset({
+          paths: current.paths,
+          configPath: current.configPath,
+          afterStep: (step) => {
+            if (!injected && normalize(step, current.paths.dataDir) === boundary) {
+              injected = true;
+              throw new Error('recovery boundary failure');
+            }
+          },
+        }),
+      ).toThrow('recovery boundary failure');
+      expect(injected).toBe(true);
+      if (existsSync(current.paths.journal))
+        recoverInterruptedReset({ paths: current.paths, configPath: current.configPath });
+      expect(readFileSync(current.configPath, 'utf8')).toContain('xoxb-old');
+      expect(readFileSync(join(current.paths.session, 'old.json'), 'utf8')).toBe('old');
+      expect(existsSync(`${current.paths.db}-wal`)).toBe(false);
+      expect(existsSync(`${current.paths.db}-shm`)).toBe(false);
+    }
+  });
+
   it('rejects an unsafe journal without changing active state', async () => {
     const { paths, configPath, backup } = await fixture();
     const original = readFileSync(configPath, 'utf8');
@@ -289,6 +418,44 @@ describe('journaled fresh reset installation', () => {
     expect(readFileSync(configPath, 'utf8')).toBe(original);
     expect(existsSync(paths.journal)).toBe(true);
   });
+
+  it.each([
+    ['neither', false, false],
+    ['WAL only', true, false],
+    ['SHM only', false, true],
+    ['WAL and SHM', true, true],
+  ])('restores from the bundle after rollback with %s sidecars', async (_name, wal, shm) => {
+    const { paths, configPath, backup, staged } = await fixture();
+    if (wal) writeFileSync(`${paths.db}-wal`, 'incomplete wal', { mode: 0o600 });
+    if (shm) writeFileSync(`${paths.db}-shm`, 'incomplete shm', { mode: 0o600 });
+    await expect(async () =>
+      installFreshReset({
+        paths,
+        configPath,
+        backup,
+        staged,
+        afterStep: (step) => {
+          if (step === `rename:${staged.database}:${paths.db}`) throw new Error('injected');
+        },
+      }),
+    ).rejects.toThrow('injected');
+    expect(readFileSync(configPath, 'utf8')).toContain('xoxb-old');
+    expect(readFileSync(join(paths.session, 'old.json'), 'utf8')).toBe('old');
+    expect(existsSync(`${paths.db}-wal`)).toBe(false);
+    expect(existsSync(`${paths.db}-shm`)).toBe(false);
+  });
+
+  it.each(['gateway.db', 'config.env', 'session/old.json', 'manifest.json'])(
+    'detects backup tampering in %s before changing active state',
+    async (component) => {
+      const { paths, configPath, backup, staged } = await fixture();
+      writeFileSync(join(backup.path, component), 'tampered', { mode: 0o600 });
+      expect(() => installFreshReset({ paths, configPath, backup, staged })).toThrow();
+      expect(readFileSync(configPath, 'utf8')).toContain('xoxb-old');
+      expect(readFileSync(join(paths.session, 'old.json'), 'utf8')).toBe('old');
+      expect(existsSync(paths.journal)).toBe(false);
+    },
+  );
 
   it('rolls back on a destructive-boundary failure without overwriting the backup', async () => {
     const { paths, configPath, backup, staged } = await fixture();

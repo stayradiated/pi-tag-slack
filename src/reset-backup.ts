@@ -61,22 +61,24 @@ function sourceTree(path: string): void {
   else if (!stat.isFile()) throw new Error(`Unsupported source path type: ${path}`);
 }
 
-function fsyncFile(path: string): void {
+function fsyncFile(path: string, step: (name: string) => void): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
+  step(`fsync:${path}`);
 }
 
-function fsyncDirectory(path: string): void {
+function fsyncDirectory(path: string, step: (name: string) => void): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
+  step(`fsync:${path}`);
 }
 
 function privateMkdir(path: string): void {
@@ -85,20 +87,22 @@ function privateMkdir(path: string): void {
   privateDirectory(path);
 }
 
-function copyTree(source: string, destination: string): void {
+function copyTree(source: string, destination: string, step: (name: string) => void): void {
   const stat = lstatSync(source);
   if (stat.isSymbolicLink()) throw new Error(`Unsafe symlink source path: ${source}`);
   if (stat.isDirectory()) {
     mkdirSync(destination, { mode: 0o700 });
     chmodSync(destination, 0o700);
-    for (const name of readdirSync(source)) copyTree(join(source, name), join(destination, name));
-    fsyncDirectory(destination);
+    for (const name of readdirSync(source))
+      copyTree(join(source, name), join(destination, name), step);
+    fsyncDirectory(destination, step);
     return;
   }
   if (!stat.isFile()) throw new Error(`Unsupported source path type: ${source}`);
   copyFileSync(source, destination, constants.COPYFILE_EXCL);
+  step(`write:${destination}`);
   chmodSync(destination, 0o600);
-  fsyncFile(destination);
+  fsyncFile(destination, step);
 }
 
 function digest(path: string): { size: number; sha256: string } {
@@ -163,6 +167,8 @@ export async function createResetBackupBundle(
     now?: () => Date;
     /** Caller already holds the gateway lock. */
     lockHeld?: boolean;
+    /** Test-only failure seam at each source mutation/publication/write/fsync boundary. */
+    afterStep?: (step: string) => void;
   } = {},
 ): Promise<ResetBackupBundle> {
   const paths = options.paths ?? gatewayPaths();
@@ -170,6 +176,7 @@ export async function createResetBackupBundle(
   // A reset caller must share this lock with the daemon; acquiring it here
   // keeps this primitive safe and makes it independently reusable.
   const lock = options.lockHeld ? undefined : acquireGatewayLock(paths, { createLayout: false });
+  const step = options.afterStep ?? (() => {});
   let staging: string | undefined;
   try {
     privateMkdir(paths.backups);
@@ -204,23 +211,25 @@ export async function createResetBackupBundle(
     let schemaVersion: number;
     try {
       source.pragma('wal_checkpoint(TRUNCATE)');
+      step(`checkpoint:${paths.db}`);
       schemaVersion = Number(source.pragma('user_version', { simple: true }));
       await source.backup(join(staging, 'gateway.db'));
+      step(`write:${join(staging, 'gateway.db')}`);
     } finally {
       source.close();
     }
     chmodSync(join(staging, 'gateway.db'), 0o600);
-    fsyncFile(join(staging, 'gateway.db'));
+    fsyncFile(join(staging, 'gateway.db'), step);
     const bundledSchemaVersion = validateBackupDatabase(join(staging, 'gateway.db'));
     if (bundledSchemaVersion !== schemaVersion)
       throw new Error('Bundled database schema version changed during backup.');
 
     if (configPresent) {
-      copyTree(configPath, join(staging, 'config.env'));
+      copyTree(configPath, join(staging, 'config.env'), step);
       validateBootstrap(join(staging, 'config.env'));
     }
     if (sessionPresent) {
-      copyTree(paths.session, join(staging, 'session'));
+      copyTree(paths.session, join(staging, 'session'), step);
       privateDirectory(join(staging, 'session'));
       sourceTree(join(staging, 'session'));
     }
@@ -238,13 +247,15 @@ export async function createResetBackupBundle(
     };
     const manifestPath = join(staging, 'manifest.json');
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    step(`write:${manifestPath}`);
     chmodSync(manifestPath, 0o600);
-    fsyncFile(manifestPath);
-    fsyncDirectory(staging);
+    fsyncFile(manifestPath, step);
+    fsyncDirectory(staging, step);
     if (structuralPathExists(finalPath))
       throw new Error(`Backup bundle destination already exists: ${finalPath}`);
     renameSync(staging, finalPath);
-    fsyncDirectory(paths.backups);
+    step(`rename:${staging}:${finalPath}`);
+    fsyncDirectory(paths.backups, step);
     staging = undefined;
     return { path: finalPath, manifest };
   } finally {

@@ -1,6 +1,17 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { connect } from 'node:net';
 import { TextDecoder } from 'node:util';
 import { dirname } from 'node:path';
@@ -132,6 +143,8 @@ export interface SetupDependencies {
   isInteractive(): boolean;
   prompts: SetupPrompts;
   installAndStartDaemon(): void;
+  /** Test-only setup/reset durability failure seam. */
+  afterStep?: (step: string) => void;
 }
 
 export function systemSetupDependencies(): SetupDependencies {
@@ -229,8 +242,11 @@ export async function setup(
       values.trustedUser,
       ...(reset ? ['--reset'] : []),
     ];
-    return setupCore(collected, validationDependencies, async (message) =>
-      confirmInteractiveReset(dependencies.prompts, message),
+    return setupCore(
+      collected,
+      validationDependencies,
+      async (message) => confirmInteractiveReset(dependencies.prompts, message),
+      dependencies.afterStep,
     ).then((result) => {
       if (result === 0) setupSuccess(true, dependencies);
       return result;
@@ -242,15 +258,65 @@ export async function setup(
     interactive && reset && !yes
       ? async (message) => confirmInteractiveReset(dependencies.prompts, message)
       : undefined,
+    dependencies.afterStep,
   );
   if (result === 0) setupSuccess(interactive, dependencies);
   return result;
+}
+
+function validateSetupBootstrapDatabase(expected: {
+  channelId: string;
+  channelLabel: string;
+  workingDirectory: string;
+  piBinary: string;
+  model: string;
+  thinking: string;
+  trustedUserId: string;
+  trustedUserLabel: string;
+}): void {
+  const database = requireConfiguredDb();
+  const configuration = database
+    .prepare(
+      `select channel_id, channel_label, working_directory, pi_binary,
+              default_model, default_thinking from gateway_config where id = 1`,
+    )
+    .get();
+  expectExactBootstrap(configuration, {
+    channel_id: expected.channelId,
+    channel_label: expected.channelLabel,
+    working_directory: expected.workingDirectory,
+    pi_binary: expected.piBinary,
+    default_model: expected.model,
+    default_thinking: expected.thinking,
+  });
+  const users = database.prepare('select user_id, label from trusted_users order by user_id').all();
+  expectExactBootstrap(users, [
+    { user_id: expected.trustedUserId, label: expected.trustedUserLabel },
+  ]);
+}
+
+function expectExactBootstrap(actual: unknown, expected: unknown): void {
+  if (JSON.stringify(actual) !== JSON.stringify(expected))
+    throw new Error('Database bootstrap values differ from validated setup values.');
+}
+
+function fsyncSetupPath(path: string, directory = false): void {
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | (directory ? constants.O_DIRECTORY : constants.O_NOFOLLOW),
+  );
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function setupCore(
   args: string[],
   validationDependencies?: SetupValidationDependencies,
   confirmReset?: (message: string) => Promise<boolean>,
+  afterStep: (step: string) => void = () => {},
 ): Promise<number> {
   const options = parseFlags(
     args,
@@ -297,6 +363,7 @@ async function setupCore(
   const stagedSession = `${paths.session}${suffix}`;
   let installedConfig = false;
   let installedDb = false;
+  let installationComplete = false;
   try {
     validateBootstrapConfigPath(configPath);
     ensurePrivateFile(paths.db);
@@ -351,11 +418,24 @@ async function setupCore(
     } finally {
       closeDb();
     }
+    afterStep(`write:${stagedDb}`);
+    fsyncSetupPath(stagedDb);
+    afterStep(`fsync:${stagedDb}`);
     // Reopen the staged database before any active path is replaced. This
     // catches a malformed singleton and verifies the durable SQLite image.
+    const expectedBootstrap = {
+      channelId: channel,
+      channelLabel: validated.channelLabel,
+      workingDirectory: cwd,
+      piBinary,
+      model,
+      thinking,
+      trustedUserId: trusted,
+      trustedUserLabel: validated.trustedUserLabel,
+    };
     initDb(stagedDb);
     try {
-      requireConfiguredDb();
+      validateSetupBootstrapDatabase(expectedBootstrap);
       const quickCheck = requireConfiguredDb().pragma('quick_check', { simple: true }) as string;
       if (quickCheck !== 'ok') throw new Error(`Staged database quick_check failed: ${quickCheck}`);
     } finally {
@@ -369,7 +449,10 @@ async function setupCore(
       `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\nSLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`,
       { mode: 0o600 },
     );
+    afterStep(`write:${stagedConfig}`);
     chmodSync(stagedConfig, 0o600);
+    fsyncSetupPath(stagedConfig);
+    afterStep(`fsync:${stagedConfig}`);
     validateBootstrapConfigPath(stagedConfig);
     const stagedBootstrap = readFileSync(stagedConfig, 'utf8');
     if (
@@ -380,21 +463,47 @@ async function setupCore(
     if (reset) {
       mkdirSync(stagedSession, { mode: 0o700 });
       chmodSync(stagedSession, 0o700);
-      const backup = await createResetBackupBundle({ paths, configPath, lockHeld: true });
+      const backup = await createResetBackupBundle({
+        paths,
+        configPath,
+        lockHeld: true,
+        afterStep,
+      });
       installFreshReset({
         paths,
         configPath,
         backup,
         staged: { config: stagedConfig, database: stagedDb, session: stagedSession },
+        afterStep,
       });
       installedConfig = true;
       installedDb = true;
     } else {
       renameSync(stagedConfig, configPath);
       installedConfig = true;
+      afterStep(`rename:${stagedConfig}:${configPath}`);
+      fsyncSetupPath(dirname(configPath), true);
+      afterStep(`fsync:${dirname(configPath)}`);
       renameSync(stagedDb, paths.db);
       installedDb = true;
+      afterStep(`rename:${stagedDb}:${paths.db}`);
+      fsyncSetupPath(dirname(paths.db), true);
+      afterStep(`fsync:${dirname(paths.db)}`);
+      ensurePrivateFile(configPath);
+      ensurePrivateFile(paths.db);
+      const expectedConfig =
+        `SLACK_BOT_TOKEN=${JSON.stringify(botToken)}\n` +
+        `SLACK_APP_TOKEN=${JSON.stringify(appToken)}\n`;
+      if (readFileSync(configPath, 'utf8') !== expectedConfig)
+        throw new Error('Installed bootstrap config differs from validated staged values.');
+      initDb(paths.db);
+      try {
+        validateSetupBootstrapDatabase(expectedBootstrap);
+      } finally {
+        closeDb();
+      }
     }
+    installationComplete = true;
     console.log(`Initialized schema v2 at ${paths.db}.`);
     return 0;
   } finally {
@@ -409,6 +518,12 @@ async function setupCore(
       rmSync(path, { force: true });
     }
     if (!installedDb && installedConfig) rmSync(configPath, { force: true });
+    if (!reset && !installationComplete) {
+      rmSync(configPath, { force: true });
+      rmSync(paths.db, { force: true });
+      rmSync(`${paths.db}-wal`, { force: true });
+      rmSync(`${paths.db}-shm`, { force: true });
+    }
     lock.release();
   }
 }

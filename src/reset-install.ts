@@ -18,6 +18,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { resolveConfigPath, validateBootstrapConfigPath } from './config.js';
+import { validateRequiredPragmas } from './db.js';
 import {
   acquireGatewayLock,
   ensurePrivateLayout,
@@ -106,25 +107,66 @@ function validateConfig(path: string): void {
   if (!values.SLACK_BOT_TOKEN?.startsWith('xoxb-') || !values.SLACK_APP_TOKEN?.startsWith('xapp-'))
     throw new Error(`Invalid bootstrap config: ${path}`);
 }
-function validateDatabase(path: string): void {
+type BootstrapDatabase = { configuration: unknown; trustedUsers: unknown[] };
+
+function validateDatabase(path: string): BootstrapDatabase {
   privateFile(path);
   const db = new Database(path, { readonly: true, fileMustExist: true });
   try {
+    // Connection-local safety settings must be enabled and read back on every
+    // staged/installed validation connection; WAL is persisted in the file.
+    db.pragma('synchronous = FULL');
+    db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
+    db.pragma('trusted_schema = OFF');
+    validateRequiredPragmas(db);
     if (db.pragma('quick_check', { simple: true }) !== 'ok')
       throw new Error(`Database quick_check failed: ${path}`);
     if (Number(db.pragma('user_version', { simple: true })) !== 2)
       throw new Error(`Unsupported installed database schema: ${path}`);
-    const row = db.prepare('select count(*) as count from gateway_config').get() as {
-      count: number;
-    };
-    if (Number(row.count) !== 1)
+    const configuration = db.prepare('select * from gateway_config where id = 1').get();
+    if (!configuration)
       throw new Error(`Installed database has no configuration singleton: ${path}`);
+    const trustedUsers = db
+      .prepare('select * from trusted_users order by user_id')
+      .all() as unknown[];
+    return { configuration, trustedUsers };
+  } finally {
+    db.close();
+  }
+}
+function validateBundledDatabase(path: string, schemaVersion: number | null): void {
+  privateFile(path);
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    if (db.pragma('quick_check', { simple: true }) !== 'ok')
+      throw new Error(`Bundled database quick_check failed: ${path}`);
+    if (Number(db.pragma('user_version', { simple: true })) !== schemaVersion)
+      throw new Error(`Bundled database schema differs from its manifest: ${path}`);
   } finally {
     db.close();
   }
 }
 function digest(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+function treeDigest(path: string): { size: number; sha256: string } {
+  const hash = createHash('sha256');
+  let size = 0;
+  const visit = (current: string, relative: string): void => {
+    const stat = lstatSync(current);
+    if (stat.isDirectory()) {
+      hash.update(`d:${relative}\n`);
+      for (const name of readdirSync(current).sort())
+        visit(join(current, name), join(relative, name));
+    } else {
+      const content = readFileSync(current);
+      size += content.length;
+      hash.update(`f:${relative}:${content.length}\n`).update(content);
+    }
+  };
+  visit(path, '.');
+  return { size, sha256: hash.digest('hex') };
 }
 function validateBundle(bundle: ResetBackupBundle): void {
   const manifestPath = join(bundle.path, 'manifest.json');
@@ -168,11 +210,14 @@ function validateBundle(bundle: ResetBackupBundle): void {
         visit(path, '.');
         if (size !== component.size || hash.digest('hex') !== component.sha256)
           throw new Error(`Invalid reset backup component: ${name}`);
-      } else if (digest(path) !== component.sha256)
-        throw new Error(`Invalid reset backup component: ${name}`);
+      } else {
+        const stat = lstatSync(path);
+        if (stat.size !== component.size || digest(path) !== component.sha256)
+          throw new Error(`Invalid reset backup component: ${name}`);
+      }
     }
   }
-  validateDatabase(join(bundle.path, 'gateway.db'));
+  validateBundledDatabase(join(bundle.path, 'gateway.db'), manifest.schemaVersion);
   if (manifest.components.config.status === 'included')
     validateConfig(join(bundle.path, 'config.env'));
 }
@@ -253,8 +298,10 @@ export function installFreshReset(options: ResetInstallOptions): void {
   const step = options.afterStep ?? (() => {});
   validateBundle(backup);
   validateConfig(staged.config);
-  validateDatabase(staged.database);
+  const expectedConfig = readFileSync(staged.config);
+  const expectedDatabase = validateDatabase(staged.database);
   privateTree(staged.session);
+  const expectedSession = treeDigest(staged.session);
   const active: ComponentPaths = {
     config: resolve(configPath),
     database: paths.db,
@@ -302,13 +349,19 @@ export function installFreshReset(options: ResetInstallOptions): void {
     journal.phase = 'fresh-installed';
     writeJournal(paths.journal, journal, step);
     validateConfig(active.config);
-    validateDatabase(active.database);
+    if (!readFileSync(active.config).equals(expectedConfig))
+      throw new Error('Installed bootstrap config differs from its validated staged artifact.');
+    const installedDatabase = validateDatabase(active.database);
+    if (JSON.stringify(installedDatabase) !== JSON.stringify(expectedDatabase))
+      throw new Error('Installed database bootstrap values differ from staged values.');
     // Opening SQLite for validation can create an empty SHM sidecar. Remove
     // both only after that connection is closed, then durable-fsync the DB
     // directory before declaring the fresh installation valid.
     removeIfPresent(active.wal, step);
     removeIfPresent(active.shm, step);
     privateTree(active.session);
+    if (JSON.stringify(treeDigest(active.session)) !== JSON.stringify(expectedSession))
+      throw new Error('Installed session artifact differs from its validated staged artifact.');
     if (exists(active.wal) || exists(active.shm))
       throw new Error('Fresh database has unexpected WAL/SHM sidecars.');
     journal.phase = 'complete';
@@ -373,19 +426,22 @@ function validateRecoveryJournal(
     throw new Error('Unsafe reset journal backup bundle path.');
 }
 
-function copyPrivateTree(source: string, destination: string): void {
+function copyPrivateTree(source: string, destination: string, step: (name: string) => void): void {
   const stat = lstatSync(source);
   if (stat.isSymbolicLink()) throw new Error(`Unsafe reset source: ${source}`);
   if (stat.isDirectory()) {
     mkdirSync(destination, { mode: 0o700 });
     chmodSync(destination, 0o700);
     for (const name of readdirSync(source))
-      copyPrivateTree(join(source, name), join(destination, name));
+      copyPrivateTree(join(source, name), join(destination, name), step);
     fsyncPath(destination, true);
+    step(`fsync:${destination}`);
   } else if (stat.isFile()) {
     copyFileSync(source, destination, constants.COPYFILE_EXCL);
+    step(`write:${destination}`);
     chmodSync(destination, 0o600);
     fsyncPath(destination);
+    step(`fsync:${destination}`);
   } else throw new Error(`Unsafe reset source: ${source}`);
 }
 
@@ -421,9 +477,9 @@ export function recoverInterruptedReset(options: ResetRecoveryOptions = {}): voi
     };
     for (const path of Object.values(staged)) absent(path);
     try {
-      copyPrivateTree(join(bundle.path, 'config.env'), staged.config);
-      copyPrivateTree(join(bundle.path, 'gateway.db'), staged.database);
-      copyPrivateTree(join(bundle.path, 'session'), staged.session);
+      copyPrivateTree(join(bundle.path, 'config.env'), staged.config, step);
+      copyPrivateTree(join(bundle.path, 'gateway.db'), staged.database, step);
+      copyPrivateTree(join(bundle.path, 'session'), staged.session, step);
       validateConfig(staged.config);
       validateDatabase(staged.database);
       privateTree(staged.session);
@@ -434,7 +490,7 @@ export function recoverInterruptedReset(options: ResetRecoveryOptions = {}): voi
       removeIfPresent(journal.active.wal, step);
       removeIfPresent(journal.active.shm, step);
       validateConfig(journal.active.config);
-      validateDatabase(journal.active.database);
+      validateBundledDatabase(journal.active.database, bundle.manifest.schemaVersion);
       // SQLite validation may create an empty SHM sidecar even for a
       // self-contained backup image; remove it only after closing SQLite.
       removeIfPresent(journal.active.wal, step);
@@ -462,27 +518,52 @@ function rollbackReset(
   backup: ResetBackupBundle,
   step: (name: string) => void,
 ): void {
-  for (const path of Object.values(journal.active)) removeIfPresent(path, step);
-  const useBundleDatabase = exists(journal.rollback.wal) || exists(journal.rollback.shm);
-  for (const key of ['config', 'session'] as const)
-    if (exists(journal.rollback[key]))
+  // Restore each component according to observed journal-owned paths. Before
+  // its active->rollback rename, an active component is still the old value
+  // and must not be deleted merely because a preceding component failed.
+  for (const key of ['config', 'session'] as const) {
+    if (exists(journal.rollback[key])) {
+      removeIfPresent(journal.active[key], step);
       moveIfPresent(journal.rollback[key], journal.active[key], step);
-  if (!useBundleDatabase && exists(journal.rollback.database))
-    moveIfPresent(journal.rollback.database, journal.active.database, step);
-  else {
+    } else if (!exists(journal.staged[key])) {
+      // No rollback means the old component was absent; an absent staged path
+      // means the fresh component was already published and must be removed.
+      removeIfPresent(journal.active[key], step);
+    }
+  }
+  const useBundleDatabase =
+    exists(journal.rollback.wal) ||
+    exists(journal.rollback.shm) ||
+    (exists(journal.staged.database) && (exists(journal.active.wal) || exists(journal.active.shm)));
+  if (useBundleDatabase) {
     // A main database paired with an old WAL is not a standalone image. The
     // pre-reset SQLite backup is the validated, WAL-inclusive rollback image.
+    removeIfPresent(journal.active.database, step);
     validateBundle(backup);
     const staging = `${journal.active.database}.restore-${Date.now()}`;
     absent(staging);
     copyFileSync(join(backup.path, 'gateway.db'), staging, constants.COPYFILE_EXCL);
+    step(`write:${staging}`);
     chmodSync(staging, 0o600);
+    fsyncPath(staging);
+    step(`fsync:${staging}`);
     moveIfPresent(staging, journal.active.database, step);
+  } else if (exists(journal.rollback.database)) {
+    removeIfPresent(journal.active.database, step);
+    moveIfPresent(journal.rollback.database, journal.active.database, step);
+  } else if (!exists(journal.staged.database)) {
+    removeIfPresent(journal.active.database, step);
   }
   // A backup image is self-contained; old sidecars must never shadow it.
   removeIfPresent(journal.active.wal, step);
   removeIfPresent(journal.active.shm, step);
   validateConfig(journal.active.config);
-  validateDatabase(journal.active.database);
+  validateBundledDatabase(journal.active.database, backup.manifest.schemaVersion);
+  // Validation of a WAL-mode image may create fresh empty sidecars. They are
+  // not part of the restored snapshot and must not survive rollback.
+  removeIfPresent(journal.active.wal, step);
+  removeIfPresent(journal.active.shm, step);
   privateTree(journal.active.session);
+  if (exists(journal.active.wal) || exists(journal.active.shm))
+    throw new Error('Rolled-back database has unexpected WAL/SHM sidecars.');
 }

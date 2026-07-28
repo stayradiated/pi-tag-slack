@@ -47,6 +47,7 @@ function dependencies(
   interactive: boolean,
   values: unknown[] = [],
   calls: string[] = [],
+  afterStep?: (step: string) => void,
 ): SetupDependencies {
   return {
     isInteractive: () => interactive,
@@ -55,6 +56,7 @@ function dependencies(
       calls.push('install');
       calls.push('start');
     },
+    ...(afterStep ? { afterStep } : {}),
   };
 }
 
@@ -111,6 +113,27 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
       ).resolves.toBe(1);
       expect(existsSync(join(root, 'gateway.db'))).toBe(true);
       expect(calls).toEqual([]);
+    }));
+
+  it('never starts the daemon, reports success, or leaves first-install artifacts after failure', async () =>
+    inRoot(async (root) => {
+      const calls: string[] = [];
+      const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await expect(
+        setup(
+          argumentsFor(),
+          validation,
+          dependencies(true, [], calls, (step) => {
+            if (step.startsWith('rename:') && step.endsWith(`:${join(root, 'config.env')}`))
+              throw new Error('install boundary failed');
+          }),
+        ),
+      ).rejects.toThrow('install boundary failed');
+      expect(calls).toEqual([]);
+      expect(output).not.toHaveBeenCalledWith(expect.stringMatching(/Setup complete/i));
+      expect(existsSync(join(root, 'config.env'))).toBe(false);
+      expect(existsSync(join(root, 'gateway.db'))).toBe(false);
+      output.mockRestore();
     }));
 
   it('installs then starts the service only after a confirmed reset succeeds', async () =>

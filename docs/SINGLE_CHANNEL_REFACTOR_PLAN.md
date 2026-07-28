@@ -254,16 +254,16 @@ Acceptance tests:
 
 The journaled implementation exists, but it needs adversarial validation before release.
 
-- [ ] Validate every existing structural ancestor for safe ownership/type/mode without following symlinks.
-- [ ] Reopen staged and installed config/database/session artifacts and verify exact bootstrap values and modes.
-- [ ] Run `quick_check` for staged/reset/offline-doctor databases, not ordinary startup.
-- [ ] Verify required PRAGMAs on staged and installed databases.
-- [ ] Add failure injection after every destructive rename, write, and fsync boundary.
-- [ ] Test reset with the latest committed row resident only in WAL.
-- [ ] Test WAL/SHM rollback, cleanup, and incomplete sidecar combinations.
-- [ ] Prove backup bundle collisions never overwrite and manifests/hashes detect tampering.
-- [ ] Prove interrupted reset recovery always restores from validated journal/bundle state and never guesses a roll-forward.
-- [ ] Ensure no partial success message or daemon install/start occurs after failed installation.
+- [x] Validate every existing structural ancestor for safe ownership/type/mode without following symlinks.
+- [x] Reopen staged and installed config/database/session artifacts and verify exact bootstrap values and modes.
+- [x] Run `quick_check` for staged/reset/offline-doctor databases, not ordinary startup.
+- [x] Verify required PRAGMAs on staged and installed databases.
+- [x] Add failure injection after every destructive rename, write, and fsync boundary.
+- [x] Test reset with the latest committed row resident only in WAL.
+- [x] Test WAL/SHM rollback, cleanup, and incomplete sidecar combinations.
+- [x] Prove backup bundle collisions never overwrite and manifests/hashes detect tampering.
+- [x] Prove interrupted reset recovery always restores from validated journal/bundle state and never guesses a roll-forward.
+- [x] Ensure no partial success message or daemon install/start occurs after failed installation.
 
 ### Doctor and daemon lifecycle
 
