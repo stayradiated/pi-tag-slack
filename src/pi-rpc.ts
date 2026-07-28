@@ -17,6 +17,12 @@ export type PiSessionStatus = {
   pending: boolean;
 };
 type Frame = Record<string, unknown>;
+type PendingCommand = {
+  command: string;
+  resolve: (value: Frame) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 type DesiredSessionSettings = { model: string | null; thinking: string | null };
 export type PiModel = { provider: string; id: string; ref: string };
 export type PiApplyResult = { application: 'applied' | 'pending' | 'failed' };
@@ -28,6 +34,10 @@ export const PI_STOP_TERMINATE_MS = 2_000;
 export const PI_STOP_MAX_MS = PI_STOP_GRACE_MS + PI_STOP_TERMINATE_MS * 2;
 /** Includes scheduler/event-loop margin beyond PiRpcSession's internal bound. */
 export const PI_STOP_LIFECYCLE_TIMEOUT_MS = PI_STOP_MAX_MS + 1_000;
+const DEFAULT_RPC_FRAME_BYTES = 1024 * 1024;
+const DEFAULT_RPC_COMMAND_TIMEOUT_MS = 30_000;
+const DEFAULT_STDERR_LOG_BYTES = 64 * 1024;
+const DEFAULT_STDERR_LOG_EVENTS = 16;
 
 /** Run the configured executable's version command before opening an RPC session. */
 export async function piVersion(binary: string): Promise<string> {
@@ -62,10 +72,7 @@ export function requireSupportedPiVersion(output: string): void {
 export class PiRpcSession {
   private child: ChildProcessWithoutNullStreams | undefined;
   private buffer = Buffer.alloc(0);
-  private readonly pending = new Map<
-    string,
-    { resolve: (value: Frame) => void; reject: (error: Error) => void }
-  >();
+  private readonly pending = new Map<string, PendingCommand>();
   private streaming = false;
   private sessionId: string | undefined;
   private sequence = 0;
@@ -88,6 +95,13 @@ export class PiRpcSession {
       restartFailureThreshold?: number;
       setTimeout?: typeof setTimeout;
       clearTimeout?: typeof clearTimeout;
+      /** Transport bounds are configurable so failure paths can be tested cheaply. */
+      commandTimeoutMs?: number;
+      maxFrameBytes?: number;
+      maxIncompleteBytes?: number;
+      stderrLogMaxBytes?: number;
+      stderrLogMaxEvents?: number;
+      onStderrActivity?: (activity: { bytes: number; suppressed: boolean }) => void;
       /** Bounded graceful shutdown seams for daemon lifecycle tests. */
       stopGraceMs?: number;
       stopTerminateMs?: number;
@@ -136,7 +150,9 @@ export class PiRpcSession {
       { cwd: this.options.cwd, stdio: ['pipe', 'pipe', 'pipe'] },
     );
     this.child = child;
-    child.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
+    this.buffer = Buffer.alloc(0);
+    child.stdout.on('data', (chunk: Buffer) => this.receive(child, chunk));
+    this.drainStderr(child);
     child.on('error', (error) => {
       this.handleUnexpectedExit(child, error);
     });
@@ -405,51 +421,165 @@ export class PiRpcSession {
   }
 
   private command(type: string, values: Record<string, unknown> = {}): Promise<Frame> {
-    if (!this.child) return Promise.reject(new Error('pi RPC process is not running.'));
+    const child = this.child;
+    if (!child) return Promise.reject(new Error('pi RPC process is not running.'));
     const id = randomUUID();
     const frame = JSON.stringify({ id, type, ...values });
+    const schedule = this.options.setTimeout ?? setTimeout;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.child!.stdin.write(`${frame}\n`, (error) => {
-        if (error) {
-          this.pending.delete(id);
-          reject(error);
-        }
+      const timer = schedule(() => {
+        const pending = this.takePending(id);
+        if (!pending) return;
+        const error = new Error(`pi RPC ${type} command timed out.`);
+        pending.reject(error);
+        this.failTransport(child, error);
+      }, this.options.commandTimeoutMs ?? DEFAULT_RPC_COMMAND_TIMEOUT_MS);
+      this.pending.set(id, { command: type, resolve, reject, timer });
+      child.stdin.write(`${frame}\n`, (error) => {
+        if (!error) return;
+        const pending = this.takePending(id);
+        if (!pending) return;
+        pending.reject(error);
+        this.failTransport(child, error);
       });
     });
   }
 
-  private receive(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    for (;;) {
-      const newline = this.buffer.indexOf(0x0a);
+  private receive(child: ChildProcessWithoutNullStreams, chunk: Buffer): void {
+    if (this.child !== child) return;
+    let offset = 0;
+    while (offset < chunk.length && this.child === child) {
+      const newline = chunk.indexOf(0x0a, offset);
+      const end = newline < 0 ? chunk.length : newline;
+      const addition = end - offset;
+      const limit =
+        newline < 0
+          ? (this.options.maxIncompleteBytes ?? DEFAULT_RPC_FRAME_BYTES)
+          : (this.options.maxFrameBytes ?? DEFAULT_RPC_FRAME_BYTES);
+      if (this.buffer.length + addition > limit) {
+        this.failTransport(
+          child,
+          new Error(
+            newline < 0
+              ? 'pi RPC incomplete frame exceeded the byte limit.'
+              : 'pi RPC frame exceeded the byte limit.',
+          ),
+        );
+        return;
+      }
+      if (addition > 0) {
+        this.buffer = Buffer.concat([this.buffer, chunk.subarray(offset, end)]);
+      }
       if (newline < 0) return;
-      const raw = this.buffer.subarray(0, newline);
-      this.buffer = this.buffer.subarray(newline + 1);
+      const raw = this.buffer;
+      this.buffer = Buffer.alloc(0);
+      offset = newline + 1;
       try {
-        const text = new TextDecoder('utf-8', { fatal: true }).decode(raw).replace(/\r$/, '');
-        const frame = JSON.parse(text) as Frame;
-        if (!frame || typeof frame.type !== 'string') throw new Error('invalid RPC frame');
-        if (frame.type === 'agent_start') this.streaming = true;
-        if (frame.type === 'agent_settled') {
-          this.streaming = false;
-          this.safeBoundaryHandler?.();
-        }
-        if (typeof frame.id === 'string' && this.pending.has(frame.id)) {
-          const pending = this.pending.get(frame.id)!;
-          this.pending.delete(frame.id);
-          pending.resolve(frame);
-        }
+        this.processFrame(child, raw);
       } catch (error) {
-        this.recordFailure(new Error(`Invalid pi RPC frame: ${(error as Error).message}`));
-        this.child?.kill();
+        this.failTransport(
+          child,
+          new Error(
+            `Invalid pi RPC frame: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+        return;
       }
     }
+  }
+
+  private processFrame(child: ChildProcessWithoutNullStreams, raw: Buffer): void {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(raw).replace(/\r$/, '');
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error('frame must be an object');
+    const frame = parsed as Frame;
+    if (typeof frame.type !== 'string' || !frame.type) throw new Error('frame type is missing');
+
+    if (frame.type === 'agent_start') this.streaming = true;
+    if (frame.type === 'agent_settled') {
+      this.streaming = false;
+      this.safeBoundaryHandler?.();
+    }
+
+    if (frame.type === 'response') {
+      if (typeof frame.id !== 'string' || !frame.id) throw new Error('response id is missing');
+      const pending = this.pending.get(frame.id);
+      if (!pending) throw new Error('response id is not pending');
+      this.validateCorrelatedResponse(pending.command, frame);
+      this.takePending(frame.id)!.resolve(frame);
+      return;
+    }
+
+    // A command id may only correlate a response, never an arbitrary event.
+    if (typeof frame.id === 'string' && this.pending.has(frame.id)) {
+      const command = this.pending.get(frame.id)!.command;
+      throw new Error(`Invalid ${command} response from pi RPC: frame is not a response`);
+    }
+    if (this.child !== child) throw new Error('response arrived from a stale child');
+  }
+
+  private validateCorrelatedResponse(command: string, frame: Frame): void {
+    if (frame.command !== command) throw new Error(`response command does not match ${command}`);
+    if (typeof frame.success !== 'boolean') throw new Error('response success is not boolean');
+    if (frame.success === false && typeof frame.error !== 'string')
+      throw new Error('failed response error is missing');
+
+    // Validate the response payloads consumed as runtime state before resolving
+    // the command. Mutation/notification responses have no payload contract.
+    if (frame.success && command === 'get_state' && !isValidState(frame.data))
+      throw new Error('Invalid get_state response from pi RPC.');
+    if (frame.success && command === 'get_available_models' && !isValidModels(frame.data))
+      throw new Error('Invalid get_available_models response from pi RPC.');
+    if (
+      frame.success &&
+      command === 'get_available_thinking_levels' &&
+      !isValidThinkingLevels(frame.data)
+    )
+      throw new Error('Invalid get_available_thinking_levels response from pi RPC.');
+  }
+
+  private takePending(id: string): PendingCommand | undefined {
+    const pending = this.pending.get(id);
+    if (!pending) return undefined;
+    this.pending.delete(id);
+    (this.options.clearTimeout ?? clearTimeout)(pending.timer);
+    return pending;
+  }
+
+  private failTransport(child: ChildProcessWithoutNullStreams, error: Error): void {
+    if (this.child !== child) return;
+    this.buffer = Buffer.alloc(0);
+    this.handleUnexpectedExit(child, error);
+    child.kill();
+  }
+
+  private drainStderr(child: ChildProcessWithoutNullStreams): void {
+    let loggedBytes = 0;
+    let loggedEvents = 0;
+    let suppressionLogged = false;
+    const byteLimit = this.options.stderrLogMaxBytes ?? DEFAULT_STDERR_LOG_BYTES;
+    const eventLimit = this.options.stderrLogMaxEvents ?? DEFAULT_STDERR_LOG_EVENTS;
+    child.stderr.on('data', (value: Buffer | string) => {
+      const bytes = Buffer.byteLength(value);
+      if (loggedBytes < byteLimit && loggedEvents < eventLimit) {
+        const report = Math.min(bytes, byteLimit - loggedBytes);
+        loggedBytes += report;
+        loggedEvents += 1;
+        this.options.onStderrActivity?.({ bytes: report, suppressed: report < bytes });
+        if (report < bytes) suppressionLogged = true;
+      } else if (!suppressionLogged) {
+        suppressionLogged = true;
+        this.options.onStderrActivity?.({ bytes: 0, suppressed: true });
+      }
+      // The listener intentionally consumes every chunk after logging is capped.
+    });
   }
 
   private failStart(child: ChildProcessWithoutNullStreams, error: Error): void {
     if (!this.stopping) this.recordFailure(error);
     if (this.child === child) this.child = undefined;
+    this.buffer = Buffer.alloc(0);
     this.streaming = false;
     child.stdin.end();
     child.kill();
@@ -460,6 +590,7 @@ export class PiRpcSession {
     // reject commands and schedule its successor.
     if (this.child !== child) return;
     this.child = undefined;
+    this.buffer = Buffer.alloc(0);
     this.streaming = false;
     if (!this.stopping) this.options.onUnexpectedExit?.();
     if (this.stopping) {
@@ -512,7 +643,49 @@ export class PiRpcSession {
   }
 
   private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
-    this.pending.clear();
+    for (const id of [...this.pending.keys()]) this.takePending(id)?.reject(error);
   }
+}
+
+function isRecord(value: unknown): value is Frame {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isValidState(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (typeof value.isStreaming !== 'boolean') return false;
+  if (typeof value.sessionId !== 'string' || !value.sessionId) return false;
+  if (typeof value.thinkingLevel !== 'string' || !thinkingLevels.has(value.thinkingLevel))
+    return false;
+  if (value.model === null || value.model === undefined) return true;
+  return (
+    isRecord(value.model) &&
+    typeof value.model.provider === 'string' &&
+    Boolean(value.model.provider) &&
+    typeof value.model.id === 'string' &&
+    Boolean(value.model.id)
+  );
+}
+
+function isValidModels(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.models) &&
+    value.models.every(
+      (model) =>
+        isRecord(model) &&
+        typeof model.provider === 'string' &&
+        Boolean(model.provider) &&
+        typeof model.id === 'string' &&
+        Boolean(model.id),
+    )
+  );
+}
+
+function isValidThinkingLevels(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.levels) &&
+    value.levels.every((level) => typeof level === 'string' && thinkingLevels.has(level))
+  );
 }

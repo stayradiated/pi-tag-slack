@@ -586,9 +586,9 @@ describe('pi RPC session status', () => {
     });
     malformed = true;
     await expect(session.status()).resolves.toMatchObject({
-      running: true,
+      running: false,
       health: 'degraded',
-      lastError: 'Invalid get_state response from pi RPC.',
+      lastError: 'Invalid pi RPC frame: Invalid get_state response from pi RPC.',
     });
   });
 });
