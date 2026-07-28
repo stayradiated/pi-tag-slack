@@ -41,18 +41,30 @@ const DEFAULT_STDERR_LOG_BYTES = 64 * 1024;
 const DEFAULT_STDERR_LOG_EVENTS = 16;
 
 /** Run the configured executable's version command before opening an RPC session. */
+export function piEnvironment(extraPath = process.env.EXTRA_PATH): NodeJS.ProcessEnv {
+  const prefix = extraPath?.trim();
+  if (!prefix) return process.env;
+  return { ...process.env, PATH: [prefix, process.env.PATH].filter(Boolean).join(':') };
+}
+
 export async function piVersion(
   binary: string,
   timeoutMs = SETUP_PI_VERSION_TIMEOUT_MS,
+  environment = piEnvironment(),
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(binary, ['--version'], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout) => {
-      if (error) {
-        reject(new Error(`Unable to run ${binary} --version: ${error.message}`));
-        return;
-      }
-      resolve(String(stdout));
-    });
+    execFile(
+      binary,
+      ['--version'],
+      { encoding: 'utf8', timeout: timeoutMs, env: environment },
+      (error, stdout) => {
+        if (error) {
+          reject(new Error(`Unable to run ${binary} --version: ${error.message}`));
+          return;
+        }
+        resolve(String(stdout));
+      },
+    );
   });
 }
 
@@ -94,6 +106,8 @@ export class PiRpcSession {
       desired?: () => DesiredSessionSettings;
       spawn?: typeof spawn;
       version?: (binary: string) => Promise<string>;
+      /** Environment inherited by Pi; EXTRA_PATH is prepended to PATH. */
+      environment?: NodeJS.ProcessEnv;
       /** Injectable only to make restart supervision deterministic in tests. */
       restartBaseMs?: number;
       restartMaxMs?: number;
@@ -146,13 +160,19 @@ export class PiRpcSession {
 
   private async startChild(): Promise<void> {
     if (this.stopping) throw new Error('pi RPC session is stopping.');
-    const output = await (this.options.version ?? piVersion)(this.options.binary);
+    const output = this.options.version
+      ? await this.options.version(this.options.binary)
+      : await piVersion(this.options.binary, SETUP_PI_VERSION_TIMEOUT_MS, this.options.environment);
     if (this.stopping) throw new Error('pi RPC session is stopping.');
     requireSupportedPiVersion(output);
     const child = (this.options.spawn ?? spawn)(
       this.options.binary,
       ['--mode', 'rpc', '--session-dir', this.options.sessionDir, '--continue', '--approve'],
-      { cwd: this.options.cwd, stdio: ['pipe', 'pipe', 'pipe'] },
+      {
+        cwd: this.options.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: this.options.environment ?? piEnvironment(),
+      },
     );
     this.child = child;
     this.buffer = Buffer.alloc(0);

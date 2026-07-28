@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { PassThrough } from 'node:stream';
-import { PiRpcSession } from '../src/pi-rpc.js';
+import { PiRpcSession, piEnvironment } from '../src/pi-rpc.js';
 
 type Failure = 'follow-up' | 'state' | 'models' | 'thinking';
 
@@ -68,6 +68,11 @@ function fakeSession(
 }
 
 describe('PiRpcSession startup handshake', () => {
+  it('prepends an explicit EXTRA_PATH when starting pi', () => {
+    expect(piEnvironment('/custom/bin')).toMatchObject({
+      PATH: `/custom/bin${process.env.PATH ? `:${process.env.PATH}` : ''}`,
+    });
+  });
   it('runs the version check and validates the successful capability handshake', async () => {
     const fake = fakeSession();
     await expect(fake.session.start()).resolves.toBeUndefined();

@@ -92,6 +92,8 @@ export interface BootstrapConfig {
   slackAppToken: string;
   dataDir: string;
   configPath: string;
+  /** Optional colon-separated directories prepended when launching pi. */
+  extraPath: string;
 }
 
 /** Loads bootstrap values at runtime, never as an import side effect. */
@@ -110,6 +112,7 @@ export function loadBootstrapConfig(): BootstrapConfig {
     slackAppToken: values.SLACK_APP_TOKEN?.trim() ?? '',
     dataDir: resolveDataDir(),
     configPath,
+    extraPath: values.EXTRA_PATH?.trim() ?? '',
   };
 }
 

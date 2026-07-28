@@ -171,7 +171,7 @@ function inspectBootstrap(findings: Finding[], inspectContents: boolean): Record
     const values = parse(readForInspection(path));
     const keys = Object.keys(values).sort();
     if (
-      keys.join(',') !== 'SLACK_APP_TOKEN,SLACK_BOT_TOKEN' ||
+      !keys.every((key) => ['EXTRA_PATH', 'SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'].includes(key)) ||
       !values.SLACK_BOT_TOKEN?.startsWith('xoxb-') ||
       !values.SLACK_APP_TOKEN?.startsWith('xapp-')
     )
