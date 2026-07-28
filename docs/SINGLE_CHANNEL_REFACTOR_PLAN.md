@@ -10,7 +10,7 @@ Verified against the current tree in July 2026:
 - `pnpm audit --prod`: no known vulnerabilities
 - `pnpm format:check`: passed
 - `pnpm lint`: passed
-- `pnpm test`: 209 passed, 1 skipped
+- `pnpm test`: 213 passed, 1 skipped
 - `pnpm build`: passed
 
 Passing automated checks do not establish completion of the unchecked manual platform and Slack validation below.
