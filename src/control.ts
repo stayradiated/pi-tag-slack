@@ -337,23 +337,30 @@ export function dispatch(request: Request, services?: ControlServices): unknown 
         fail('SESSION_UNAVAILABLE', 'Pi session confirmation is unavailable.');
       return services.coordinator
         .reserve(() => services.sessionControls!.confirmReset!(params.confirm as string))
-        .then(({ value, release }) => ({
-          result: value.result,
-          cancelPostFlush: () => {
-            try {
-              value.cancelPostFlush();
-            } finally {
-              release();
-            }
-          },
-          postFlush: async () => {
-            try {
-              await value.postFlush();
-            } finally {
-              release();
-            }
-          },
-        }));
+        .then(({ value, release }) => {
+          let completed = false;
+          return {
+            result: value.result,
+            cancelPostFlush: () => {
+              if (completed) return;
+              completed = true;
+              try {
+                value.cancelPostFlush();
+              } finally {
+                release();
+              }
+            },
+            postFlush: async () => {
+              if (completed) return;
+              completed = true;
+              try {
+                await value.postFlush();
+              } finally {
+                release();
+              }
+            },
+          };
+        });
     }
     case 'session.archive.list': {
       if (!services?.archivePath)
@@ -707,6 +714,9 @@ export function errorReply(id: string, error: unknown): Reply {
     FILE_CHANGED: 'An upload file changed before it could be sent.',
     FILE_EXISTS: 'The media destination already exists.',
     UNSAFE_MEDIA_PATH: 'The local media store is unsafe.',
+    ARCHIVE_UNAVAILABLE: 'Session archive storage is unavailable.',
+    ARCHIVE_CREATE_FAILED: 'The current session could not be archived.',
+    ARCHIVE_CLEANUP_FAILED: 'Session archive cleanup failed.',
   };
   const publicCodes = new Set([
     'INVALID_REQUEST',
@@ -815,8 +825,11 @@ function decodeFrame(frame: Buffer): Request {
 function serve(socket: Socket, services?: ControlServices): void {
   let buffer = Buffer.alloc(0);
   let answered = false;
-  // This timer only covers framing. The command deadline starts after a complete
-  // request has been validated, so a slow Slack call receives its longer budget.
+  let request: Request | undefined;
+  let pendingReset: PostFlushResult | undefined;
+  let resetSettled = false;
+  let requestDispatched = false;
+  // This timer initially covers framing, then the command or reset receipt.
   let timer: NodeJS.Timeout | undefined = setTimeout(() => {
     finish(
       errorReply(
@@ -825,29 +838,153 @@ function serve(socket: Socket, services?: ControlServices): void {
       ),
     );
   }, IDLE_TIMEOUT_MS);
+
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  const cancelReset = () => {
+    if (!pendingReset || resetSettled) return;
+    resetSettled = true;
+    clearTimer();
+    pendingReset.cancelPostFlush();
+  };
   const finish = (reply: Reply) => {
     if (answered) return;
     answered = true;
-    if (timer) clearTimeout(timer);
-    timer = undefined;
+    clearTimer();
     writeReply(socket, reply);
   };
-  const commandDeadline = (request: Request): void => {
-    if (timer) clearTimeout(timer);
-    const isSlackMutation = request.command === 'slack.send' || request.command === 'inbox.respond';
-    const deadline = deadlineForCommand(request.command);
+  const commandDeadline = (value: Request): void => {
+    clearTimer();
+    const isSlackMutation = value.command === 'slack.send' || value.command === 'inbox.respond';
     timer = setTimeout(() => {
       const error = isSlackMutation
-        ? Object.assign(new Error(outcomeUnknownMessage(request.id)), { code: 'OUTCOME_UNKNOWN' })
+        ? Object.assign(new Error(outcomeUnknownMessage(value.id)), { code: 'OUTCOME_UNKNOWN' })
         : Object.assign(new Error('Control command deadline exceeded.'), {
             code: 'DEADLINE_EXCEEDED',
           });
-      finish(errorReply(request.id, error));
-    }, deadline);
+      finish(errorReply(value.id, error));
+    }, deadlineForCommand(value.command));
   };
+  const beginResetReceipt = (value: PostFlushResult) => {
+    if (answered || socket.destroyed || socket.readableEnded) {
+      value.cancelPostFlush();
+      // A confirmation may finish after the peer's EOF. It has no receipt
+      // path, so release its reservation and close our writable half too.
+      if (!socket.destroyed) socket.end();
+      return;
+    }
+    answered = true;
+    clearTimer();
+    pendingReset = value;
+    const frame = `${JSON.stringify({ id: request!.id, result: value.result })}\n`;
+    if (Buffer.byteLength(frame) > MAX_FRAME_BYTES) {
+      cancelReset();
+      socket.end(
+        JSON.stringify(
+          errorReply(
+            request!.id,
+            Object.assign(new Error('Response exceeds frame limit.'), {
+              code: 'RESPONSE_TOO_LARGE',
+            }),
+          ),
+        ) + '\n',
+      );
+      return;
+    }
+    socket.write(frame, () => {
+      if (resetSettled) return;
+      // A kernel write is not delivery. The client must return this one narrow,
+      // correlated receipt after it has consumed and presented the response.
+      timer = setTimeout(() => {
+        cancelReset();
+        socket.destroy();
+      }, IDLE_TIMEOUT_MS);
+    });
+  };
+  const dispatchRequest = (value: Request) => {
+    // Confirmed resets dispatch on their initial frame, before EOF, so they
+    // can receive the correlated receipt. EOF while that async dispatch is
+    // pending must not admit the same request a second time.
+    if (requestDispatched) return;
+    requestDispatched = true;
+    commandDeadline(value);
+    try {
+      Promise.resolve(dispatch(value, services))
+        .then((result) => {
+          if (isPostFlushResult(result)) beginResetReceipt(result);
+          else finish({ id: value.id, result });
+        })
+        .catch((error) => finish(errorReply(value.id, error)));
+    } catch (error) {
+      finish(errorReply(value.id, error));
+    }
+  };
+  const acceptReceipt = () => {
+    const newline = buffer.indexOf(0x0a);
+    if (newline === -1) {
+      if (buffer.length > MAX_FRAME_BYTES) {
+        cancelReset();
+        socket.destroy();
+      }
+      return;
+    }
+    if (newline !== buffer.length - 1) {
+      cancelReset();
+      socket.destroy();
+      return;
+    }
+    let receipt: unknown;
+    try {
+      receipt = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, -1)),
+      );
+    } catch {
+      cancelReset();
+      socket.destroy();
+      return;
+    }
+    if (
+      !receipt ||
+      typeof receipt !== 'object' ||
+      Object.keys(receipt).length !== 1 ||
+      (receipt as { receipt?: unknown }).receipt !== request?.id
+    ) {
+      cancelReset();
+      socket.destroy();
+      return;
+    }
+    buffer = Buffer.alloc(0);
+    if (!pendingReset || resetSettled) return;
+    resetSettled = true;
+    clearTimer();
+    socket.end();
+    // Receipt is the delivery boundary. The response is already consumed by
+    // the CLI; reset remains asynchronous and cannot produce a second frame.
+    void pendingReset.postFlush().catch(() => undefined);
+  };
+
   socket.on('data', (chunk: Buffer) => {
-    if (answered) return;
+    if (resetSettled) return;
     buffer = Buffer.concat([buffer, chunk]);
+    if (pendingReset) {
+      acceptReceipt();
+      return;
+    }
+    if (request) {
+      // The initial complete frame is held until EOF, except for the narrow
+      // reset confirmation exchange. Any subsequent bytes are trailing data.
+      finish(
+        errorReply(
+          request.id,
+          Object.assign(new Error('Only one request frame is allowed.'), {
+            code: 'TRAILING_DATA',
+          }),
+        ),
+      );
+      return;
+    }
     if (buffer.length > MAX_FRAME_BYTES + 1) {
       finish(
         errorReply(
@@ -855,15 +992,52 @@ function serve(socket: Socket, services?: ControlServices): void {
           Object.assign(new Error('Request exceeds frame limit.'), { code: 'FRAME_TOO_LARGE' }),
         ),
       );
+      return;
+    }
+    const newline = buffer.indexOf(0x0a);
+    if (newline === -1) return;
+    if (newline !== buffer.length - 1) {
+      let id = '';
+      try {
+        id = decodeFrame(buffer.subarray(0, newline)).id;
+      } catch {
+        // Preserve the uncorrelated invalid-request response for malformed
+        // first frames while still attributing valid trailing-frame failures.
+      }
+      finish(
+        errorReply(
+          id,
+          Object.assign(new Error('Only one request frame is allowed.'), { code: 'TRAILING_DATA' }),
+        ),
+      );
+      return;
+    }
+    try {
+      const value = decodeFrame(buffer.subarray(0, newline));
+      buffer = Buffer.alloc(0);
+      request = value;
+      // A confirmed reset is intentionally the one bidirectional protocol:
+      // dispatch now so its response can be acknowledged on this connection.
+      // Every other command waits for EOF, making one-frame rejection
+      // deterministic even if a peer splits writes across data events.
+      if (value.command === 'session.reset' && typeof value.params.confirm === 'string')
+        dispatchRequest(value);
+    } catch (error) {
+      finish(errorReply('', error));
     }
   });
-  // Dispatch only after the client write-half-closes. This makes it possible
-  // to reject a second frame even when its bytes arrive in a later data event.
-  // The client can still read the response after socket.end(requestFrame).
   socket.on('end', () => {
+    const awaitingReceipt = pendingReset !== undefined;
+    if (awaitingReceipt) cancelReset();
+    // With allowHalfOpen, an EOF while awaiting the receipt otherwise leaves
+    // the server write half alive and can retain both the socket and lane.
+    if (awaitingReceipt) socket.end();
+    if (request) {
+      if (!answered && !requestDispatched) dispatchRequest(request);
+      return;
+    }
     if (answered) return;
-    const newline = buffer.indexOf(0x0a);
-    if (newline === -1) {
+    if (buffer.length === 0) {
       finish(
         errorReply(
           '',
@@ -872,63 +1046,13 @@ function serve(socket: Socket, services?: ControlServices): void {
           }),
         ),
       );
-      return;
-    }
-    if (newline !== buffer.length - 1) {
-      finish(
-        errorReply(
-          '',
-          Object.assign(new Error('Only one request frame is allowed.'), { code: 'TRAILING_DATA' }),
-        ),
-      );
-      return;
-    }
-    try {
-      const request = decodeFrame(buffer.subarray(0, newline));
-      commandDeadline(request);
-      try {
-        // Do not wire client socket close/error into this promise. In particular,
-        // a timed-out mutation must continue to its Slack/SQLite conclusion.
-        Promise.resolve(dispatch(request, services))
-          .then((result) => {
-            if (!isPostFlushResult(result)) {
-              finish({ id: request.id, result });
-              return;
-            }
-            if (answered || socket.destroyed) {
-              result.cancelPostFlush();
-              return;
-            }
-            answered = true;
-            if (timer) clearTimeout(timer);
-            timer = undefined;
-            let flushed = false;
-            const cancel = () => {
-              if (!flushed) result.cancelPostFlush();
-            };
-            socket.once('error', cancel);
-            socket.once('close', cancel);
-            writeReply(socket, { id: request.id, result: result.result }, () => {
-              flushed = true;
-              socket.off('error', cancel);
-              socket.off('close', cancel);
-              // Reset failures are recorded by the session controller. The
-              // response has already crossed the control boundary, so there is
-              // no second frame on which to report this asynchronous result.
-              void result.postFlush().catch(() => undefined);
-            });
-          })
-          .catch((error) => finish(errorReply(request.id, error)));
-      } catch (error) {
-        finish(errorReply(request.id, error));
-      }
-    } catch (error) {
-      finish(errorReply('', error));
     }
   });
   socket.on('error', () => {
-    if (timer) clearTimeout(timer);
+    cancelReset();
+    clearTimer();
   });
+  socket.on('close', cancelReset);
 }
 
 async function staleSocket(path: string): Promise<boolean> {

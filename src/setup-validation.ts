@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { WebClient } from '@slack/web-api';
 import { PiRpcSession, piVersion } from './pi-rpc.js';
 import { validateConfiguredConversation } from './slack-validation.js';
@@ -16,7 +16,12 @@ export type SetupValidationInput = {
   trustedUserId: string;
 };
 
-export type SetupValidationResult = { channelLabel: string; trustedUserLabel: string };
+export type SetupValidationResult = {
+  channelLabel: string;
+  trustedUserLabel: string;
+  /** Canonical, service-safe path which setup must persist as pi_binary. */
+  piBinary: string;
+};
 
 type BotClient = {
   auth: { test(): Promise<unknown> };
@@ -64,6 +69,61 @@ const defaultDependencies: SetupValidationDependencies = {
   },
 };
 
+/**
+ * Resolves the default command through setup's PATH, but never persists a
+ * service-PATH-dependent value. Explicit paths must already be absolute.
+ */
+export function resolvePiExecutable(piBinary: string, path = process.env.PATH): string {
+  if (!piBinary.trim()) throw new Error('Pi executable must not be empty.');
+  const selected = piBinary.trim();
+  let candidate: string | undefined;
+  if (isAbsolute(selected)) {
+    candidate = selected;
+  } else if (selected.includes('/')) {
+    throw new Error(
+      'Pi executable paths must be absolute. Use an absolute --pi-bin path, or a command name resolvable through PATH.',
+    );
+  } else {
+    for (const directory of (path ?? '').split(':')) {
+      // Relative PATH entries would make setup's result depend on cwd. They
+      // are resolved here solely to discover the executable; realpath below
+      // makes the persisted value independent of both cwd and PATH.
+      const attempted = resolve(directory || process.cwd(), selected);
+      try {
+        const stat = statSync(attempted);
+        if (stat.isFile() && (stat.mode & 0o111) !== 0) {
+          candidate = attempted;
+          break;
+        }
+      } catch {
+        // Keep searching PATH entries, as execvp does.
+      }
+    }
+    if (!candidate)
+      throw new Error(`Pi executable '${selected}' was not found as an executable on setup PATH.`);
+  }
+  let canonical: string;
+  try {
+    canonical = realpathSync(candidate);
+    const stat = lstatSync(canonical);
+    const account = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    if (!stat.isFile() || (stat.mode & 0o111) === 0)
+      throw new Error('not a regular executable file');
+    // A user service executes as this account. Root-owned system binaries and
+    // binaries owned by that account are safe ownership boundaries; binaries
+    // writable by another group/world principal are not.
+    if (
+      (account !== undefined && stat.uid !== account && stat.uid !== 0) ||
+      (stat.mode & 0o022) !== 0
+    )
+      throw new Error('has unsafe ownership or permissions');
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'cannot be inspected';
+    throw new Error(`Pi executable is not a safe executable file: ${detail}`, { cause: error });
+  }
+  return canonical;
+}
+
 function slackOk(response: unknown, operation: string): void {
   if (!response || typeof response !== 'object' || (response as { ok?: unknown }).ok !== true)
     throw new Error(
@@ -104,7 +164,8 @@ export async function validateFirstTimeSetup(
   if (!input.botToken.startsWith('xoxb-')) throw new Error('Setup requires an xoxb- bot token.');
   if (!input.appToken.startsWith('xapp-')) throw new Error('Setup requires an xapp- app token.');
 
-  await dependencies.validatePi(input);
+  const piBinary = resolvePiExecutable(input.piBinary);
+  await dependencies.validatePi({ ...input, piBinary });
 
   const bot = dependencies.createBotClient(input.botToken);
   const auth = (await bot.auth.test()) as { ok?: unknown; user_id?: unknown; error?: unknown };
@@ -128,5 +189,9 @@ export async function validateFirstTimeSetup(
     userResponse.user.deleted === true
   )
     throw new Error('Initial trusted Slack user is invalid or deactivated.');
-  return { channelLabel, trustedUserLabel: cosmeticLabel(userResponse.user, 'user') };
+  return {
+    channelLabel,
+    trustedUserLabel: cosmeticLabel(userResponse.user, 'user'),
+    piBinary,
+  };
 }

@@ -193,6 +193,29 @@ describe.sequential('interactive setup consent and daemon lifecycle', () => {
       expect(calls).toEqual(['install', 'start']);
     }));
 
+  it('shows the validated service executable before interactive installation', async () =>
+    inRoot(async () => {
+      const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await expect(
+        setup(
+          [],
+          validation,
+          dependencies(true, [
+            'C0123456789',
+            '/tmp',
+            'pi',
+            'provider/model',
+            'medium',
+            'xoxb-token',
+            'xapp-token',
+            'U0123456789',
+          ]),
+        ),
+      ).resolves.toBe(0);
+      expect(output).toHaveBeenCalledWith(expect.stringMatching(/^Validated pi binary: \/.+/));
+      output.mockRestore();
+    }));
+
   it('keeps non-interactive setup service-free and prints manual next steps', async () =>
     inRoot(async () => {
       const calls: string[] = [];

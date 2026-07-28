@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 
-export type PiAcceptance = { acceptedAt: string; sessionId?: string; runSequence: number };
+export type PiAcceptance = { acceptedAt: string; sessionId: string; runSequence: number };
 export type PiSessionStatus = {
   running: boolean;
   health: 'healthy' | 'degraded';
@@ -323,6 +323,7 @@ export class PiRpcSession {
       message: reopenedExhaustedWindow ? `${message}\nOther open work may exist.` : message,
     });
     if (response.success !== true) throw new Error(`pi rejected ${command}.`);
+    if (!this.sessionId) throw new Error('pi accepted work without a session ID.');
     this.sequence += 1;
     return {
       acceptedAt: new Date().toISOString(),

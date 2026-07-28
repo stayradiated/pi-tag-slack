@@ -149,7 +149,13 @@ describe('session reset control routing', () => {
   it('rejects malformed confirmation challenges before touching the session', () => {
     configured();
     const services = {
-      notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+      notifier: {
+        notify: async () => ({
+          acceptedAt: '2030-01-01T00:00:00.000Z',
+          sessionId: 'session',
+          runSequence: 0,
+        }),
+      },
       coordinator: new GatewayCoordinator(),
       sessionControls: { reset: async () => ({ archivedTo: '', recoverySent: false }) },
     };
@@ -179,7 +185,13 @@ describe('session reset control routing', () => {
       dispatch(
         { version: 1, id: 'reset', command: 'session.reset', params: {} },
         {
-          notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+          notifier: {
+            notify: async () => ({
+              acceptedAt: '2030-01-01T00:00:00.000Z',
+              sessionId: 'session',
+              runSequence: 0,
+            }),
+          },
           coordinator: new GatewayCoordinator(),
           sessionControls: controls,
         },
@@ -288,7 +300,13 @@ describe('coordinator reset reservation', () => {
       }),
     };
     const service = {
-      notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+      notifier: {
+        notify: async () => ({
+          acceptedAt: '2030-01-01T00:00:00.000Z',
+          sessionId: 'session',
+          runSequence: 0,
+        }),
+      },
       coordinator,
       sessionControls: controls,
     };
@@ -377,7 +395,13 @@ describe('session desired/effective controls', () => {
       applyDesired: async () => ({ application: 'applied' as const }),
     };
     const service = {
-      notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+      notifier: {
+        notify: async () => ({
+          acceptedAt: '2030-01-01T00:00:00.000Z',
+          sessionId: 'session',
+          runSequence: 0,
+        }),
+      },
       coordinator,
       sessionControls: controls,
     };

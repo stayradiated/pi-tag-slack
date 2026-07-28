@@ -16,7 +16,7 @@ create table gateway_config (
 ) strict;
 create table trusted_users (user_id text primary key check(length(user_id) > 1 and user_id glob '[UW][A-Z0-9]*' and user_id not glob '*[^A-Z0-9]*'), label text not null check(trim(label) <> ''), created_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at)) strict;
 create table inbox (
- id integer primary key, slack_message_id text not null unique check(trim(slack_message_id) <> ''), sender_id text not null check(trim(sender_id) <> ''), sender_label text not null check(trim(sender_label) <> ''), content text not null, revision integer not null check(revision >= 1), message_ts text not null check(trim(message_ts) <> ''), thread_ts text not null check(trim(thread_ts) <> ''), attachments text not null check(json_valid(attachments) and json_type(attachments) = 'array'), state text not null check(state in ('open','resolved')), source_deleted_at text check(source_deleted_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', source_deleted_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', source_deleted_at) = source_deleted_at), resolution_reason text check(resolution_reason is null or trim(resolution_reason) <> ''), resolved_at text check(resolved_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at) = resolved_at), reaction_desired text check(reaction_desired is null or trim(reaction_desired) <> ''), reaction_actual text check(reaction_actual is null or trim(reaction_actual) <> ''), reaction_error text check(reaction_error is null or trim(reaction_error) <> ''), reaction_next_attempt_at text check(reaction_next_attempt_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', reaction_next_attempt_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', reaction_next_attempt_at) = reaction_next_attempt_at), latest_reply_ts text check(latest_reply_ts is null or trim(latest_reply_ts) <> ''), latest_reply_at text check(latest_reply_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', latest_reply_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', latest_reply_at) = latest_reply_at), created_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at), updated_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) = updated_at),
+ id integer primary key, slack_message_id text not null unique check(trim(slack_message_id) <> ''), sender_id text not null check(trim(sender_id) <> ''), sender_label text not null check(trim(sender_label) <> ''), content text not null, revision integer not null check(revision >= 1), message_ts text not null check(length(message_ts) >= 3 and message_ts not glob '*[^0-9.]*' and instr(message_ts, '.') > 1 and instr(message_ts, '.') < length(message_ts) and length(message_ts) - length(replace(message_ts, '.', '')) = 1), thread_ts text not null check(length(thread_ts) >= 3 and thread_ts not glob '*[^0-9.]*' and instr(thread_ts, '.') > 1 and instr(thread_ts, '.') < length(thread_ts) and length(thread_ts) - length(replace(thread_ts, '.', '')) = 1), attachments text not null check(json_valid(attachments) and json_type(attachments) = 'array'), state text not null check(state in ('open','resolved')), source_deleted_at text check(source_deleted_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', source_deleted_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', source_deleted_at) = source_deleted_at), resolution_reason text check(resolution_reason is null or trim(resolution_reason) <> ''), resolved_at text check(resolved_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at) = resolved_at), reaction_desired text check(reaction_desired is null or trim(reaction_desired) <> ''), reaction_actual text check(reaction_actual is null or trim(reaction_actual) <> ''), reaction_error text check(reaction_error is null or trim(reaction_error) <> ''), reaction_next_attempt_at text check(reaction_next_attempt_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', reaction_next_attempt_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', reaction_next_attempt_at) = reaction_next_attempt_at), latest_reply_ts text check(latest_reply_ts is null or (length(latest_reply_ts) >= 3 and latest_reply_ts not glob '*[^0-9.]*' and instr(latest_reply_ts, '.') > 1 and instr(latest_reply_ts, '.') < length(latest_reply_ts) and length(latest_reply_ts) - length(replace(latest_reply_ts, '.', '')) = 1)), latest_reply_at text check(latest_reply_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', latest_reply_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', latest_reply_at) = latest_reply_at), created_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at), updated_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) = updated_at),
  check((state = 'open' and resolved_at is null and resolution_reason is null) or (state = 'resolved' and resolved_at is not null and resolution_reason is not null)),
  check((latest_reply_ts is null) = (latest_reply_at is null)),
  check(source_deleted_at is null or (state = 'resolved' and content = '' and attachments = '[]' and reaction_desired is null and reaction_actual is null and reaction_error is null and reaction_next_attempt_at is null))
@@ -30,8 +30,7 @@ end;
 create table slack_events (
  source_identity text primary key check(source_identity glob 'slack:event:*' and length(source_identity) > 12), kind text not null check(kind in ('new-message','edit','deletion')), inbox_id integer references inbox(id), inbox_revision integer check(inbox_revision is null or inbox_revision >= 1), outcome text not null check(outcome in ('created','updated','deleted','already-represented')), rpc_accepted_at text check(rpc_accepted_at is null or strftime('%Y-%m-%dT%H:%M:%fZ', rpc_accepted_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', rpc_accepted_at) = rpc_accepted_at), pi_session_id text check(pi_session_id is null or trim(pi_session_id) <> ''), run_sequence integer check(run_sequence is null or run_sequence >= 0), created_at text not null check(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) is not null and strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at),
  check(inbox_id is not null and inbox_revision is not null),
- check((pi_session_id is null) = (run_sequence is null)),
- check(rpc_accepted_at is not null or (pi_session_id is null and run_sequence is null)),
+ check((rpc_accepted_at is null and pi_session_id is null and run_sequence is null) or (rpc_accepted_at is not null and pi_session_id is not null and run_sequence is not null)),
  check(rpc_accepted_at is null or outcome <> 'already-represented'),
  check((kind = 'new-message' and outcome in ('created','already-represented')) or (kind = 'edit' and outcome = 'updated') or (kind = 'deletion' and outcome = 'deleted'))
 ) strict;
@@ -46,8 +45,7 @@ create table tasks (
  check((source='manual' and schedule_id is null and occurrence_key is null) or (source='schedule' and schedule_id is not null and occurrence_key is not null)),
  check((catch_up_first_at is null and catch_up_last_at is null and catch_up_count is null) or (source='schedule' and catch_up_first_at is not null and catch_up_last_at is not null and catch_up_count is not null and catch_up_first_at <= catch_up_last_at)),
  check((state = 'open' and resolved_at is null and resolution_reason is null) or (state = 'resolved' and resolved_at is not null and resolution_reason is not null)),
- check((pi_session_id is null) = (run_sequence is null)),
- check(rpc_accepted_at is not null or (pi_session_id is null and run_sequence is null))
+ check((rpc_accepted_at is null and pi_session_id is null and run_sequence is null) or (rpc_accepted_at is not null and pi_session_id is not null and run_sequence is not null))
 ) strict;
 create index tasks_state_created on tasks(state, created_at desc, id desc);
 create trigger tasks_no_reopen before update of state on tasks
@@ -341,7 +339,7 @@ function validTimestamp(value: unknown): value is string {
 }
 
 function validSlackTimestamp(value: unknown): value is string {
-  return typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value);
+  return typeof value === 'string' && /^\d+\.\d+$/.test(value);
 }
 
 function nonempty(value: unknown): value is string {
@@ -451,7 +449,9 @@ export function validateInboxRow(row: Record<string, unknown>): void {
 }
 
 export function validateSlackEventRow(row: Record<string, unknown>): void {
-  const acceptancePair = (row.pi_session_id === null) === (row.run_sequence === null);
+  const acceptanceMetadata =
+    (row.rpc_accepted_at === null && row.pi_session_id === null && row.run_sequence === null) ||
+    (row.rpc_accepted_at !== null && row.pi_session_id !== null && row.run_sequence !== null);
   const kindOutcome =
     (row.kind === 'new-message' &&
       (row.outcome === 'created' || row.outcome === 'already-represented')) ||
@@ -469,8 +469,7 @@ export function validateSlackEventRow(row: Record<string, unknown>): void {
     !nullableNonempty(row.pi_session_id) ||
     (row.run_sequence !== null &&
       (!Number.isSafeInteger(row.run_sequence) || Number(row.run_sequence) < 0)) ||
-    !acceptancePair ||
-    (row.rpc_accepted_at === null && row.pi_session_id !== null) ||
+    !acceptanceMetadata ||
     (row.rpc_accepted_at !== null && row.outcome === 'already-represented') ||
     !validTimestamp(row.created_at)
   )
@@ -678,20 +677,29 @@ export type SlackMutation = {
   attachments?: unknown[];
 };
 /** Atomically records a delivery and mutates an open source snapshot. Ignored mutations are deliberately not ledgered. */
-export function markSlackEventAccepted(
-  eventId: string,
-  metadata: { acceptedAt: string; sessionId?: string; runSequence?: number },
-): void {
+export type AcceptanceMetadata = {
+  acceptedAt: string;
+  sessionId: string;
+  runSequence: number;
+};
+
+function validateAcceptanceMetadata(metadata: AcceptanceMetadata): void {
+  if (
+    !validTimestamp(metadata.acceptedAt) ||
+    !nonempty(metadata.sessionId) ||
+    !Number.isSafeInteger(metadata.runSequence) ||
+    metadata.runSequence < 0
+  )
+    throw new Error('Malformed pi acceptance metadata.');
+}
+
+export function markSlackEventAccepted(eventId: string, metadata: AcceptanceMetadata): void {
+  validateAcceptanceMetadata(metadata);
   requireConfiguredDb()
     .prepare(
       'update slack_events set rpc_accepted_at=?, pi_session_id=?, run_sequence=? where source_identity=?',
     )
-    .run(
-      metadata.acceptedAt,
-      metadata.sessionId ?? null,
-      metadata.runSequence ?? null,
-      `slack:event:${eventId}`,
-    );
+    .run(metadata.acceptedAt, metadata.sessionId, metadata.runSequence, `slack:event:${eventId}`);
 }
 
 export function inboxSnapshot(id: number): Record<string, unknown> | undefined {
@@ -746,8 +754,10 @@ export function validateTaskRow(row: Record<string, unknown>): asserts row is Ta
     !nullableNonempty(row.pi_session_id) ||
     (row.run_sequence !== null &&
       (!Number.isSafeInteger(row.run_sequence) || Number(row.run_sequence) < 0)) ||
-    (row.pi_session_id === null) !== (row.run_sequence === null) ||
-    (row.rpc_accepted_at === null && row.pi_session_id !== null) ||
+    !(
+      (row.rpc_accepted_at === null && row.pi_session_id === null && row.run_sequence === null) ||
+      (row.rpc_accepted_at !== null && row.pi_session_id !== null && row.run_sequence !== null)
+    ) ||
     !validTimestamp(row.created_at) ||
     (!catchUp &&
       (!scheduled ||
@@ -949,13 +959,11 @@ export function materializeDueScheduleTasks(
 }
 
 /** Records only an RPC command that pi has explicitly accepted. */
-export function markTaskAccepted(
-  id: number,
-  metadata: { acceptedAt: string; sessionId?: string; runSequence?: number },
-): void {
+export function markTaskAccepted(id: number, metadata: AcceptanceMetadata): void {
+  validateAcceptanceMetadata(metadata);
   requireConfiguredDb()
     .prepare('update tasks set rpc_accepted_at=?, pi_session_id=?, run_sequence=? where id=?')
-    .run(metadata.acceptedAt, metadata.sessionId ?? null, metadata.runSequence ?? null, id);
+    .run(metadata.acceptedAt, metadata.sessionId, metadata.runSequence, id);
 }
 
 /** Existing work for a single startup/reset recovery message; this never changes acceptance metadata. */
@@ -1014,6 +1022,8 @@ export function revertOpenInboxWorkingReactions(): number {
 
 /** Resolves an open inbox after a confirmed Slack reply, preserving terminal snapshots. */
 export function recordInboxReply(id: number, replyTs: string): void {
+  if (!validSlackTimestamp(replyTs))
+    throw new Error('Slack reply has an invalid decimal timestamp.');
   const d = requireConfiguredDb();
   d.transaction(() => {
     const row = inboxSnapshot(id);
@@ -1089,6 +1099,11 @@ export function ingestSlackEvent(event: SlackMutation): {
     throw new Error('Missing or invalid Slack top-level event_id.');
   if (!event.messageId || !event.senderId || !event.senderLabel || !event.messageTs)
     throw new Error('Slack mutation lacks required message identity fields.');
+  if (
+    !validSlackTimestamp(event.messageTs) ||
+    (event.threadTs && !validSlackTimestamp(event.threadTs))
+  )
+    throw new Error('Slack mutation has an invalid decimal timestamp.');
   const d = requireConfiguredDb();
   const identity = `slack:event:${event.eventId}`;
   return d.transaction(() => {

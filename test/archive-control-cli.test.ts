@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { commandFor, paramsFor } from '../src/cli/index.js';
-import { dispatch } from '../src/control.js';
+import { dispatch, errorReply } from '../src/control.js';
 import { closeDb, createGatewayConfig, initDb } from '../src/db.js';
 import { GatewayCoordinator } from '../src/slack.js';
 
@@ -35,7 +35,13 @@ function services(archivePath: string, coordinator: GatewayCoordinator) {
   return {
     archivePath,
     coordinator,
-    notifier: { notify: async () => ({ acceptedAt: '', runSequence: 0 }) },
+    notifier: {
+      notify: async () => ({
+        acceptedAt: '2030-01-01T00:00:00.000Z',
+        sessionId: 'session',
+        runSequence: 0,
+      }),
+    },
   };
 }
 
@@ -85,6 +91,24 @@ describe('archive control routing', () => {
         services(archive, coordinator),
       ),
     ).resolves.toMatchObject({ deleted: [old] });
+  });
+
+  it('preserves sanitized archive filesystem errors at the public route boundary', async () => {
+    const { archive, coordinator } = configured();
+    rmSync(archive, { recursive: true });
+    const failure = await Promise.resolve(
+      dispatch(
+        { version: 1, id: 'list', command: 'session.archive.list', params: {} },
+        services(archive, coordinator),
+      ),
+    ).catch((error) => error);
+    expect(errorReply('list', failure)).toEqual({
+      id: 'list',
+      error: {
+        code: 'ARCHIVE_UNAVAILABLE',
+        message: 'Session archive storage is unavailable.',
+      },
+    });
   });
 });
 

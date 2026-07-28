@@ -116,7 +116,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = fileDownload
     ? 'slack.file.download'
     : commandFor(group, verb, sessionNested ? runtimeArgs[0] : undefined);
-  if (!command) throw new Error(`Unsupported command.\n${help}`);
+  if (!command)
+    throw Object.assign(new Error('Unsupported command. Run pi-tag-slack help for usage.'), {
+      code: 'UNKNOWN_COMMAND',
+    });
   const response = await request(
     command,
     paramsFor(
@@ -271,6 +274,7 @@ export async function setup(
       validationDependencies,
       async (message) => confirmInteractiveReset(dependencies.prompts, message),
       dependencies.afterStep,
+      (piBinary) => console.log(`Validated pi binary: ${piBinary}`),
     ).then((result) => {
       if (result === 0) setupSuccess(true, dependencies);
       return result;
@@ -283,6 +287,7 @@ export async function setup(
       ? async (message) => confirmInteractiveReset(dependencies.prompts, message)
       : undefined,
     dependencies.afterStep,
+    interactive ? (piBinary) => console.log(`Validated pi binary: ${piBinary}`) : undefined,
   );
   if (result === 0) setupSuccess(interactive, dependencies);
   return result;
@@ -341,6 +346,7 @@ async function setupCore(
   validationDependencies?: SetupValidationDependencies,
   confirmReset?: (message: string) => Promise<boolean>,
   afterStep: (step: string) => void = () => {},
+  onValidatedPiBinary?: (piBinary: string) => void,
 ): Promise<number> {
   const options = parseFlags(
     args,
@@ -413,6 +419,7 @@ async function setupCore(
       },
       validationDependencies,
     );
+    onValidatedPiBinary?.(validated.piBinary);
     console.warn(
       "Warning: trusted Slack users can influence an agent with this daemon account's local capabilities.",
     );
@@ -434,7 +441,7 @@ async function setupCore(
         channelId: channel,
         channelLabel: validated.channelLabel,
         workingDirectory: cwd,
-        piBinary,
+        piBinary: validated.piBinary,
         defaultModel: model,
         defaultThinking: thinking,
       });
@@ -451,7 +458,7 @@ async function setupCore(
       channelId: channel,
       channelLabel: validated.channelLabel,
       workingDirectory: cwd,
-      piBinary,
+      piBinary: validated.piBinary,
       model,
       thinking,
       trustedUserId: trusted,
@@ -502,6 +509,12 @@ async function setupCore(
       });
       installedConfig = true;
       installedDb = true;
+      initDb(paths.db);
+      try {
+        validateSetupBootstrapDatabase(expectedBootstrap);
+      } finally {
+        closeDb();
+      }
     } else {
       renameSync(stagedConfig, configPath);
       installedConfig = true;
@@ -786,46 +799,26 @@ export function request(
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const socket = connect(gatewayPaths().socket);
+    const mutation = SLACK_MUTATIONS.has(command);
+    const needsReceipt = command === 'session.reset' && typeof params.confirm === 'string';
     let output = Buffer.alloc(0);
     let settled = false;
+    let deliveryStarted = false;
+    const ambiguous = (fallback: Error): Error =>
+      mutation && deliveryStarted ? timeoutError(command, id) : fallback;
     const rejectOnce = (error: Error) => {
       if (settled) return;
       settled = true;
+      socket.destroy();
       reject(error);
     };
-    socket.setTimeout(
-      SLACK_NETWORK_COMMANDS.has(command) ? SLACK_NETWORK_DEADLINE_MS : CONTROL_COMMAND_DEADLINE_MS,
-    );
-    socket.once('error', () =>
-      rejectOnce(
-        Object.assign(new Error('pi-tag-slack daemon is unavailable.'), {
-          code: 'DAEMON_UNAVAILABLE',
-        }),
-      ),
-    );
-    socket.once('timeout', () => {
-      socket.destroy();
-      // Keep the generated ID available to callers: a mutation may have reached
-      // Slack even though this client did not receive the daemon's response.
-      rejectOnce(timeoutError(command, id));
-    });
-    socket.on('data', (chunk: Buffer) => {
-      output = Buffer.concat([output, chunk]);
-      if (output.length > MAX_RESPONSE_FRAME_BYTES + 1) {
-        socket.destroy();
-        rejectOnce(protocolError('Daemon response exceeds frame limit.'));
-      }
-    });
-    socket.on('end', () => {
+    const invalidResponse = (message: string) => rejectOnce(ambiguous(protocolError(message)));
+    const parseResponse = () => {
       if (settled) return;
-      settled = true;
-      if (
-        output.length === 0 ||
-        output.length > MAX_RESPONSE_FRAME_BYTES ||
-        output.at(-1) !== 0x0a ||
-        output.indexOf(0x0a) !== output.length - 1
-      ) {
-        reject(protocolError('Daemon response must contain exactly one LF-terminated frame.'));
+      const newline = output.indexOf(0x0a);
+      if (newline === -1) return;
+      if (newline !== output.length - 1 || output.length > MAX_RESPONSE_FRAME_BYTES) {
+        invalidResponse('Daemon response must contain exactly one LF-terminated frame.');
         return;
       }
       let response: unknown;
@@ -834,11 +827,11 @@ export function request(
           new TextDecoder('utf-8', { fatal: true }).decode(output.subarray(0, -1)),
         );
       } catch {
-        reject(protocolError('Daemon response must be valid UTF-8 JSON.'));
+        invalidResponse('Daemon response must be valid UTF-8 JSON.');
         return;
       }
       if (!response || typeof response !== 'object' || (response as ControlResponse).id !== id) {
-        reject(protocolError('Daemon response has an invalid correlation ID.'));
+        invalidResponse('Daemon response has an invalid correlation ID.');
         return;
       }
       const value = response as ControlResponse;
@@ -851,14 +844,57 @@ export function request(
             typeof value.error.code !== 'string' ||
             typeof value.error.message !== 'string'))
       ) {
-        reject(protocolError('Daemon response has an invalid schema.'));
+        invalidResponse('Daemon response has an invalid schema.');
         return;
       }
+      settled = true;
+      socket.setTimeout(0);
       resolve(value);
-    });
-    socket.on('connect', () =>
-      socket.end(`${JSON.stringify({ version: 1, id, command, params })}\n`),
+      if (needsReceipt && hasResult) {
+        // Promise continuations present the confirmation response before this
+        // macrotask acknowledges delivery and permits reset termination.
+        setImmediate(() => socket.end(`${JSON.stringify({ receipt: id })}\n`));
+      } else {
+        socket.end();
+      }
+    };
+    socket.setTimeout(
+      SLACK_NETWORK_COMMANDS.has(command) ? SLACK_NETWORK_DEADLINE_MS : CONTROL_COMMAND_DEADLINE_MS,
     );
+    socket.once('error', () =>
+      rejectOnce(
+        ambiguous(
+          Object.assign(new Error('pi-tag-slack daemon is unavailable.'), {
+            code: 'DAEMON_UNAVAILABLE',
+          }),
+        ),
+      ),
+    );
+    socket.once('timeout', () => rejectOnce(timeoutError(command, id)));
+    socket.on('data', (chunk: Buffer) => {
+      output = Buffer.concat([output, chunk]);
+      if (output.length > MAX_RESPONSE_FRAME_BYTES + 1) {
+        invalidResponse('Daemon response exceeds frame limit.');
+        return;
+      }
+      parseResponse();
+    });
+    socket.on('end', () => {
+      if (settled) return;
+      parseResponse();
+      if (!settled)
+        invalidResponse('Daemon response must contain exactly one LF-terminated frame.');
+    });
+    socket.on('connect', () => {
+      deliveryStarted = true;
+      const frame = `${JSON.stringify({ version: 1, id, command, params })}\n`;
+      // Ordinary commands half-close after their sole frame, allowing the
+      // daemon to reject trailing frames before dispatch. Confirmed reset is
+      // the sole bidirectional exchange: it retains the write half for its
+      // correlated delivery receipt.
+      if (needsReceipt) socket.write(frame);
+      else socket.end(frame);
+    });
   });
 }
 

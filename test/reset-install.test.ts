@@ -148,6 +148,7 @@ describe('journaled fresh reset installation', () => {
     }
   });
 
+  // Rebuilds, fsyncs, and inspects a complete fixture at every install boundary.
   it('never leaves mixed active state after failure injection at every install boundary', async () => {
     const baseline = await fixture();
     const normalize = (step: string, root: string) =>
@@ -198,7 +199,7 @@ describe('journaled fresh reset installation', () => {
         );
       }
     }
-  });
+  }, 45_000);
 
   it('rolls back when installed-state validation fails', async () => {
     const { paths, configPath, backup, staged } = await fixture();
@@ -368,6 +369,7 @@ describe('journaled fresh reset installation', () => {
     expect(existsSync(paths.journal)).toBe(false);
   });
 
+  // Rebuilds and recovers a complete fixture at every discovered durability boundary.
   it('restores a validated bundle after failure at every recovery boundary', async () => {
     const baseline = await interruptedFixture();
     const normalize = (step: string, root: string) =>
@@ -404,7 +406,7 @@ describe('journaled fresh reset installation', () => {
       expect(existsSync(`${current.paths.db}-wal`)).toBe(false);
       expect(existsSync(`${current.paths.db}-shm`)).toBe(false);
     }
-  });
+  }, 45_000);
 
   it('rejects an unsafe journal without changing active state', async () => {
     const { paths, configPath, backup } = await fixture();

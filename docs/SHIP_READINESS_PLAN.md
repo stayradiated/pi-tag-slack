@@ -2,266 +2,132 @@
 
 ## Status
 
-**Not ready to ship.** Automated checks pass on the current machine, and most Linux/public/private Slack smoke tests have been exercised, but several live-validation failures violate the single-conversation contract. Two destructive/boundary checks also remain outstanding.
+**Not ready to ship.** The current tree closes several automated gaps, but live/manual validation, supported-version CI, and release mechanics remain incomplete. Most importantly, pi cannot currently provide exactly-once notification across its accept-before-local-mark boundary; this is a ship blocker.
 
-This plan records the remaining work found during code review and live validation on 2026-07-28. Complete the sections in order. Do not publish merely because the original automated acceptance tests are green.
+## Scope and evidence
 
-## Supported release scope
+This is a Linux/systemd-user-manager alpha only. macOS/launchd is out of scope and must not be advertised as supported.
 
-This alpha supports Linux with a systemd user manager only. macOS/launchd is unvalidated and explicitly out of release scope. Package metadata, user documentation, release notes, and validation claims must continue to state Linux-only support until a future release restores macOS as a tested platform.
+Recorded local validation for this tree:
 
-## Current validated baseline
+- five `pnpm test` runs on Node 26 and one parallel CPU/I/O load run passed;
+- the Node-26 evidence is useful flake coverage, **not** supported-version CI;
+- Node 22 and Node 24 CI have not run.
 
-The following passed from the current tree:
+The normal release commands and all live Slack/systemd checks below must be rerun after the pending work; none is implied by the local evidence above.
 
-- `pnpm install --frozen-lockfile`
-- `pnpm audit --prod`
-- `pnpm format:check`
-- `pnpm lint`
-- `pnpm test` (213 passed, 1 skipped in the manager run)
-- `pnpm build`
-- CLI help smoke test
-- `pnpm pack --dry-run`
-- Linux systemd install/start/status/log/stop/uninstall
-- Public and private Slack conversation metadata and bot-membership validation
-- Public and private Socket Mode admission
-- Mentioned text, attachment-only, actual edit, deletion, and mentioned thread-reply ingestion
-- Unmentioned top-level message rejection
-- Live history/message/thread reads and pagination
-- Live file download, text send, and thread send
-- Idle prompt, active follow-up, pi crash/restart, and no automatic Slack post
-- Active reset, stale challenge, archive creation, and aggregate recovery prompt
-- Journaled ordinary setup/reset, backup creation, and online/offline doctor
+## P0 automated work
 
-The gateway was restored to the original public conversation after private-channel testing and was left healthy. Reset backups preserve the prior public and private test states.
+### 1. Synthetic thread-parent updates
 
-## P0: fix failures found by live validation
+Implemented and covered in `test/slack-ingestion.test.ts`.
 
-### 1. Ignore synthetic parent updates caused by thread activity
+- [x] Unmentioned replies and their added/deleted synthetic parent updates leave no inbox mutation, revision, reaction, or pi notification.
+- [x] Mentioned replies create one accepted item/notification; adjacent synthetic parent updates do not add another.
+- [x] Real parent text edits and attachment additions/removals remain substantive and notify once per accepted revision.
 
-**Observed failure:** An unmentioned thread reply was added and deleted before a later mentioned reply. Slack emitted a synthetic parent `message_changed` event. The gateway advanced the accepted parent inbox revision despite unchanged source content and notified pi. This lets unmentioned thread activity indirectly wake pi and produced extra run sequences.
+Synthetic no-ops are deliberately **not ledgered**. On retry, the gateway compares the owned content/attachment snapshot again; the unchanged delivery remains inert and cannot later mutate or notify.
 
-Required change:
+### 2. V2 file-upload results
 
-- Distinguish substantive source edits from Slack parent metadata updates caused by reply count/latest-reply changes.
-- Compare the persisted source snapshot fields that the gateway owns: content and attachment metadata.
-- If an open accepted message has no substantive snapshot change, acknowledge the delivery without inbox mutation, reaction work, or pi notification.
-- Decide and document whether the no-op event is ledgered. Preserve the invariant that retries cannot later mutate or notify.
-- Do not weaken handling of real edits, deletions, or mentioned thread replies.
+Implemented and covered in `test/slack-upload-response.test.ts` and gateway upload tests.
 
-Acceptance tests:
+- [x] The captured nested Web API v8 multi-file completion shape returns its message timestamp.
+- [x] Flat single-file and multi-file responses, including thread shares, return the correct timestamp.
+- [x] Ambiguous/malformed successful completions use a bounded exact-file-ID lookup or return `OUTCOME_UNKNOWN`, rather than inviting a blind duplicate; explicit Slack rejection remains distinct.
+- [ ] Live text, thread, single-file, and multi-file sends return success and appear exactly once.
 
-- [ ] An unmentioned thread reply plus Slack's synthetic parent update creates no inbox item, parent revision, or pi notification.
-- [ ] Deleting that unmentioned reply also causes no parent mutation or notification.
-- [ ] A mentioned thread reply creates exactly one inbox item and one notification.
-- [ ] A synthetic parent update adjacent to a mentioned reply does not produce a second notification.
-- [ ] A real parent text edit without a fresh mention still advances exactly one revision and notifies once.
-- [ ] Attachment additions/removals on a real accepted source are treated as substantive edits.
+### 3. Active-reset delivery boundary
 
-### 2. Make live V2 multi-file upload return success correctly
+The control protocol now uses a narrow correlated receipt after the confirmation response; reset starts only after that receipt. Coverage is in `test/control-reset-receipt.test.ts` and `test/session-controls.test.ts`.
 
-**Observed failure:** `slack send --file ... --file ...` uploaded both files and posted the message, but the control response was `SLACK_ERROR`. `uploadTimestamp()` did not understand the real `files.uploadV2()` response shape.
+- [x] Close before the receipt cancels the reservation, performs no reset, and releases the coordinator lane.
+- [x] A confirmed reset is dispatched once, and reset starts only after the response is consumed and receipted.
+- [x] Stale confirmations are rejected by session-control tests.
+- [ ] Exercise the frozen-server/pre-flush-disconnect and pi-status-pending cases against the real daemon.
+- [ ] Re-run live archive-once and aggregate-recovery-summary behavior.
 
-Required change:
+### 4. Service-safe pi executable
 
-- Capture and model the real Bolt/Web API v8 V2 multi-file result shape without logging tokens, private URLs, or file content.
-- Extract the posted message timestamp from every supported successful response shape.
-- Runtime-validate the result rather than treating an undocumented field as guaranteed.
-- If Slack confirms upload completion but does not return a message timestamp, return a truthful success result that the public contract can support, or perform a bounded identity lookup that cannot select an unrelated message.
-- Never tell the caller the upload failed after Slack has confirmed success.
-- Preserve `OUTCOME_UNKNOWN` for transport ambiguity and `PARTIAL_SUCCESS` where Slack success is followed by a local persistence failure.
+`test/setup-validation.test.ts` and `test/setup-interactive.test.ts` cover canonical PATH resolution, rejection of relative/unsafe inputs, persistence/reopen validation, and interactive display.
 
-Acceptance tests:
+- [x] Setup resolves the default command to a canonical absolute executable and persists/reopens that value.
+- [x] Missing, non-file, non-executable, relative-path, and unsafe executable inputs fail before staging.
+- [ ] Verify a PATH-only pnpm installation starts under a minimal real systemd environment without caller PATH injection.
 
-- [ ] A fixture matching the captured live V2 multi-file response returns success and the correct timestamp.
-- [ ] Single-file and multi-file uploads both return success.
-- [ ] A thread upload returns the thread message timestamp.
-- [ ] Malformed successful responses fail safely without encouraging a blind duplicate upload.
-- [ ] Live text, thread, single-file, and multi-file sends all return success and appear exactly once.
+## P0 unresolved ship blocker
 
-### 3. Make active reset genuinely cancel on pre-flush disconnect
+### 5. Socket Mode acknowledgement/effect recovery is not exactly once
 
-**Observed failure:** The service was frozen, a complete active-reset confirmation was queued, the client disconnected, and only then was the service thawed. The daemon still reset the session. A local socket write callback only proves transfer to the kernel, not that the peer remained connected to receive the response.
+The tree durably reconciles post-admission effects across acknowledgement rejection and restart; `test/slack-ingestion.test.ts` covers duplicate-safe acknowledgement failure and pending-effect recovery. That is not sufficient to close this item.
 
-Required change:
+**Blocker:** pi can accept a notification before the gateway records its local acceptance metadata. A crash in that interval leaves no durable local proof of pi acceptance; recovery/retry can notify pi again. Conversely, suppressing retry can lose the accepted work. The gateway cannot establish exactly-once behavior at this boundary by itself.
 
-- Keep the control client write side open while awaiting the response instead of calling `socket.end()` immediately after the request frame.
-- Let the server observe an actual peer close while a reset reservation is pending.
-- Cancel the reservation on close/error before the confirmation response has been successfully delivered according to the revised protocol boundary.
-- Preserve one request and one response frame; do not add an unrestricted second command frame.
-- If kernel-level flush still cannot establish the required guarantee, introduce a narrow correlated receipt handshake or revise the product contract explicitly before release. Do not claim a guarantee the Unix stream protocol cannot provide.
-- Ensure all cancellation paths release the coordinator lane exactly once.
+- [ ] Item 5 remains open. Do not claim convergence without loss or duplication across the pi accept-before-local-mark boundary.
+- [ ] Obtain upstream pi idempotency/correlation support, or revise the product contract to an explicitly at-least-once/at-most-once guarantee, then add boundary crash tests.
 
-Acceptance tests:
+### 6. Mutation disconnect outcomes
 
-- [ ] Freeze server, send confirmation, disconnect client, thaw server: no reset occurs.
-- [ ] Disconnect while pi status validation is pending: no reset occurs.
-- [ ] Successful CLI confirmation prints the response before child termination starts.
-- [ ] Wrong, stale, settled, and replaced-run challenges do nothing.
-- [ ] Cancellation cannot deadlock later Slack, scheduler, task, or control work.
-- [ ] Successful confirmation still archives once and emits one aggregate recovery summary.
+Covered in `test/control-cli-contract.test.ts`.
 
-### 4. Persist a service-safe pi executable
+- [x] Pre-connect refusal remains `DAEMON_UNAVAILABLE`.
+- [x] EOF/unusable response after a mutation may have been delivered returns correlated `OUTCOME_UNKNOWN`; read-only commands retain protocol classification.
+- [ ] Prove and document the intended classification for disconnect before request write completion.
 
-**Observed failure:** Setup persisted `pi_binary = "pi"`. It worked in the interactive shell but systemd repeatedly failed with `spawn pi ENOENT` because the user manager did not inherit the pnpm bin directory.
+### 7. Archive errors
 
-Required change:
+- [x] `test/archive-control-cli.test.ts` proves sanitized public route mappings for archive filesystem errors; paths and underlying details are not exposed.
 
-- During setup, resolve the selected/default pi executable through the setup process PATH.
-- Persist a canonical absolute executable path after validating ownership/type/executability as appropriate for the daemon-account boundary.
-- Reopen the staged and installed database and verify that exact resolved path.
-- Interactive setup should display the resolved executable before installation.
-- Decide how an intentionally relative `--pi-bin` is handled; rejecting it with guidance is preferable to storing a service-dependent value.
-- Keep the persisted executable independent of the invoking shell's PATH so the systemd service can start reliably.
+### 8. Persistence coupling
 
-Acceptance tests:
+- [x] `test/persistence-control-validation.test.ts` proves schema and application validation require `rpc_accepted_at`, `pi_session_id`, and `run_sequence` to be all null or all present, and rejects invalid decimal Slack timestamps.
 
-- [ ] Setup with no `--pi-bin` resolves and persists the executable's absolute path.
-- [ ] Setup with a PATH-only pnpm installation starts successfully under a minimal systemd PATH.
-- [ ] Missing, non-file, non-executable, and unsafe paths fail before staging state.
-- [ ] The generated systemd unit starts without adding the caller's whole PATH.
+## P1 automated work
 
-## P0: close previously identified contract gaps
+### 9. Reset-test stability
 
-### 5. Recover safely when post-commit Socket Mode acknowledgement fails
+- [x] Five Node-26 suite runs passed.
+- [x] One parallel CPU/I/O load run passed.
+- [ ] Node 22 CI passes.
+- [ ] Node 24 CI passes.
 
-`src/slack.ts` commits admission, awaits acknowledgement, and only then starts reaction/pi effects. If acknowledgement rejects, durable work exists but effects do not run. Slack's retry is a duplicate and intentionally cannot repeat effects, so the item may remain unwoken until restart.
+### 10. CLI usage errors
 
-Required change:
+- [x] `test/control-cli-contract.test.ts` proves unsupported commands return a concise stable unknown-command error rather than `INTERNAL` plus full help.
 
-- Define the durable post-admission side-effect state explicitly.
-- Ensure an acknowledgement transport failure cannot permanently suppress receipt reconciliation or pi notification.
-- Preserve the rule that duplicate deliveries never cause a second notification/reaction.
-- Add a test with commit success followed by acknowledgement rejection and retry.
+### 11. Release workflow gates
 
-Acceptance tests:
-
-- [ ] Commit success plus ack rejection eventually produces exactly one reaction attempt and one pi notification.
-- [ ] Retry remains duplicate-safe.
-- [ ] Crash at each commit/ack/effect boundary converges after restart without replaying accepted work twice.
-
-### 6. Return `OUTCOME_UNKNOWN` for mutation disconnects
-
-`src/cli/index.ts` maps mutation timeout correctly, but socket error/EOF after request delivery can become `DAEMON_UNAVAILABLE` or `INVALID_RESPONSE`.
-
-Required change:
-
-- Track whether the mutation request may have reached the daemon.
-- For `slack.send` and `inbox.respond`, map timeout, post-write disconnect, EOF, and unusable response after delivery to `OUTCOME_UNKNOWN`.
-- Include the generated request ID and inspect-before-retry guidance.
-- Keep pre-connect failures as `DAEMON_UNAVAILABLE`.
-
-Acceptance tests:
-
-- [ ] Refused connection returns `DAEMON_UNAVAILABLE`.
-- [ ] Disconnect before request write completes has deterministic safe classification.
-- [ ] Disconnect/EOF after mutation write returns `OUTCOME_UNKNOWN` with request ID.
-- [ ] Non-mutation commands retain their existing deadline/protocol classifications.
-
-### 7. Preserve stable archive filesystem error codes
-
-`session-archive.ts` emits `ARCHIVE_UNAVAILABLE`, `ARCHIVE_CREATE_FAILED`, and `ARCHIVE_CLEANUP_FAILED`, but the control error allowlist does not expose all of them, causing expected failures to become `INTERNAL`.
-
-Required change:
-
-- Add safe public mappings for expected archive errors.
-- Keep local paths and underlying filesystem details out of responses.
-- Add route-level tests, not only direct archive-function tests.
-
-### 8. Finish persistence coupling constraints
-
-Required change:
-
-- Require `rpc_accepted_at`, `pi_session_id`, and `run_sequence` to be either all null or all present for accepted Slack events/tasks.
-- Align runtime row validators with the database constraint.
-- Validate Slack timestamp fields as decimal Slack timestamps where practical.
-- Add negative schema and application-read tests.
-
-## P1: stabilize and strengthen the release gate
-
-### 9. Remove reset-test timeout flakiness
-
-The manager's full run passed, but concurrent independent runs exceeded Vitest's default five-second per-test timeout in exhaustive reset failure-injection tests.
-
-Required change:
-
-- Give explicitly exhaustive filesystem tests a justified per-test timeout, or reduce redundant setup cost.
-- Keep assertions exhaustive; do not fix this by dropping failure boundaries.
-- Run the suite repeatedly under CI-like load.
-
-Acceptance gate:
-
-- [ ] Five consecutive `pnpm test` runs pass.
-- [ ] A parallel CPU/I/O load run passes.
-- [ ] Node 22 and Node 24 CI jobs pass.
-
-### 10. Tighten CLI usage errors
-
-- Map unsupported CLI commands to a concise stable usage/unknown-command error rather than `INTERNAL` plus the complete help text.
-- Preserve exact JSON failure shape and stderr-only human failures.
-
-### 11. Put every automated ship gate in the publishing path
-
-The tag release workflow currently runs build/test but omits format, lint, production audit, CLI smoke, and package verification.
-
-Required change:
-
-- Make publish depend on an equivalent successful CI commit, or repeat all required gates in the tag workflow.
-- Ensure tag builds cannot bypass the plan's automated release gate.
+- [x] `.github/workflows/release.yml` now runs production audit, format check, lint, test, build, CLI help smoke, and package dry-run before publishing.
+- [ ] Verify the amended workflow in CI; publishing/tag mechanics remain unperformed.
 
 ## Remaining manual validation
 
-Repeat affected live tests after fixes; prior passes do not validate changed code.
+All are release gates and remain unchecked:
 
-Linux and Slack:
-
-- [ ] Re-run public mentioned text, attachment-only, real edit, deletion, unmentioned thread activity, and mentioned thread reply.
-- [ ] Prove one user action causes one intended inbox mutation/notification.
-- [ ] Re-run live single/multi-file upload and confirm successful control responses.
-- [ ] Re-run active reset success, forced disconnect, stale challenge, and recovery summary.
-- [ ] Re-run systemd lifecycle from a fresh setup using default pi executable discovery.
-- [ ] Exercise a live `RESPONSE_TOO_LARGE` result. Use a disposable channel/workspace fixture rather than flooding the normal channel.
-- [ ] Exercise interrupted-reset recovery through plain `setup` in an isolated data/config directory, then verify bundle hashes, journal cleanup, and restored WAL-resident state.
-
-macOS/launchd is not a release gate for this Linux-only alpha. Do not advertise or declare macOS package support until its lifecycle and Slack matrix are added back to a future plan and validated.
+- [ ] Re-run public mentioned text, attachment-only, real edit, deletion, unmentioned thread activity, and mentioned thread reply; prove one action causes one intended mutation/notification.
+- [ ] Re-run live text/thread/single-file/multi-file sends and confirm one successful control result and one Slack message each.
+- [ ] Re-run active-reset success, forced disconnect, stale challenge, archive, and recovery summary.
+- [ ] Fresh setup with default pi discovery, then full Linux systemd install/start/status/log/stop/uninstall under a minimal service PATH.
+- [ ] Exercise live `RESPONSE_TOO_LARGE` with a disposable fixture.
+- [ ] Exercise interrupted-reset recovery through plain `setup` in isolated paths; verify bundle hashes, journal cleanup, and WAL-resident restoration.
 
 ## Release mechanics
 
-Only after all P0/P1 and manual gates pass:
+All remain unchecked: attach/push the release branch, merge/rebase current `main`, bump version and lockfile, finalize changelog, reapply/verify the Slack manifest, run and inspect the full release gate/tarball, create/verify the tag, publish the prerelease, and validate the published artifact on a clean Linux systemd account.
 
-1. [ ] Attach the detached HEAD commits to `docs/single-channel-refactor-plan` (or a replacement release branch) and push them. The named branch currently trails the reviewed HEAD.
-2. [ ] Rebase/merge the latest `main` and rerun the complete gate.
-3. [ ] Bump `package.json` and `pnpm-lock.yaml` from already-published `0.1.3` to the intended breaking alpha version.
-4. [ ] Replace the changelog's `Unreleased` heading with the version and release date; include the hard cut, reset requirement, manifest reinstall, and alpha limitations.
-5. [ ] Reapply and verify `manifest.yaml` in the release Slack app.
-6. [ ] Run:
+Required gate:
 
-   ```text
-   pnpm install --frozen-lockfile
-   pnpm audit --prod
-   pnpm format:check
-   pnpm lint
-   pnpm test
-   pnpm build
-   node dist/cli/index.js help
-   pnpm pack --dry-run
-   ```
+```text
+pnpm install --frozen-lockfile
+pnpm audit --prod
+pnpm format:check
+pnpm lint
+pnpm test
+pnpm build
+node dist/cli/index.js help
+pnpm pack --dry-run
+```
 
-7. [ ] Inspect the tarball contents and executable mode.
-8. [ ] Confirm the release tag exactly matches `package.json`.
-9. [ ] Publish the alpha/prerelease tag first if operational confidence is still limited.
-10. [ ] Verify the npm install, CLI help, setup, and daemon lifecycle from the published artifact on a clean Linux account with a systemd user manager.
+## Shippable only when
 
-## Definition of shippable
-
-This branch is shippable only when:
-
-- no unmentioned Slack action can indirectly mutate accepted work or wake pi;
-- every successful Slack mutation returns success, while ambiguous mutations return `OUTCOME_UNKNOWN` with correlation guidance;
-- an active reset cannot occur after a confirmed pre-flush client disconnect;
-- default setup starts under a real systemd environment without PATH repair;
-- Socket Mode commit/ack/effect failures converge without loss or duplication;
-- persistence and public error contracts match the documented invariants;
-- automated tests are repeatably green under supported Node versions;
-- all affected Linux/systemd and Slack checks pass;
-- release versioning, branch refs, changelog, manifest, and publish workflows are ready.
+The pi exactly-once blocker is resolved by upstream idempotency/correlation or an approved product-contract revision; supported Node 22/24 CI, all manual Linux/Slack checks, and every release mechanic above are complete.

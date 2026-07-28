@@ -232,7 +232,7 @@ describe('schedules', () => {
       {
         notify: async (prompt) => {
           notified.push(prompt);
-          return { acceptedAt: '2030-01-01T00:00:01.000Z' };
+          return { acceptedAt: '2030-01-01T00:00:01.000Z', sessionId: 'session', runSequence: 1 };
         },
       },
       new GatewayCoordinator(),
@@ -253,7 +253,7 @@ describe('schedules', () => {
       {
         notify: async (prompt) => {
           notified.push(prompt);
-          return { acceptedAt: '2030-01-01T00:04:00.000Z' };
+          return { acceptedAt: '2030-01-01T00:04:00.000Z', sessionId: 'session', runSequence: 1 };
         },
       },
       new GatewayCoordinator(),
@@ -508,7 +508,11 @@ describe('control configuration', () => {
         {
           notifier: {
             async notify() {
-              return { acceptedAt: '', runSequence: 0 };
+              return {
+                acceptedAt: '2030-01-01T00:00:00.000Z',
+                sessionId: 'session',
+                runSequence: 0,
+              };
             },
           },
           coordinator: new GatewayCoordinator(),
@@ -523,7 +527,11 @@ describe('control configuration', () => {
     const services = {
       notifier: {
         async notify() {
-          return { acceptedAt: '', runSequence: 0 };
+          return {
+            acceptedAt: '2030-01-01T00:00:00.000Z',
+            sessionId: 'session',
+            runSequence: 0,
+          };
         },
       },
       coordinator: new GatewayCoordinator(),
@@ -749,7 +757,7 @@ describe('task pi delivery and recovery', () => {
       senderId: 'U0123456789',
       senderLabel: 'User',
       content: 'Hello',
-      messageTs: '1',
+      messageTs: '1.0',
     });
     const summary = startupRecoveryPrompt();
     expect(summary).toContain('Open inbox items: 1');
@@ -818,7 +826,7 @@ describe('Socket Mode admission', () => {
     const notifier = {
       async notify() {
         notifications += 1;
-        return { acceptedAt: new Date().toISOString(), runSequence: 1 };
+        return { acceptedAt: new Date().toISOString(), sessionId: 'session', runSequence: 1 };
       },
     };
     await expect(
@@ -1346,7 +1354,13 @@ describe('Slack-validated trust management', () => {
 
   it('paginates deterministically, permits an empty final list, and only applies removal to future events', async () => {
     configuredDb();
-    const notifier = { notify: async () => ({ acceptedAt: '2030-01-01T00:00:00.000Z' }) };
+    const notifier = {
+      notify: async () => ({
+        acceptedAt: '2030-01-01T00:00:00.000Z',
+        sessionId: 'session',
+        runSequence: 1,
+      }),
+    };
     const accepted = {
       event_id: 'Ev_before_removal',
       event: {
@@ -1406,7 +1420,7 @@ describe('Slack-validated trust management', () => {
     ).resolves.toBe('ignored');
     expect(
       dispatch({ version: 1, id: 'inbox', command: 'inbox.list', params: { state: 'all' } }),
-    ).toMatchObject({ items: [{ content: 'keep this' }] });
+    ).toMatchObject({ items: [{ content: '<@B1> keep this' }] });
     dispatch({
       version: 1,
       id: 'remove-second',

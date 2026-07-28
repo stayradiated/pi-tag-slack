@@ -1,10 +1,10 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import { setup } from '../src/cli/index.js';
 import { closeDb, initDb, readGatewayConfig, requireConfiguredDb } from '../src/db.js';
-import type { SetupValidationDependencies } from '../src/setup-validation.js';
+import { resolvePiExecutable, type SetupValidationDependencies } from '../src/setup-validation.js';
 
 const directories: string[] = [];
 afterEach(() => {
@@ -79,6 +79,20 @@ function noApplicationState(): void {
   expect(existsSync(join(directory, 'gateway.db-wal'))).toBe(false);
   expect(existsSync(join(directory, 'gateway.db-shm'))).toBe(false);
 }
+
+describe('pi executable resolution', () => {
+  it('canonicalizes a PATH command and rejects relative paths and unsafe files', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-pi-bin-'));
+    directories.push(directory);
+    const executable = join(directory, 'pi');
+    writeFileSync(executable, '#!/bin/sh\n', { mode: 0o700 });
+    chmodSync(executable, 0o700);
+    expect(resolvePiExecutable('pi', directory)).toBe(executable);
+    expect(() => resolvePiExecutable('./pi', directory)).toThrow(/must be absolute/);
+    chmodSync(executable, 0o600);
+    expect(() => resolvePiExecutable(executable)).toThrow(/safe executable/);
+  });
+});
 
 describe.sequential('first-time setup validation', () => {
   it('rejects setup --yes when no interrupted reset journal exists', async () => {
@@ -191,5 +205,26 @@ describe.sequential('first-time setup validation', () => {
         .prepare('select label from trusted_users where user_id=?')
         .get('U0123456789'),
     ).toEqual({ label: 'Ada Lovelace' });
+  });
+
+  it('stages and reopens the canonical executable validated for the service', async () => {
+    const binDirectory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-canonical-pi-'));
+    directories.push(binDirectory);
+    const executable = join(binDirectory, 'pi');
+    writeFileSync(executable, '#!/bin/sh\n', { mode: 0o700 });
+    let validatedBinary = '';
+    await expect(
+      run(
+        {
+          validatePi: async ({ piBinary }) => {
+            validatedBinary = piBinary;
+          },
+        },
+        ['--pi-bin', executable],
+      ),
+    ).resolves.toBe(0);
+    initDb(join(directories.at(-1)!, 'gateway.db'));
+    expect(validatedBinary).toBe(executable);
+    expect(readGatewayConfig().pi_binary).toBe(executable);
   });
 });

@@ -129,6 +129,7 @@ describe('reset backup bundle', () => {
     expect(bundle.manifest.components.session).toEqual({ status: 'missing' });
   });
 
+  // Rebuilds and fsyncs a complete backup once per discovered durability boundary.
   it('cleans or leaves a complete validated bundle after every injected boundary failure', async () => {
     const baseline = fixture();
     const normalize = (step: string, root: string) =>
@@ -169,7 +170,7 @@ describe('reset backup bundle', () => {
         });
       }
     }
-  });
+  }, 45_000);
 
   it('chooses collision-free names and preserves prior bundles on failure', async () => {
     const { paths, configPath } = fixture();

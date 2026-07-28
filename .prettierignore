@@ -1,4 +1,5 @@
 dist/
 node_modules/
+.pi/
 *.db
 pnpm-lock.yaml

@@ -323,24 +323,141 @@ function revalidateUploadFiles(files: UploadFile[]): void {
   }
 }
 
-function uploadTimestamp(result: Record<string, unknown>, channel: string): string | undefined {
-  if (typeof result.ts === 'string') return result.ts;
-  const files = Array.isArray(result.files) ? result.files : [];
-  for (const file of files) {
-    if (!file || typeof file !== 'object') continue;
-    const value = file as Record<string, unknown>;
-    if (typeof value.timestamp === 'string') return value.timestamp;
-    const shares = value.shares;
-    if (!shares || typeof shares !== 'object') continue;
-    for (const visibility of Object.values(shares as Record<string, unknown>)) {
-      const entries =
-        visibility && typeof visibility === 'object'
-          ? (visibility as Record<string, unknown>)[channel]
-          : undefined;
-      if (Array.isArray(entries) && typeof entries[0]?.ts === 'string') return entries[0].ts;
+type UploadResult = { timestamp?: string; fileIds?: string[] };
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function slackTimestamp(value: unknown): string | undefined {
+  return typeof value === 'string' && /^\d+\.\d+$/.test(value) ? value : undefined;
+}
+
+function fileShareTimestamps(
+  file: Record<string, unknown>,
+  channel: string,
+  threadTs?: string,
+): string[] {
+  const timestamps: string[] = [];
+  const shares = record(file.shares);
+  if (!shares) return timestamps;
+  for (const visibility of Object.values(shares)) {
+    const entries = record(visibility)?.[channel];
+    if (!Array.isArray(entries)) continue;
+    for (const entryValue of entries) {
+      const entry = record(entryValue);
+      const ts = slackTimestamp(entry?.ts);
+      if (!entry || !ts) continue;
+      const entryThread = slackTimestamp(entry.thread_ts);
+      if (threadTs ? entryThread === threadTs : entryThread === undefined) timestamps.push(ts);
     }
   }
-  return undefined;
+  return timestamps;
+}
+
+/**
+ * Models both uploadV2's v8 wrapper (`files` is an array of
+ * files.completeUploadExternal responses) and the older flat file-array shape.
+ * A direct `ts` is retained for compatibility with Web API mocks/older wrappers.
+ */
+function parseUploadResult(
+  value: unknown,
+  channel: string,
+  threadTs: string | undefined,
+  expectedFiles: number,
+): UploadResult | undefined {
+  const result = record(value);
+  if (!result || result.ok !== true) return undefined;
+  const directTimestamp = slackTimestamp(result.ts);
+  if (directTimestamp) return { timestamp: directTimestamp };
+  if (!Array.isArray(result.files) || result.files.length === 0) return {};
+
+  const outer = result.files.map(record);
+  if (outer.some((item) => !item)) return {};
+  const nested = outer.some((item) => Object.hasOwn(item!, 'files') || Object.hasOwn(item!, 'ok'));
+  let files: Record<string, unknown>[];
+  if (nested) {
+    if (
+      outer.some(
+        (completion) =>
+          completion!.ok !== true ||
+          !Array.isArray(completion!.files) ||
+          completion!.files.length === 0,
+      )
+    )
+      return {};
+    files = outer.flatMap((completion) =>
+      (completion!.files as unknown[]).map(record).filter((file) => file !== undefined),
+    );
+    if (
+      files.length !==
+      outer.reduce((total, completion) => total + (completion!.files as unknown[]).length, 0)
+    )
+      return {};
+  } else {
+    files = outer as Record<string, unknown>[];
+  }
+  if (files.length !== expectedFiles) return {};
+
+  const timestamps = new Set<string>();
+  const fileIds = new Set<string>();
+  for (const file of files) {
+    // Some older flat responses used a string timestamp on the file itself.
+    const legacyTimestamp = slackTimestamp(file.timestamp);
+    if (legacyTimestamp) timestamps.add(legacyTimestamp);
+    for (const ts of fileShareTimestamps(file, channel, threadTs)) timestamps.add(ts);
+    if (typeof file.id === 'string' && file.id) fileIds.add(file.id);
+  }
+  if (timestamps.size === 1) return { timestamp: [...timestamps][0] };
+  if (timestamps.size > 1) return {};
+  return fileIds.size === expectedFiles ? { fileIds: [...fileIds] } : {};
+}
+
+function messageHasExactlyFiles(message: Record<string, unknown>, fileIds: Set<string>): boolean {
+  if (!Array.isArray(message.files)) return false;
+  const ids = message.files.map((file) => record(file)?.id);
+  return (
+    ids.length === fileIds.size &&
+    new Set(ids).size === fileIds.size &&
+    ids.every((id): id is string => typeof id === 'string' && fileIds.has(id))
+  );
+}
+
+/** A bounded fallback can identify only the message containing the exact new file-ID set. */
+async function lookupUploadTimestamp(
+  runtime: { client: WebClient; channelId: string },
+  fileIds: string[],
+  threadTs?: string,
+): Promise<string | undefined> {
+  try {
+    const response = threadTs
+      ? await runtime.client.conversations.replies({
+          channel: runtime.channelId,
+          ts: threadTs,
+          limit: 100,
+        })
+      : await runtime.client.conversations.history({ channel: runtime.channelId, limit: 100 });
+    if (!response.ok || !Array.isArray(response.messages)) return undefined;
+    const expected = new Set(fileIds);
+    const matches = response.messages.filter((message) => {
+      const item = record(message);
+      return item && slackTimestamp(item.ts) && messageHasExactlyFiles(item, expected);
+    });
+    return matches.length === 1 ? slackTimestamp(matches[0]?.ts) : undefined;
+  } catch {
+    // Completion has already succeeded. A failed diagnostic lookup must not be
+    // presented as a definite upload failure or leak its transport details.
+    return undefined;
+  }
+}
+
+function uncertainUpload(): Error & { code: string } {
+  return uploadError(
+    'OUTCOME_UNKNOWN',
+    'Slack may have completed the upload; inspect the conversation before retrying.',
+  );
 }
 
 /** Sends text and, when supplied, one Slack V2 multi-file message. */
@@ -364,18 +481,27 @@ export async function sendSlackMessage(
     return { ts: result.ts };
   }
   revalidateUploadFiles(files);
-  const result = await slackCall(() =>
-    runtime.client.files.uploadV2({
+  let result: unknown;
+  try {
+    result = await runtime.client.files.uploadV2({
       channel_id: runtime.channelId,
       initial_comment: text,
       ...(threadTs ? { thread_ts: threadTs } : {}),
       file_uploads: files.map((file) => ({ file: file.path, filename: basename(file.path) })),
-    }),
-  );
-  const ts = result.ok
-    ? uploadTimestamp(result as unknown as Record<string, unknown>, runtime.channelId)
-    : undefined;
-  if (!ts) throw slackError(Object.assign(new Error('Slack file upload failed.'), result));
+    });
+  } catch (error) {
+    const details = error as { data?: { error?: unknown } };
+    // uploadV2 has already started its multi-step mutation. Only an explicit
+    // Slack API rejection is definite; transport/library failures are ambiguous.
+    if (typeof details.data?.error !== 'string') throw uncertainUpload();
+    throw slackError(error);
+  }
+  const parsed = parseUploadResult(result, runtime.channelId, threadTs, files.length);
+  if (!parsed) throw slackError(result);
+  const ts =
+    parsed.timestamp ??
+    (parsed.fileIds ? await lookupUploadTimestamp(runtime, parsed.fileIds, threadTs) : undefined);
+  if (!ts) throw uncertainUpload();
   return { ts };
 }
 

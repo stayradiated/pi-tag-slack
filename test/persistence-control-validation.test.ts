@@ -9,7 +9,11 @@ import {
   createGatewayConfig,
   createManualTask,
   ingestSlackEvent,
+  inboxSnapshot,
   initDb,
+  markSlackEventAccepted,
+  markTaskAccepted,
+  recordInboxReply,
   validateInboxRow,
   validateScheduleRow,
   validateSlackEventRow,
@@ -96,14 +100,87 @@ describe('persistent boundary validation', () => {
       "update inbox set source_deleted_at='2030-01-01T00:00:00.000Z' where id=1",
       "update inbox set updated_at='not-a-time' where id=1",
       "update tasks set pi_session_id='session', run_sequence=1 where id=1",
+      "update tasks set rpc_accepted_at='2030-01-01T00:00:00.000Z' where id=1",
       "update tasks set state='resolved', resolution_reason='done' where id=1",
       'update schedules set enabled=0 where id=1',
       "update slack_events set rpc_accepted_at='bad' where source_identity='slack:event:Ev_constraints'",
-      "update slack_events set outcome='already-represented', rpc_accepted_at='2030-01-01T00:00:00.000Z' where source_identity='slack:event:Ev_constraints'",
+      "update slack_events set rpc_accepted_at='2030-01-01T00:00:00.000Z' where source_identity='slack:event:Ev_constraints'",
+      "update slack_events set outcome='already-represented', rpc_accepted_at='2030-01-01T00:00:00.000Z', pi_session_id='session', run_sequence=1 where source_identity='slack:event:Ev_constraints'",
+      "update inbox set message_ts='1' where id=1",
+      "update inbox set thread_ts='1.bad' where id=1",
+      "update inbox set latest_reply_ts='1..2', latest_reply_at='2030-01-01T00:00:00.000Z' where id=1",
       "update trusted_users set label='' where user_id='U0123456789'",
     ];
     for (const statement of statements)
       expect(() => db.prepare(statement).run(), statement).toThrow(/constraint/i);
+  });
+
+  it('rejects malformed acceptance metadata and Slack timestamps before writes', () => {
+    configured();
+    ingestSlackEvent({
+      eventId: 'Ev_api_constraints',
+      kind: 'new-message',
+      messageId: 'C0123456789:5.0',
+      senderId: 'U0123456789',
+      senderLabel: 'Ada',
+      content: 'hello',
+      messageTs: '5.0',
+    });
+    createManualTask('task', 'instructions');
+
+    expect(() =>
+      markSlackEventAccepted('Ev_api_constraints', {
+        acceptedAt: '2030-01-01T00:00:00.000Z',
+        sessionId: '',
+        runSequence: 1,
+      }),
+    ).toThrow(/acceptance metadata/);
+    expect(() =>
+      markTaskAccepted(1, {
+        acceptedAt: 'not-a-time',
+        sessionId: 'session',
+        runSequence: 1,
+      }),
+    ).toThrow(/acceptance metadata/);
+    expect(() => recordInboxReply(1, 'not-a-slack-timestamp')).toThrow(/decimal timestamp/);
+    expect(() =>
+      ingestSlackEvent({
+        eventId: 'Ev_bad_timestamp',
+        kind: 'new-message',
+        messageId: 'C0123456789:bad',
+        senderId: 'U0123456789',
+        senderLabel: 'Ada',
+        content: 'hello',
+        messageTs: 'bad',
+      }),
+    ).toThrow(/decimal timestamp/);
+  });
+
+  it('accepts exactly the practical Slack timestamp shape enforced by SQLite', () => {
+    const { db } = configured();
+    ingestSlackEvent({
+      eventId: 'Ev_timestamp_boundaries',
+      kind: 'new-message',
+      messageId: 'C0123456789:timestamp',
+      senderId: 'U0123456789',
+      senderLabel: 'Ada',
+      content: 'hello',
+      messageTs: '1.0',
+    });
+    const inbox = () =>
+      db.prepare('select * from inbox where id=1').get() as Record<string, unknown>;
+    for (const timestamp of ['1.0', '12.345', '000.0']) {
+      expect(() =>
+        db.prepare('update inbox set message_ts=? where id=1').run(timestamp),
+      ).not.toThrow();
+      expect(() => validateInboxRow({ ...inbox(), message_ts: timestamp })).not.toThrow();
+    }
+    for (const timestamp of ['', '1', '.0', '1.', '1..0', '1.a', ' 1.0', '1.0 ']) {
+      expect(() => db.prepare('update inbox set message_ts=? where id=1').run(timestamp)).toThrow(
+        /constraint/i,
+      );
+      expect(() => validateInboxRow({ ...inbox(), message_ts: timestamp })).toThrow(/inbox/);
+    }
   });
 
   it('runtime-validates every persisted work and trust row shape', () => {
@@ -122,10 +199,23 @@ describe('persistent boundary validation', () => {
     const row = (table: string) =>
       db.prepare(`select * from ${table} limit 1`).get() as Record<string, unknown>;
     expect(() => validateInboxRow({ ...row('inbox'), attachments: '{}' })).toThrow(/inbox/);
+    expect(() => validateInboxRow({ ...row('inbox'), message_ts: '4' })).toThrow(/inbox/);
     expect(() => validateSlackEventRow({ ...row('slack_events'), outcome: 'unknown' })).toThrow(
       /Slack-event/,
     );
+    expect(() =>
+      validateSlackEventRow({
+        ...row('slack_events'),
+        rpc_accepted_at: '2030-01-01T00:00:00.000Z',
+      }),
+    ).toThrow(/Slack-event/);
     expect(() => validateTaskRow({ ...row('tasks'), title: '' })).toThrow(/task/);
+    expect(() =>
+      validateTaskRow({
+        ...row('tasks'),
+        rpc_accepted_at: '2030-01-01T00:00:00.000Z',
+      }),
+    ).toThrow(/task/);
     expect(() => validateScheduleRow({ ...row('schedules'), next_run_at: null })).toThrow(
       /schedule/,
     );
@@ -146,8 +236,9 @@ describe('persistent boundary validation', () => {
       messageTs: '2.0',
     });
     db.pragma('ignore_check_constraints = ON');
-    db.prepare("update inbox set attachments='{}' where id=1").run();
+    db.prepare("update inbox set message_ts='not-a-slack-timestamp' where id=1").run();
     db.pragma('ignore_check_constraints = OFF');
+    expect(() => inboxSnapshot(1)).toThrow('Malformed persisted inbox data.');
     expect(() =>
       dispatch({ version: 1, id: 'show', command: 'inbox.show', params: { id: 'inbox-1' } }),
     ).toThrow('Malformed persisted inbox data.');
