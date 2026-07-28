@@ -179,7 +179,14 @@ export class PiRpcSession {
       const desired = this.options.desired?.() ?? { model: null, thinking: null };
       if (desired.model && !models.some((model) => model.ref === desired.model))
         throw new Error(`Configured model is unavailable from pi: ${desired.model}`);
-      if (desired.thinking && !levels.includes(desired.thinking))
+      // The catalog is model-specific. Only validate it here when the resumed
+      // model is already the desired model; applyDesired validates again after
+      // selecting a different target model.
+      if (
+        desired.thinking &&
+        (!desired.model || desired.model === this.effectiveModel) &&
+        !levels.includes(desired.thinking)
+      )
         throw new Error(`Configured thinking level is unavailable from pi: ${desired.thinking}`);
       // A fully validated handshake is the only point a restart is healthy.
       this.consecutiveFailures = 0;
@@ -266,8 +273,14 @@ export class PiRpcSession {
         )
           throw new Error('pi rejected set_model.');
       }
-      // Model selection can change which thinking levels pi supports.
+      // Model selection can change both the effective thinking value and its
+      // catalog. Read both from the resulting model before applying thinking.
       this.applyState(await this.getState());
+      const levels = await this.availableThinkingLevels();
+      if (desired.thinking && !levels.includes(desired.thinking))
+        throw new Error(
+          `Configured thinking level is unavailable for the resulting model: ${desired.thinking}`,
+        );
       if (desired.thinking && desired.thinking !== this.effectiveThinking) {
         const response = await this.command('set_thinking_level', { level: desired.thinking });
         if (
@@ -278,6 +291,14 @@ export class PiRpcSession {
           throw new Error('pi rejected set_thinking_level.');
       }
       this.applyState(await this.getState());
+      if (desired.model !== null && desired.model !== this.effectiveModel)
+        throw new Error(
+          `pi effective model does not match desired model: expected ${desired.model}, received ${this.effectiveModel ?? 'none'}.`,
+        );
+      if (desired.thinking !== null && desired.thinking !== this.effectiveThinking)
+        throw new Error(
+          `pi effective thinking does not match desired thinking: expected ${desired.thinking}, received ${this.effectiveThinking ?? 'none'}.`,
+        );
       return { application: 'applied' };
     } catch (error) {
       this.recordFailure(error instanceof Error ? error : new Error(String(error)));
@@ -518,6 +539,15 @@ export class PiRpcSession {
       const pending = this.pending.get(frame.id);
       if (!pending) throw new Error('response id is not pending');
       this.validateCorrelatedResponse(pending.command, frame);
+      // Pi 0.82 acknowledges prompt preflight before emitting agent_start.
+      // Record the accepted logical turn in frame receive-order so a caller
+      // awakened by this response queues immediate work as a follow-up. Later
+      // frames in this same chunk (especially agent_settled) still win.
+      if (
+        frame.success === true &&
+        (pending.command === 'prompt' || pending.command === 'follow_up')
+      )
+        this.setStreaming(true);
       this.takePending(frame.id)!.resolve(frame);
       return;
     }

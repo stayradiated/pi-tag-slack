@@ -49,6 +49,11 @@ const defaultDependencies: SetupValidationDependencies = {
     });
     try {
       await session.start();
+      const result = await session.applyDesired();
+      if (result.application !== 'applied') {
+        const status = await session.status();
+        throw new Error(status.lastError ?? 'Pi rejected the configured session settings.');
+      }
     } finally {
       try {
         await session.stop();

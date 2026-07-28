@@ -95,6 +95,42 @@ async function waitForRestart(session: PiRpcSession, spawns: () => number): Prom
 afterEach(() => vi.useRealTimers());
 
 describe('PiRpcSession hardened transport', () => {
+  it('queues immediate work as follow_up after prompt success but before agent_start', async () => {
+    const child = fakeChild();
+    const { session } = sessionFor([child]);
+    await session.start();
+
+    await expect(session.notify('first')).resolves.toMatchObject({ runSequence: 1 });
+    const second = session.notify('second');
+    await expect(second).resolves.toMatchObject({ runSequence: 2 });
+    expect(
+      child.commands.filter((command) => command === 'prompt' || command === 'follow_up'),
+    ).toEqual(['prompt', 'follow_up']);
+
+    // Deliberately later than both acknowledgements: Pi 0.82 emits this event
+    // after successful prompt preflight.
+    child.stdout.write('{"type":"agent_start"}\n');
+    await session.stop();
+  });
+
+  it('honors later agent events when response and lifecycle frames share a chunk', async () => {
+    const child = fakeChild((request) =>
+      request.type === 'prompt'
+        ? `${response(request)}{"type":"agent_start"}\n{"type":"agent_settled"}\n`
+        : response(request),
+    );
+    const { session } = sessionFor([child]);
+    await session.start();
+
+    await session.notify('settles in response chunk');
+    await expect(session.status()).resolves.toMatchObject({ activity: 'idle' });
+    await session.notify('new turn');
+    expect(
+      child.commands.filter((command) => command === 'prompt' || command === 'follow_up'),
+    ).toEqual(['prompt', 'prompt']);
+    await session.stop();
+  });
+
   it('continuously drains large stderr while bounding safe log metadata', async () => {
     const child = fakeChild();
     const activity: Array<{ bytes: number; suppressed: boolean }> = [];

@@ -40,7 +40,13 @@ function configured(): void {
 }
 
 function fakeSession(
-  options: { streaming?: boolean; malformedModels?: boolean; rejectModel?: boolean } = {},
+  options: {
+    streaming?: boolean;
+    malformedModels?: boolean;
+    rejectModel?: boolean;
+    clampThinking?: boolean;
+    thinkingCatalogs?: Record<string, string[]>;
+  } = {},
 ) {
   let streaming = options.streaming ?? false;
   let model = 'provider/current';
@@ -76,10 +82,20 @@ function fakeSession(
             ],
           };
     if (request.type === 'get_available_thinking_levels')
-      data = { levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] };
+      data = {
+        levels: options.thinkingCatalogs?.[model] ?? [
+          'off',
+          'minimal',
+          'low',
+          'medium',
+          'high',
+          'xhigh',
+          'max',
+        ],
+      };
     if (request.type === 'set_model' && !options.rejectModel)
       model = `${request.provider}/${request.modelId}`;
-    if (request.type === 'set_thinking_level') thinking = request.level;
+    if (request.type === 'set_thinking_level' && !options.clampThinking) thinking = request.level;
     stdout.write(
       JSON.stringify({
         id: request.id,
@@ -422,6 +438,46 @@ describe('session desired/effective controls', () => {
       desiredModel: 'provider/new',
       effectiveModel: 'provider/current',
     });
+  });
+
+  it('fails and degrades when pi acknowledges but clamps desired thinking', async () => {
+    configured();
+    const fake = fakeSession({ clampThinking: true });
+    await fake.session.start();
+
+    await expect(
+      request('session.thinking.set', { level: 'high' }, services(fake.session)),
+    ).resolves.toMatchObject({ desiredThinking: 'high', application: 'failed' });
+    expect(readGatewayConfig().session_thinking_override).toBe('high');
+    await expect(fake.session.status()).resolves.toMatchObject({
+      health: 'degraded',
+      desiredThinking: 'high',
+      effectiveModel: 'provider/default',
+      effectiveThinking: 'low',
+    });
+  });
+
+  it('validates thinking against the selected target model catalog', async () => {
+    configured();
+    updateGatewayConfig('sessionModelOverride', 'provider/new');
+    updateGatewayConfig('sessionThinkingOverride', 'max');
+    const fake = fakeSession({
+      thinkingCatalogs: {
+        'provider/current': ['low'],
+        'provider/new': ['max'],
+      },
+    });
+
+    await expect(fake.session.start()).resolves.toBeUndefined();
+    await expect(fake.session.applyDesired()).resolves.toEqual({ application: 'applied' });
+    await expect(fake.session.status()).resolves.toMatchObject({
+      health: 'healthy',
+      effectiveModel: 'provider/new',
+      effectiveThinking: 'max',
+    });
+    expect(
+      fake.commands.filter((command) => command === 'get_available_thinking_levels'),
+    ).toHaveLength(2);
   });
 
   it('keeps active changes pending, applies model before thinking, and reset selects defaults', async () => {
