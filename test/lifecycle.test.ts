@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GatewayLifecycle } from '../src/lifecycle.js';
 import type { DaemonLogger } from '../src/logging.js';
+import { SchedulerService } from '../src/scheduler.js';
+import { GatewayCoordinator } from '../src/slack.js';
 
 function logger(): DaemonLogger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as DaemonLogger;
@@ -65,6 +67,41 @@ describe('GatewayLifecycle', () => {
       'database',
       'lock',
     ]);
+  });
+
+  it('absorbs an interval tick rejected after coordinator shutdown and completes orderly cleanup', async () => {
+    vi.useFakeTimers();
+    const logs = logger();
+    const coordinator = new GatewayCoordinator();
+    const scheduler = new SchedulerService(
+      { notify: async () => ({ acceptedAt: '', sessionId: '', runSequence: 0 }) },
+      coordinator,
+      undefined,
+      logs,
+    );
+    const closeDatabase = vi.fn();
+    const releaseLock = vi.fn();
+    scheduler.start(1);
+    const lifecycle = new GatewayLifecycle({
+      logger: logs,
+      stopAccepting: {
+        stop: async () => {
+          coordinator.close();
+          await vi.advanceTimersByTimeAsync(1);
+        },
+      },
+      stopTimers: scheduler,
+      drainCoordinator: () => coordinator.drain(),
+      closeDatabase,
+      releaseLock,
+    });
+
+    await lifecycle.shutdown('SIGTERM');
+
+    expect(logs.warn).toHaveBeenCalledWith({ event: 'scheduler_tick_failed' });
+    expect(logs.info).toHaveBeenCalledWith({ event: 'shutdown_complete' });
+    expect(closeDatabase).toHaveBeenCalledOnce();
+    expect(releaseLock).toHaveBeenCalledOnce();
   });
 
   it('continues through cleanup failure and shares one shutdown for repeated signals', async () => {

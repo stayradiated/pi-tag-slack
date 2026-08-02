@@ -6,6 +6,7 @@ import {
   setScheduleEnabled,
   type ScheduleRow,
 } from './db.js';
+import type { DaemonLogger } from './logging.js';
 import type { GatewayCoordinator, PiNotifier } from './slack.js';
 
 export type ScheduleInput =
@@ -103,6 +104,7 @@ export class SchedulerService {
     private readonly notifier: PiNotifier,
     private readonly coordinator: GatewayCoordinator,
     private readonly clock: () => Date = () => new Date(),
+    private readonly logger?: Pick<DaemonLogger, 'warn'>,
   ) {}
 
   async tick(): Promise<void> {
@@ -126,7 +128,12 @@ export class SchedulerService {
   }
 
   start(intervalMs = 15_000): void {
-    this.timer = setInterval(() => void this.tick(), intervalMs);
+    this.timer = setInterval(() => {
+      // Shutdown closes the coordinator before stopping timers, so an already-due
+      // interval can reject here. Consume every background tick failure instead
+      // of letting it become an unhandled rejection.
+      void this.tick().catch(() => this.logger?.warn({ event: 'scheduler_tick_failed' }));
+    }, intervalMs);
   }
   stop(): void {
     if (this.timer) clearInterval(this.timer);

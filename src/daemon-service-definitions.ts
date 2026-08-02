@@ -22,7 +22,7 @@ interface ServiceDefinitionDependencies {
 }
 
 function systemdEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return value.replace(/%/g, '%%').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 export function systemdUnit(deps: SystemdDependencies): string {

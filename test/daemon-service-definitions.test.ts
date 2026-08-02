@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { LAUNCHD_LABEL, launchdPlist, systemdUnit } from '../src/daemon-service-definitions.js';
 
@@ -72,21 +76,43 @@ WantedBy=default.target
 `);
   });
 
-  it('escapes quotes and backslashes in systemd values', () => {
-    expect(
-      systemdUnit({
-        ...dependencies,
-        nodePath: '/opt/node\\bin/node',
-        cliPath: '/opt/cli"quoted',
-        configPath: '/config\\with"quotes',
-        dataDir: '/data"with\\slashes',
-      }),
-    ).toContain(`ExecStart="/opt/node\\\\bin/node" "/opt/cli\\"quoted" start
+  it('escapes percent signs, quotes, and backslashes in systemd values', () => {
+    const unit = systemdUnit({
+      ...dependencies,
+      nodePath: '/opt/node%bin\\node',
+      cliPath: '/opt/cli%"quoted',
+      configPath: '/config%with\\"quotes',
+      dataDir: '/data%"with\\slashes',
+    });
+
+    expect(unit).toContain(`ExecStart="/opt/node%%bin\\\\node" "/opt/cli%%\\"quoted" start
 Restart=on-failure`);
-    expect(systemdUnit({ ...dependencies, configPath: '/config\\with"quotes' })).toContain(
-      'Environment="PI_TAG_SLACK_CONFIG=/config\\\\with\\"quotes"',
-    );
+    expect(unit).toContain('Environment="PI_TAG_SLACK_CONFIG=/config%%with\\\\\\"quotes"');
+    expect(unit).toContain('Environment="PI_TAG_SLACK_DATA_DIR=/data%%\\"with\\\\slashes"');
   });
+
+  it.runIf(process.platform === 'linux' && existsSync('/usr/bin/systemd-analyze'))(
+    'passes systemd-analyze verification with percent-containing environment values',
+    () => {
+      const directory = mkdtempSync(join(tmpdir(), 'pi-tag-slack-systemd-'));
+      const unitPath = join(directory, 'pi-tag-slack.service');
+      try {
+        writeFileSync(
+          unitPath,
+          systemdUnit({
+            ...dependencies,
+            nodePath: '/bin/true',
+            cliPath: '/bin/true',
+            configPath: '/private/config%value.env',
+            dataDir: '/private/data%value',
+          }),
+        );
+        expect(() => execFileSync('/usr/bin/systemd-analyze', ['verify', unitPath])).not.toThrow();
+      } finally {
+        rmSync(directory, { force: true, recursive: true });
+      }
+    },
+  );
 
   it('escapes XML metacharacters in launchd values', () => {
     const plist = launchdPlist({

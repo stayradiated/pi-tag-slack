@@ -305,7 +305,7 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
       () => void reconcileInboxReactions().catch(() => undefined),
       15_000,
     );
-    scheduler = new SchedulerService(session, coordinator);
+    scheduler = new SchedulerService(session, coordinator, undefined, logger);
     scheduler.start();
     logger.info({ event: 'gateway_ready' });
     await new Promise<void>((resolve) => {
