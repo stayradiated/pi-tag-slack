@@ -208,6 +208,7 @@ describe('active reset challenge', () => {
     activity: 'active',
     runSequence: 3,
     lastError: null,
+    lastFailure: null,
     desiredModel: null,
     desiredThinking: null,
     effectiveModel: null,
