@@ -636,6 +636,7 @@ describe('pi RPC session status', () => {
       activity: 'active',
       runSequence: 0,
       lastError: null,
+      lastFailure: null,
       desiredModel: 'configured/model',
       desiredThinking: 'medium',
       effectiveModel: 'anthropic/claude-test',

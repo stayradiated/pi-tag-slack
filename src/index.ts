@@ -204,7 +204,7 @@ async function startGatewayOwned(logger: ReturnType<typeof createDaemonLogger>):
         environment,
         sessionDir: paths.session,
         cwd: String(config.working_directory),
-        onRuntimeFailure: () => logFailure(logger, 'pi_runtime_failure', 'pi'),
+        onRuntimeFailure: ({ event, reason }) => logger.error({ event, component: 'pi', reason }),
         onStderrActivity: ({ bytes, suppressed }) => {
           logger.warn({ event: 'pi_stderr', component: 'pi', bytes, suppressed });
         },

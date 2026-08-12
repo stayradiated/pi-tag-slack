@@ -3,6 +3,10 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child
 import { TextDecoder } from 'node:util';
 
 export type PiAcceptance = { acceptedAt: string; sessionId: string; runSequence: number };
+export type PiRuntimeFailure = {
+  event: 'pi_prompt_preflight_timeout' | 'pi_rpc_failure';
+  reason: string;
+};
 export type PiSessionStatus = {
   running: boolean;
   health: 'healthy' | 'degraded';
@@ -10,6 +14,8 @@ export type PiSessionStatus = {
   activity: 'active' | 'idle';
   runSequence: number;
   lastError: string | null;
+  /** Retained across automatic restarts so recovery evidence remains inspectable. */
+  lastFailure: PiRuntimeFailure | null;
   desiredModel: string | null;
   desiredThinking: string | null;
   effectiveModel: string | null;
@@ -94,6 +100,7 @@ export class PiRpcSession {
   private sessionId: string | undefined;
   private sequence = 0;
   private lastError: string | undefined;
+  private lastFailure: PiRuntimeFailure | undefined;
   private effectiveModel: string | undefined;
   private effectiveThinking: string | undefined;
   private safeBoundaryHandler: (() => void) | undefined;
@@ -124,7 +131,7 @@ export class PiRpcSession {
       /** Bounded graceful shutdown seams for daemon lifecycle tests. */
       stopGraceMs?: number;
       stopTerminateMs?: number;
-      onRuntimeFailure?: () => void;
+      onRuntimeFailure?: (failure: PiRuntimeFailure) => void;
       /** Called once when this session loses ownership of a running child. */
       onUnexpectedExit?: () => void;
     },
@@ -419,6 +426,7 @@ export class PiRpcSession {
       activity: this.streaming ? 'active' : 'idle',
       runSequence: this.sequence,
       lastError: this.lastError ?? null,
+      lastFailure: this.lastFailure ?? null,
       desiredModel: desired.model,
       desiredThinking: desired.thinking,
       effectiveModel: this.effectiveModel ?? null,
@@ -704,8 +712,23 @@ export class PiRpcSession {
 
   private recordFailure(error: Error): void {
     this.lastError = error.message;
-    this.options.onRuntimeFailure?.();
+    const failure = this.classifyFailure(error);
+    this.lastFailure = failure;
+    this.options.onRuntimeFailure?.(failure);
     this.rejectPending(error);
+  }
+
+  private classifyFailure(error: Error): PiRuntimeFailure {
+    const promptPreflightTimeout =
+      error.message === 'pi RPC prompt command timed out.' && !this.streaming;
+    if (promptPreflightTimeout) {
+      return {
+        event: 'pi_prompt_preflight_timeout',
+        reason:
+          'Pi did not start the agent turn before the prompt deadline; a resumed session may be stalled in prompt preflight or compaction. Archive and replace it with pi-tag-slack session reset.',
+      };
+    }
+    return { event: 'pi_rpc_failure', reason: error.message };
   }
 
   private rejectPending(error: Error): void {

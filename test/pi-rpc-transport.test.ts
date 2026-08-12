@@ -226,6 +226,12 @@ describe('PiRpcSession hardened transport', () => {
     const { session, spawns } = sessionFor([first, second], { commandTimeoutMs: 10 });
     await session.start();
     await expect(session.notify('never answered')).rejects.toThrow(/prompt command timed out/);
+    expect(await session.status()).toMatchObject({
+      lastFailure: {
+        event: 'pi_prompt_preflight_timeout',
+        reason: expect.stringContaining('resumed session may be stalled'),
+      },
+    });
     await waitForRestart(session, spawns);
     await expect(session.notify('later work')).resolves.toMatchObject({ runSequence: 1 });
     await session.stop();
